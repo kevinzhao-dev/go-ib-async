@@ -1575,9 +1575,13 @@ func (ib *IB) PlaceOrder(con *contract.Contract, ord *order.Order) (*order.Trade
 	}
 
 	if err := ib.client.Send(fields...); err != nil {
-		ib.state.Mu.Lock()
-		delete(ib.state.Trades, key)
-		ib.state.Mu.Unlock()
+		if !isModify {
+			// Only remove from state if this was a new order;
+			// modify failures must not lose the existing trade
+			ib.state.Mu.Lock()
+			delete(ib.state.Trades, key)
+			ib.state.Mu.Unlock()
+		}
 		return nil, err
 	}
 
@@ -1756,10 +1760,8 @@ func (ib *IB) handleCommissionReport(r *protocol.FieldReader) {
 
 	if trade != nil && fill != nil {
 		trade.CommissionReportEvent.Emit(fill)
-		// Check if fully filled
-		if trade.OrderStatus.Status == order.StatusFilled {
-			trade.FilledEvent.Emit(trade)
-		}
+		// FilledEvent is already emitted by handleOrderStatus on status transition;
+		// do NOT re-emit here to avoid duplicate events
 	}
 }
 
