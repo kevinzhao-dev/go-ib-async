@@ -11,7 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/kvzhao/go-ib-async/contract"
+	"github.com/kevinzhao-dev/go-ib-async/contract"
 )
 
 // ClientState represents the connection state.

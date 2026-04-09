@@ -4,8 +4,8 @@ import (
 	"math"
 	"time"
 
-	"github.com/kvzhao/go-ib-async/contract"
-	"github.com/kvzhao/go-ib-async/event"
+	"github.com/kevinzhao-dev/go-ib-async/contract"
+	"github.com/kevinzhao-dev/go-ib-async/event"
 )
 
 // BarData represents an OHLCV bar.

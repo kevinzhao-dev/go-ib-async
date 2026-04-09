@@ -1,7 +1,7 @@
 // Package account defines account, portfolio, and execution types for IB.
 package account
 
-import "github.com/kvzhao/go-ib-async/contract"
+import "github.com/kevinzhao-dev/go-ib-async/contract"
 
 // AccountValue represents an account summary value.
 type AccountValue struct {

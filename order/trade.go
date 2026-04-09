@@ -3,8 +3,8 @@ package order
 import (
 	"time"
 
-	"github.com/kvzhao/go-ib-async/contract"
-	"github.com/kvzhao/go-ib-async/event"
+	"github.com/kevinzhao-dev/go-ib-async/contract"
+	"github.com/kevinzhao-dev/go-ib-async/event"
 )
 
 // TradeLogEntry records a status change or event for a trade.

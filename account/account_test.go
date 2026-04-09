@@ -4,7 +4,7 @@ import (
 	"math"
 	"testing"
 
-	"github.com/kvzhao/go-ib-async/contract"
+	"github.com/kevinzhao-dev/go-ib-async/contract"
 )
 
 func TestAccountValueFields(t *testing.T) {

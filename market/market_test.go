@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kvzhao/go-ib-async/contract"
+	"github.com/kevinzhao-dev/go-ib-async/contract"
 )
 
 func TestNewTicker(t *testing.T) {
