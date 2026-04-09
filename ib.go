@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
+	"time"
 
 	"github.com/kevinzhao-dev/go-ib-async/account"
 	"github.com/kevinzhao-dev/go-ib-async/contract"
@@ -260,6 +262,14 @@ func (ib *IB) handleMessage(msgID int, r *protocol.FieldReader) {
 		ib.handleTickGeneric(r)
 	case protocol.InMsgTickString:
 		ib.handleTickString(r)
+	case protocol.InMsgHistoricalData:
+		ib.handleHistoricalData(r)
+	case protocol.InMsgHistoricalDataUpdate:
+		ib.handleHistoricalDataUpdate(r)
+	case protocol.InMsgTickSnapshotEnd:
+		ib.handleTickSnapshotEnd(r)
+	case protocol.InMsgMarketDataType:
+		ib.handleMarketDataType(r)
 	default:
 		// Unhandled message types are silently ignored for now
 	}
@@ -299,7 +309,9 @@ func (ib *IB) handleError(r *protocol.FieldReader) {
 }
 
 func (ib *IB) handleContractDetails(r *protocol.FieldReader) {
-	r.Skip(1) // version
+	if ib.client.ServerVersion < 164 {
+		r.Skip(1) // skip version field (only for old servers)
+	}
 	reqID := r.ReadInt()
 
 	cd := contract.NewContractDetails()
@@ -307,13 +319,79 @@ func (ib *IB) handleContractDetails(r *protocol.FieldReader) {
 
 	c.Symbol = r.ReadString()
 	c.SecType = r.ReadString()
+	lastTimes := r.ReadString()
+	c.Strike = r.ReadFloat()
+	c.Right = r.ReadString()
+	c.Exchange = r.ReadString()
+	c.Currency = r.ReadString()
+	c.LocalSymbol = r.ReadString()
 	cd.MarketName = r.ReadString()
-	cd.MinTick = r.ReadFloat()
-	// Read basic fields
-	r.Skip(1) // orderTypes (skip for now, long string)
-	r.Skip(1) // validExchanges
+	c.TradingClass = r.ReadString()
 	c.ConID = r.ReadInt()
-	// ... more fields would be parsed here in a full implementation
+	cd.MinTick = r.ReadFloat()
+
+	if ib.client.ServerVersion < 164 {
+		r.Skip(1) // obsolete mdSizeMultiplier
+	}
+
+	c.Multiplier = r.ReadString()
+	cd.OrderTypes = r.ReadString()
+	cd.ValidExchanges = r.ReadString()
+	cd.PriceMagnifier = int(r.ReadInt())
+	cd.UnderConID = r.ReadInt()
+	cd.LongName = r.ReadString()
+	c.PrimaryExchange = r.ReadString()
+	cd.ContractMonth = r.ReadString()
+	cd.Industry = r.ReadString()
+	cd.Category = r.ReadString()
+	cd.Subcategory = r.ReadString()
+	cd.TimeZoneID = r.ReadString()
+	cd.TradingHours = r.ReadString()
+	cd.LiquidHours = r.ReadString()
+	cd.EvRule = r.ReadString()
+	cd.EvMultiplier = int(r.ReadInt())
+
+	numSecIds := int(r.ReadInt())
+	if numSecIds > 0 {
+		cd.SecIDList = make([]contract.TagValue, numSecIds)
+		for i := range numSecIds {
+			cd.SecIDList[i] = contract.TagValue{
+				Tag:   r.ReadString(),
+				Value: r.ReadString(),
+			}
+		}
+	}
+
+	cd.AggGroup = int(r.ReadInt())
+	cd.UnderSymbol = r.ReadString()
+	cd.UnderSecType = r.ReadString()
+	cd.MarketRuleIDs = r.ReadString()
+	cd.RealExpirationDate = r.ReadString()
+	cd.StockType = r.ReadString()
+
+	if ib.client.ServerVersion >= 164 {
+		cd.MinSize = r.ReadFloat()
+		cd.SizeIncrement = r.ReadFloat()
+		cd.SuggestedSizeIncrement = r.ReadFloat()
+	}
+
+	// Parse lastTradeDateOrContractMonth from combined field
+	if lastTimes != "" {
+		sep := " "
+		if len(lastTimes) > 8 && lastTimes[8] == '-' {
+			sep = "-"
+		}
+		parts := splitN(lastTimes, sep)
+		if len(parts) > 0 {
+			c.LastTradeDateOrContractMonth = parts[0]
+		}
+		if len(parts) > 1 {
+			cd.LastTradeTime = parts[1]
+		}
+		if len(parts) > 2 {
+			cd.TimeZoneID = parts[2]
+		}
+	}
 
 	cd.Contract = c
 	ib.state.AppendResult(reqID, cd)
@@ -699,4 +777,233 @@ func setTickerString(t *market.Ticker, field, value string) {
 	case "SocialMarketAnalytics":
 		t.SocialMarketAnalytics = value
 	}
+}
+
+func splitN(s, sep string) []string {
+	return strings.Split(s, sep)
+}
+
+// --- Historical Data ---
+
+func (ib *IB) handleHistoricalData(r *protocol.FieldReader) {
+	_ = r.ReadString() // version
+	reqID := r.ReadInt()
+	_ = r.ReadString() // startDateStr
+	_ = r.ReadString() // endDateStr
+	numBars := int(r.ReadInt())
+
+	bars := make([]market.BarData, 0, numBars)
+	for range numBars {
+		bar := market.BarData{
+			Date:     parseBarDate(r.ReadString()),
+			Open:     r.ReadFloat(),
+			High:     r.ReadFloat(),
+			Low:      r.ReadFloat(),
+			Close:    r.ReadFloat(),
+			Volume:   r.ReadFloat(),
+			Average:  r.ReadFloat(),
+			BarCount: int(r.ReadInt()),
+		}
+		bars = append(bars, bar)
+	}
+
+	ib.state.EndReq(reqID, bars, nil)
+}
+
+func (ib *IB) handleHistoricalDataUpdate(r *protocol.FieldReader) {
+	_ = r.ReadString() // version
+	reqID := r.ReadInt()
+
+	bar := market.BarData{
+		BarCount: int(r.ReadInt()),
+		Date:     parseBarDate(r.ReadString()),
+		Open:     r.ReadFloat(),
+		Close:    r.ReadFloat(),
+		High:     r.ReadFloat(),
+		Low:      r.ReadFloat(),
+		Average:  r.ReadFloat(),
+		Volume:   r.ReadFloat(),
+	}
+
+	ib.state.Mu.RLock()
+	sub, ok := ib.state.ReqID2Subscriber[reqID]
+	ib.state.Mu.RUnlock()
+
+	if ok {
+		if bdl, ok := sub.(*market.BarDataList); ok {
+			bdl.Bars = append(bdl.Bars, bar)
+			bdl.UpdateEvent.Emit(bdl)
+		}
+	}
+}
+
+func parseBarDate(s string) time.Time {
+	if len(s) == 8 {
+		t, _ := time.Parse("20060102", s)
+		return t
+	}
+	if len(s) == 10 {
+		// Unix timestamp
+		ts := int64(0)
+		for _, c := range s {
+			ts = ts*10 + int64(c-'0')
+		}
+		return time.Unix(ts, 0)
+	}
+	t, _ := time.Parse("20060102 15:04:05", s)
+	return t
+}
+
+func (ib *IB) handleTickSnapshotEnd(r *protocol.FieldReader) {
+	r.Skip(1) // version
+	reqID := r.ReadInt()
+	ib.state.EndReq(reqID, nil, nil)
+}
+
+func (ib *IB) handleMarketDataType(r *protocol.FieldReader) {
+	r.Skip(1) // version
+	reqID := r.ReadInt()
+	mktDataType := int(r.ReadInt())
+
+	ib.state.Mu.RLock()
+	ticker, ok := ib.state.ReqID2Ticker[reqID]
+	ib.state.Mu.RUnlock()
+
+	if ok {
+		ticker.MarketDataType = mktDataType
+	}
+}
+
+// --- ReqHistoricalData public method ---
+
+// ReqHistoricalData requests historical bar data.
+func (ib *IB) ReqHistoricalData(ctx context.Context, con *contract.Contract, endDateTime, durationStr, barSizeSetting, whatToShow string, useRTH bool, formatDate int) ([]market.BarData, error) {
+	reqID := ib.client.GetReqID()
+	ch := ib.state.StartReq(reqID, con)
+
+	if err := ib.client.ReqHistoricalData(reqID, con, endDateTime, durationStr, barSizeSetting, whatToShow, useRTH, formatDate, false, nil); err != nil {
+		ib.state.Requests.Cancel(reqID)
+		return nil, err
+	}
+
+	select {
+	case result := <-ch:
+		if result.Err != nil {
+			return nil, result.Err
+		}
+		if bars, ok := result.Value.([]market.BarData); ok {
+			return bars, nil
+		}
+		return nil, nil
+	case <-ctx.Done():
+		ib.state.Requests.Cancel(reqID)
+		return nil, ctx.Err()
+	case <-ib.client.Done():
+		return nil, ErrDisconnected
+	}
+}
+
+// --- ReqMktData subscription ---
+
+// ReqMktData subscribes to streaming market data for a contract.
+func (ib *IB) ReqMktData(con *contract.Contract, genericTickList string, snapshot, regulatorySnapshot bool) (*market.Ticker, error) {
+	reqID := ib.client.GetReqID()
+	ticker := market.NewTicker(con)
+
+	ib.state.Mu.Lock()
+	key := con.Key()
+	ib.state.Tickers[key] = ticker
+	ib.state.ReqID2Ticker[reqID] = ticker
+	ib.state.Mu.Unlock()
+
+	if err := ib.client.ReqMktData(reqID, con, genericTickList, snapshot, regulatorySnapshot, nil); err != nil {
+		ib.state.Mu.Lock()
+		delete(ib.state.Tickers, key)
+		delete(ib.state.ReqID2Ticker, reqID)
+		ib.state.Mu.Unlock()
+		return nil, err
+	}
+
+	// For snapshot requests, set up request tracking
+	if snapshot || regulatorySnapshot {
+		ib.state.StartReq(reqID, con)
+	}
+
+	return ticker, nil
+}
+
+// CancelMktData unsubscribes from streaming market data.
+func (ib *IB) CancelMktData(con *contract.Contract) {
+	key := con.Key()
+
+	ib.state.Mu.Lock()
+	ticker, ok := ib.state.Tickers[key]
+	if ok {
+		delete(ib.state.Tickers, key)
+		// Find and remove reqID mapping
+		for reqID, t := range ib.state.ReqID2Ticker {
+			if t == ticker {
+				delete(ib.state.ReqID2Ticker, reqID)
+				ib.client.CancelMktData(reqID)
+				break
+			}
+		}
+	}
+	ib.state.Mu.Unlock()
+}
+
+// --- PlaceOrder ---
+
+// PlaceOrder submits an order. Returns a Trade that tracks the order lifecycle.
+func (ib *IB) PlaceOrder(con *contract.Contract, ord *order.Order) (*order.Trade, error) {
+	if ord.OrderID == 0 {
+		ord.OrderID = ib.client.GetReqID()
+	}
+
+	trade := order.NewTrade(con, ord)
+
+	key := state.OrderKey{ClientID: int64(ib.client.ClientID), OrderID: ord.OrderID}
+	ib.state.Mu.Lock()
+	ib.state.Trades[key] = trade
+	ib.state.Mu.Unlock()
+
+	if err := ib.client.Send(
+		protocol.MsgPlaceOrder,
+		ord.OrderID,
+		con,
+		con.SecIDType,
+		con.SecID,
+		ord.Action,
+		ord.TotalQuantity,
+		ord.OrderType,
+		ord.LmtPrice,
+		ord.AuxPrice,
+		ord.TIF,
+		ord.OcaGroup,
+		ord.Account,
+		ord.OpenClose,
+		ord.Origin,
+		ord.OrderRef,
+		ord.Transmit,
+		ord.ParentID,
+		ord.BlockOrder,
+		ord.SweepToFill,
+		ord.DisplaySize,
+		ord.TriggerMethod,
+		ord.OutsideRTH,
+		ord.Hidden,
+	); err != nil {
+		ib.state.Mu.Lock()
+		delete(ib.state.Trades, key)
+		ib.state.Mu.Unlock()
+		return nil, err
+	}
+
+	ib.NewOrderEvent.Emit(trade)
+	return trade, nil
+}
+
+// CancelOrder cancels an order.
+func (ib *IB) CancelOrder(ord *order.Order) error {
+	return ib.client.CancelOrder(ord.OrderID, "")
 }

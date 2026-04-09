@@ -9,12 +9,16 @@ import (
 	"time"
 
 	ibgo "github.com/kevinzhao-dev/go-ib-async"
+	"github.com/kevinzhao-dev/go-ib-async/account"
+	"github.com/kevinzhao-dev/go-ib-async/contract"
+	"github.com/kevinzhao-dev/go-ib-async/market"
 )
 
 func main() {
 	host := "127.0.0.1"
 	port := 4002 // IB Gateway paper trading default
 
+	fmt.Printf("=== ibgo smoke test ===\n")
 	fmt.Printf("Connecting to %s:%d ...\n", host, port)
 
 	ib := ibgo.New()
@@ -38,34 +42,102 @@ func main() {
 	fmt.Printf("OK: Accounts=%v\n", ib.ManagedAccounts())
 
 	// Test 1: Request positions
-	fmt.Println("\n--- ReqPositions ---")
-	posCtx, posCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer posCancel()
-
-	positions, err := ib.ReqPositions(posCtx)
+	fmt.Println("\n--- 1. ReqPositions ---")
+	positions, err := reqWithTimeout(func(ctx context.Context) (interface{}, error) {
+		return ib.ReqPositions(ctx)
+	})
 	if err != nil {
-		fmt.Printf("FAIL: ReqPositions: %v\n", err)
+		fmt.Printf("FAIL: %v\n", err)
 	} else {
-		fmt.Printf("OK: %d positions\n", len(positions))
-		for i, p := range positions {
+		pos := positions.([]account.Position)
+		fmt.Printf("OK: %d positions\n", len(pos))
+		for i, p := range pos {
 			fmt.Printf("  [%d] %s %s: %.0f @ %.2f\n", i, p.Contract.Symbol, p.Contract.SecType, p.Position, p.AvgCost)
 		}
 	}
 
 	// Test 2: Request account summary
-	fmt.Println("\n--- ReqAccountSummary ---")
-	acctCtx, acctCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer acctCancel()
-
-	values, err := ib.ReqAccountSummary(acctCtx, "All", "NetLiquidation,TotalCashValue,BuyingPower")
+	fmt.Println("\n--- 2. ReqAccountSummary ---")
+	values, err := reqWithTimeout(func(ctx context.Context) (interface{}, error) {
+		return ib.ReqAccountSummary(ctx, "All", "NetLiquidation,TotalCashValue,BuyingPower")
+	})
 	if err != nil {
-		fmt.Printf("FAIL: ReqAccountSummary: %v\n", err)
+		fmt.Printf("FAIL: %v\n", err)
 	} else {
-		fmt.Printf("OK: %d account values\n", len(values))
-		for _, v := range values {
+		avs := values.([]account.AccountValue)
+		fmt.Printf("OK: %d values\n", len(avs))
+		for _, v := range avs {
 			fmt.Printf("  %s: %s = %s %s\n", v.Account, v.Tag, v.Value, v.Currency)
 		}
 	}
 
-	fmt.Println("\nDone. Disconnecting.")
+	// Test 3: Request contract details for AAPL
+	fmt.Println("\n--- 3. ReqContractDetails (AAPL) ---")
+	aaplContract := contract.Stock("AAPL", "SMART", "USD")
+	details, err := reqWithTimeout(func(ctx context.Context) (interface{}, error) {
+		return ib.ReqContractDetails(ctx, aaplContract)
+	})
+	if err != nil {
+		fmt.Printf("FAIL: %v\n", err)
+	} else {
+		cds := details.([]contract.ContractDetails)
+		fmt.Printf("OK: %d contract details\n", len(cds))
+		for _, cd := range cds {
+			c := cd.Contract
+			fmt.Printf("  %s (conId=%d) %s | %s | minTick=%.4f\n",
+				c.Symbol, c.ConID, c.PrimaryExchange, cd.LongName, cd.MinTick)
+		}
+	}
+
+	// Test 4: Request historical data for AAPL
+	fmt.Println("\n--- 4. ReqHistoricalData (AAPL, 5 days, 1 day bars) ---")
+	// Need a qualified contract (with conId) for historical data
+	if details != nil {
+		cds := details.([]contract.ContractDetails)
+		if len(cds) > 0 {
+			qualifiedContract := cds[0].Contract
+			bars, err := reqWithTimeout(func(ctx context.Context) (interface{}, error) {
+				return ib.ReqHistoricalData(ctx, qualifiedContract, "", "5 D", "1 day", "TRADES", true, 1)
+			})
+			if err != nil {
+				fmt.Printf("FAIL: %v\n", err)
+			} else {
+				barData := bars.([]market.BarData)
+				fmt.Printf("OK: %d bars\n", len(barData))
+				for _, b := range barData {
+					fmt.Printf("  %s  O=%.2f H=%.2f L=%.2f C=%.2f V=%.0f\n",
+						b.Date.Format("2006-01-02"), b.Open, b.High, b.Low, b.Close, b.Volume)
+				}
+			}
+		}
+	}
+
+	// Test 5: Request market data snapshot for AAPL
+	fmt.Println("\n--- 5. ReqMktData snapshot (AAPL) ---")
+	if details != nil {
+		cds := details.([]contract.ContractDetails)
+		if len(cds) > 0 {
+			qualifiedContract := cds[0].Contract
+			ticker, err := ib.ReqMktData(qualifiedContract, "", true, false)
+			if err != nil {
+				fmt.Printf("FAIL: %v\n", err)
+			} else {
+				// Wait a moment for snapshot data to arrive
+				time.Sleep(2 * time.Second)
+				fmt.Printf("OK: bid=%.2f ask=%.2f last=%.2f vol=%.0f\n",
+					ticker.Bid, ticker.Ask, ticker.Last, ticker.Volume)
+			}
+		}
+	}
+
+	fmt.Println("\n=== All tests complete ===")
+}
+
+// Position and AccountValue type aliases for cleaner main
+// type aliases not needed, using account package directly
+
+func reqWithTimeout(fn func(ctx context.Context) (interface{}, error)) (interface{}, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return fn(ctx)
 }
