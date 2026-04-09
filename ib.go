@@ -265,6 +265,14 @@ func (ib *IB) handleMessage(msgID int, r *protocol.FieldReader) {
 		ib.handleSecDefOptParams(r)
 	case protocol.InMsgSecDefOptParamsEnd:
 		ib.handleSecDefOptParamsEnd(r)
+	case protocol.InMsgCompletedOrder:
+		ib.handleCompletedOrder(r)
+	case protocol.InMsgCompletedOrdersEnd:
+		ib.handleCompletedOrdersEnd(r)
+	case protocol.InMsgOrderBound:
+		ib.handleOrderBound(r)
+	case protocol.InMsgCurrentTime:
+		ib.handleCurrentTime(r)
 	case protocol.InMsgNextValidID:
 		// already handled in client.go readLoop
 	case protocol.InMsgManagedAccounts:
@@ -1940,4 +1948,283 @@ func (ib *IB) CancelRealTimeBars(rtbl *market.RealTimeBarList) {
 	delete(ib.state.ReqID2Subscriber, rtbl.ReqID)
 	ib.state.Mu.Unlock()
 	ib.client.CancelRealTimeBars(rtbl.ReqID)
+}
+
+// ReqCompletedOrders requests all completed (filled/cancelled) orders.
+func (ib *IB) ReqCompletedOrders(ctx context.Context, apiOnly bool) ([]*order.Trade, error) {
+	ch := ib.state.StartReq(completedOrdersReqID, nil)
+	if err := ib.client.ReqCompletedOrders(apiOnly); err != nil {
+		ib.state.Requests.Cancel(completedOrdersReqID)
+		return nil, err
+	}
+	select {
+	case result := <-ch:
+		if result.Err != nil {
+			return nil, result.Err
+		}
+		if result.Value == nil {
+			return nil, nil
+		}
+		items := result.Value.([]interface{})
+		trades := make([]*order.Trade, 0, len(items))
+		for _, item := range items {
+			if t, ok := item.(*order.Trade); ok {
+				trades = append(trades, t)
+			}
+		}
+		return trades, nil
+	case <-ctx.Done():
+		ib.state.Requests.Cancel(completedOrdersReqID)
+		return nil, ctx.Err()
+	case <-ib.client.Done():
+		return nil, ErrDisconnected
+	}
+}
+
+const completedOrdersReqID = int64(-2000)
+
+// --- completedOrder / orderBound / currentTime handlers ---
+
+func (ib *IB) handleCompletedOrder(r *protocol.FieldReader) {
+	o := order.NewOrder()
+	c := &contract.Contract{}
+	st := order.NewOrderState()
+
+	// completedOrder has skip=1 (no version field, just msgId already skipped)
+	c.ConID = r.ReadInt()
+	c.Symbol = r.ReadString()
+	c.SecType = r.ReadString()
+	c.LastTradeDateOrContractMonth = r.ReadString()
+	c.Strike = r.ReadFloat()
+	c.Right = r.ReadString()
+	c.Multiplier = r.ReadString()
+	c.Exchange = r.ReadString()
+	c.Currency = r.ReadString()
+	c.LocalSymbol = r.ReadString()
+	c.TradingClass = r.ReadString()
+
+	o.Action = r.ReadString()
+	o.TotalQuantity = r.ReadFloat()
+	o.OrderType = r.ReadString()
+	o.LmtPrice = r.ReadFloat()
+	o.AuxPrice = r.ReadFloat()
+	o.TIF = r.ReadString()
+	o.OcaGroup = r.ReadString()
+	o.Account = r.ReadString()
+	o.OpenClose = r.ReadString()
+	o.Origin = int(r.ReadInt())
+	o.OrderRef = r.ReadString()
+	o.PermID = r.ReadInt()
+	o.OutsideRTH = r.ReadBool()
+	o.Hidden = r.ReadBool()
+	o.DiscretionaryAmt = r.ReadFloat()
+	o.GoodAfterTime = r.ReadString()
+	o.FAGroup = r.ReadString()
+	o.FAMethod = r.ReadString()
+	o.FAPercentage = r.ReadString()
+
+	if ib.client.ServerVersion < 177 {
+		r.Skip(1) // faProfile
+	}
+
+	o.ModelCode = r.ReadString()
+	o.GoodTillDate = r.ReadString()
+	o.Rule80A = r.ReadString()
+	o.PercentOffset = r.ReadFloat()
+	o.SettlingFirm = r.ReadString()
+	o.ShortSaleSlot = int(r.ReadInt())
+	o.DesignatedLocation = r.ReadString()
+	o.ExemptCode = int(r.ReadInt())
+	o.StartingPrice = r.ReadFloat()
+	o.StockRefPrice = r.ReadFloat()
+	o.Delta = r.ReadFloat()
+	o.StockRangeLower = r.ReadFloat()
+	o.StockRangeUpper = r.ReadFloat()
+	o.DisplaySize = int(r.ReadInt())
+	o.SweepToFill = r.ReadBool()
+	o.AllOrNone = r.ReadBool()
+	o.MinQty = r.ReadInt()
+	o.OcaType = int(r.ReadInt())
+	o.TriggerMethod = int(r.ReadInt())
+	o.Volatility = r.ReadFloat()
+	o.VolatilityType = r.ReadInt()
+	o.DeltaNeutralOrderType = r.ReadString()
+	o.DeltaNeutralAuxPrice = r.ReadFloat()
+
+	if o.DeltaNeutralOrderType != "" {
+		o.DeltaNeutralConID = r.ReadInt()
+		o.DeltaNeutralShortSale = r.ReadBool()
+		o.DeltaNeutralShortSaleSlot = int(r.ReadInt())
+		o.DeltaNeutralDesignatedLocation = r.ReadString()
+	}
+
+	o.ContinuousUpdate = r.ReadBool()
+	o.ReferencePriceType = r.ReadInt()
+	o.TrailStopPrice = r.ReadFloat()
+	o.TrailingPercent = r.ReadFloat()
+	c.ComboLegsDescrip = r.ReadString()
+
+	// Combo legs
+	numLegs := int(r.ReadInt())
+	if numLegs > 0 {
+		c.ComboLegs = make([]contract.ComboLeg, numLegs)
+		for i := range numLegs {
+			c.ComboLegs[i] = contract.ComboLeg{
+				ConID:              r.ReadInt(),
+				Ratio:              int(r.ReadInt()),
+				Action:             r.ReadString(),
+				Exchange:           r.ReadString(),
+				OpenClose:          int(r.ReadInt()),
+				ShortSaleSlot:      int(r.ReadInt()),
+				DesignatedLocation: r.ReadString(),
+				ExemptCode:         int(r.ReadInt()),
+			}
+		}
+	}
+
+	numOrderLegs := int(r.ReadInt())
+	if numOrderLegs > 0 {
+		o.OrderComboLegs = make([]order.OrderComboLeg, numOrderLegs)
+		for i := range numOrderLegs {
+			o.OrderComboLegs[i] = order.OrderComboLeg{Price: r.ReadFloat()}
+		}
+	}
+
+	numParams := int(r.ReadInt())
+	if numParams > 0 {
+		o.SmartComboRoutingParams = make([]contract.TagValue, numParams)
+		for i := range numParams {
+			o.SmartComboRoutingParams[i] = contract.TagValue{Tag: r.ReadString(), Value: r.ReadString()}
+		}
+	}
+
+	o.ScaleInitLevelSize = r.ReadInt()
+	o.ScaleSubsLevelSize = r.ReadInt()
+	scalePriceIncrement := r.ReadFloat()
+	if scalePriceIncrement == 0 {
+		scalePriceIncrement = UnsetDouble
+	}
+	o.ScalePriceIncrement = scalePriceIncrement
+	if o.ScalePriceIncrement > 0 && o.ScalePriceIncrement < UnsetDouble {
+		o.ScalePriceAdjustValue = r.ReadFloat()
+		o.ScalePriceAdjustInterval = r.ReadInt()
+		o.ScaleProfitOffset = r.ReadFloat()
+		o.ScaleAutoReset = r.ReadBool()
+		o.ScaleInitPosition = r.ReadInt()
+		o.ScaleInitFillQty = r.ReadInt()
+		o.ScaleRandomPercent = r.ReadBool()
+	}
+
+	o.HedgeType = r.ReadString()
+	if o.HedgeType != "" {
+		o.HedgeParam = r.ReadString()
+	}
+
+	o.ClearingAccount = r.ReadString()
+	o.ClearingIntent = r.ReadString()
+	o.NotHeld = r.ReadBool()
+
+	dncPresent := r.ReadBool()
+	if dncPresent {
+		c.DeltaNeutralContract = &contract.DeltaNeutralContract{
+			ConID: r.ReadInt(), Delta: r.ReadFloat(), Price: r.ReadFloat(),
+		}
+	}
+
+	o.AlgoStrategy = r.ReadString()
+	if o.AlgoStrategy != "" {
+		numAlgoParams := int(r.ReadInt())
+		if numAlgoParams > 0 {
+			o.AlgoParams = make([]contract.TagValue, numAlgoParams)
+			for i := range numAlgoParams {
+				o.AlgoParams[i] = contract.TagValue{Tag: r.ReadString(), Value: r.ReadString()}
+			}
+		}
+	}
+
+	o.Solicited = r.ReadBool()
+	st.Status = r.ReadString()
+	o.RandomizeSize = r.ReadBool()
+	o.RandomizePrice = r.ReadBool()
+
+	if o.OrderType == "PEG BENCH" || o.OrderType == "PEGBENCH" {
+		o.ReferenceContractID = r.ReadInt()
+		o.IsPeggedChangeAmountDecrease = r.ReadBool()
+		o.PeggedChangeAmount = r.ReadFloat()
+		o.ReferenceChangeAmount = r.ReadFloat()
+		o.ReferenceExchangeID = r.ReadString()
+	}
+
+	numConditions := int(r.ReadInt())
+	if numConditions > 0 {
+		o.Conditions = make([]order.OrderCondition, 0, numConditions)
+		for range numConditions {
+			condType := int(r.ReadInt())
+			cond := order.CreateCondition(condType)
+			if cond != nil {
+				ib.readConditionFields(cond, r)
+				o.Conditions = append(o.Conditions, cond)
+			}
+		}
+		o.ConditionsIgnoreRTH = r.ReadBool()
+		o.ConditionsCancelOrder = r.ReadBool()
+	}
+
+	o.TrailStopPrice = r.ReadFloat()
+	o.LmtPriceOffset = r.ReadFloat()
+	o.CashQty = r.ReadFloat()
+	o.DontUseAutoPriceForHedge = r.ReadBool()
+	o.IsOmsContainer = r.ReadBool()
+	o.AutoCancelDate = r.ReadString()
+	o.FilledQuantity = r.ReadFloat()
+	o.RefFuturesConID = r.ReadInt()
+	o.AutoCancelParent = r.ReadBool()
+	o.Shareholder = r.ReadString()
+	o.ImbalanceOnly = r.ReadBool()
+	o.RouteMarketableToBbo = r.ReadBool()
+	o.ParentPermID = r.ReadInt()
+	st.CompletedTime = r.ReadString()
+	st.CompletedStatus = r.ReadString()
+
+	if ib.client.ServerVersion >= 170 {
+		o.MinTradeQty = r.ReadInt()
+		o.MinCompeteSize = r.ReadInt()
+		o.CompeteAgainstBestOffset = r.ReadFloat()
+		o.MidOffsetAtWhole = r.ReadFloat()
+		o.MidOffsetAtHalf = r.ReadFloat()
+	}
+
+	// Create trade and store
+	os := &order.OrderStatus{OrderID: o.OrderID, Status: st.Status}
+	trade := &order.Trade{Contract: c, Order: o, OrderStatus: os}
+
+	ib.state.Mu.Lock()
+	if o.PermID != 0 {
+		if _, exists := ib.state.PermID2Trade[o.PermID]; !exists {
+			ib.state.Trades[state.OrderKey{ClientID: 0, OrderID: o.PermID}] = trade
+			ib.state.PermID2Trade[o.PermID] = trade
+		}
+	}
+	ib.state.Mu.Unlock()
+
+	ib.state.AppendResult(completedOrdersReqID, trade)
+}
+
+func (ib *IB) handleCompletedOrdersEnd(r *protocol.FieldReader) {
+	ib.state.EndReq(completedOrdersReqID, nil, nil)
+}
+
+func (ib *IB) handleOrderBound(r *protocol.FieldReader) {
+	// orderBound links an API order to its permId
+	_ = r.ReadInt() // reqId
+	_ = r.ReadInt() // apiClientId
+	_ = r.ReadInt() // apiOrderId
+}
+
+func (ib *IB) handleCurrentTime(r *protocol.FieldReader) {
+	r.Skip(1) // version
+	serverTime := r.ReadInt()
+	ib.state.Mu.Lock()
+	ib.state.LastTime = time.Unix(serverTime, 0)
+	ib.state.Mu.Unlock()
 }

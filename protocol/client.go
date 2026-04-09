@@ -44,6 +44,7 @@ type Client struct {
 	handler Handler
 
 	done   chan struct{}
+	doneMu sync.Mutex // protects closing done channel
 	mu     sync.Mutex
 	readWg sync.WaitGroup
 
@@ -72,11 +73,16 @@ func (c *Client) Connect(ctx context.Context, host string, port, clientID int) e
 	c.Port = port
 	c.ClientID = clientID
 	c.ConnState = Connecting
+	c.ServerVersion = 0
 	c.hasReqID = false
 	c.apiReady = false
 	c.accounts = nil
 	c.startTime = time.Now()
+
+	// Wait for any previous readLoop to finish
+	c.readWg.Wait()
 	c.done = make(chan struct{})
+	// done channel is fresh, no need to reset mutex
 
 	if err := c.Conn.Connect(host, port); err != nil {
 		c.ConnState = Disconnected
@@ -132,8 +138,15 @@ func (c *Client) Disconnect() {
 
 	c.Conn.Disconnect()
 
+	c.closeDone()
+}
+
+func (c *Client) closeDone() {
+	c.doneMu.Lock()
+	defer c.doneMu.Unlock()
 	select {
 	case <-c.done:
+		// already closed
 	default:
 		close(c.done)
 	}
@@ -195,11 +208,7 @@ func (c *Client) Send(fields ...interface{}) error {
 func (c *Client) readLoop() {
 	defer c.readWg.Done()
 	defer func() {
-		select {
-		case <-c.done:
-		default:
-			close(c.done)
-		}
+		c.closeDone()
 		if c.OnDisconnect != nil {
 			c.OnDisconnect(nil)
 		}
@@ -208,7 +217,10 @@ func (c *Client) readLoop() {
 	for {
 		fields, err := c.Conn.ReadMessage()
 		if err != nil {
-			if c.ConnState != Disconnected {
+			c.mu.Lock()
+			isDisconnected := c.ConnState == Disconnected
+			c.mu.Unlock()
+			if !isDisconnected {
 				log.Printf("ibgo: read error: %v", err)
 			}
 			return
