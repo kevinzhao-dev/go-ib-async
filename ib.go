@@ -544,6 +544,7 @@ func (ib *IB) handleTickPrice(r *protocol.FieldReader) {
 	tickType := int(r.ReadInt())
 	price := r.ReadFloat()
 	size := r.ReadFloat()
+	_ = r.ReadString() // tickAttrib (ignored for now)
 
 	ib.state.Mu.RLock()
 	ticker, ok := ib.state.ReqID2Ticker[reqID]
@@ -553,14 +554,27 @@ func (ib *IB) handleTickPrice(r *protocol.FieldReader) {
 		return
 	}
 
-	// Update price field
-	if fieldName, ok := state.PriceTickMap[tickType]; ok {
-		setTickerFloat(ticker, fieldName, price)
-	}
-
-	// Update corresponding size field
-	if fieldName, ok := state.SizeTickMap[tickType]; ok {
-		setTickerFloat(ticker, fieldName, size)
+	// Bid/Ask/Last are handled specially (tick types 1,2,4 + delayed 66,67,68)
+	switch tickType {
+	case 1, 66: // BID
+		ticker.PrevBid = ticker.Bid
+		ticker.PrevBidSize = ticker.BidSize
+		ticker.Bid = price
+		ticker.BidSize = size
+	case 2, 67: // ASK
+		ticker.PrevAsk = ticker.Ask
+		ticker.PrevAskSize = ticker.AskSize
+		ticker.Ask = price
+		ticker.AskSize = size
+	case 4, 68: // LAST
+		ticker.PrevLast = ticker.Last
+		ticker.PrevLastSize = ticker.LastSize
+		ticker.Last = price
+		ticker.LastSize = size
+	default:
+		if fieldName, ok := state.PriceTickMap[tickType]; ok {
+			setTickerFloat(ticker, fieldName, price)
+		}
 	}
 
 	ticker.UpdateEvent.Emit(ticker)
@@ -786,8 +800,7 @@ func splitN(s, sep string) []string {
 // --- Historical Data ---
 
 func (ib *IB) handleHistoricalData(r *protocol.FieldReader) {
-	_ = r.ReadString() // version
-	reqID := r.ReadInt()
+	reqID := r.ReadInt() // no version field for historicalData
 	_ = r.ReadString() // startDateStr
 	_ = r.ReadString() // endDateStr
 	numBars := int(r.ReadInt())
@@ -811,8 +824,7 @@ func (ib *IB) handleHistoricalData(r *protocol.FieldReader) {
 }
 
 func (ib *IB) handleHistoricalDataUpdate(r *protocol.FieldReader) {
-	_ = r.ReadString() // version
-	reqID := r.ReadInt()
+	reqID := r.ReadInt() // no version field
 
 	bar := market.BarData{
 		BarCount: int(r.ReadInt()),
