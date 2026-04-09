@@ -52,12 +52,13 @@ func main() {
             b.Date.Format("2006-01-02"), b.Open, b.High, b.Low, b.Close)
     }
 
-    // Market data snapshot
+    // Market data snapshot (idiomatic: use event, not sleep)
     ticker, err := ib.ReqMktData(details[0].Contract, "", true, false)
     if err != nil {
         log.Fatal(err)
     }
-    time.Sleep(2 * time.Second)
+    ch := ticker.UpdateEvent.Once()
+    <-ch // wait for first tick update
     fmt.Printf("bid=%.2f ask=%.2f last=%.2f\n", ticker.Bid, ticker.Ask, ticker.Last)
 }
 ```
@@ -103,6 +104,13 @@ go test -fuzz=FuzzDecodeMessage -fuzztime=10s ./protocol/ # fuzz
 go test -cover ./...                                    # coverage
 go run ./cmd/smoketest                                  # live test (needs Gateway)
 ```
+
+## Known Limitations
+
+- **Not production-ready for live trading.** Order execution edge cases (partial fills, status transitions, commission timing) need more coverage.
+- **No reconnection / heartbeat.** IB Gateway disconnects are routine; this library does not auto-reconnect.
+- **35% message coverage** (29/82 inbound types). Many advanced features are not yet implemented.
+- **No request throttling** at runtime (constants defined, enforcement not implemented).
 
 ## Requirements
 
