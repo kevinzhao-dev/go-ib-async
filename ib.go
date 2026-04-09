@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -65,6 +66,26 @@ func New() *IB {
 	ib.client.OnDisconnect = func(err error) {
 		ib.state.Requests.DrainAll(ErrDisconnected)
 		ib.DisconnectedEvent.Emit(struct{}{})
+	}
+	ib.client.OnDataArrived = func() {
+		now := time.Now()
+		ib.state.LastTime = now
+		ib.state.TimeFloat = float64(now.UnixMilli()) / 1000.0
+		ib.state.ClearPendingTickers()
+	}
+	ib.client.OnDataProcessed = func() {
+		ib.UpdateEvent.Emit(struct{}{})
+		pending := ib.state.GetPendingTickers()
+		if len(pending) > 0 {
+			t := ib.state.LastTime
+			ts := ib.state.TimeFloat
+			for _, ticker := range pending {
+				ticker.Time = t
+				ticker.Timestamp = ts
+				ticker.UpdateEvent.Emit(ticker)
+			}
+			ib.PendingTickersEvent.Emit(pending)
+		}
 	}
 	return ib
 }
@@ -1049,9 +1070,138 @@ func (ib *IB) handleTickString(r *protocol.FieldReader) {
 		return
 	}
 
-	if fieldName, ok := state.StringTickMap[tickType]; ok {
-		setTickerString(ticker, fieldName, value)
+	switch {
+	case tickType == 45 || tickType == 88:
+		// Timestamp ticks (lastTimestamp, delayedLastTimestamp)
+		ib.processTimestampTick(ticker, tickType, value)
+	case tickType == 48 || tickType == 77:
+		// RT Volume / RT Trade Volume
+		ib.processRtVolumeTick(ticker, tickType, value)
+	case tickType == 59:
+		// Dividends: "past12,next12,nextDate,nextAmount"
+		ib.processDividendTick(ticker, value)
+	case tickType == 47:
+		// Fundamental ratios: "key=value;key=value;..."
+		ib.processFundamentalRatios(ticker, value)
+	default:
+		if fieldName, ok := state.StringTickMap[tickType]; ok {
+			setTickerString(ticker, fieldName, value)
+		}
 	}
+
+	ib.state.MarkTickerPending(ticker)
+}
+
+func (ib *IB) processTimestampTick(ticker *market.Ticker, tickType int, value string) {
+	if value == "" || value == "0" {
+		return
+	}
+	ts, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || ts == 0 {
+		return
+	}
+	t := time.Unix(ts, 0)
+
+	switch tickType {
+	case 45:
+		ticker.LastTimestamp = t
+	case 88:
+		ticker.DelayedLastTimestamp = t
+	}
+}
+
+func (ib *IB) processRtVolumeTick(ticker *market.Ticker, tickType int, value string) {
+	// Format: price;size;ms_since_epoch;total_volume;VWAP;single_trade
+	parts := strings.Split(value, ";")
+	if len(parts) < 6 {
+		return
+	}
+
+	priceStr, sizeStr, rtTimeStr, volumeStr, vwapStr := parts[0], parts[1], parts[2], parts[3], parts[4]
+
+	if volumeStr != "" {
+		if v, err := strconv.ParseFloat(volumeStr, 64); err == nil {
+			switch tickType {
+			case 48:
+				ticker.RTVolume = v
+			case 77:
+				ticker.RTTradeVolume = v
+			}
+		}
+	}
+
+	if vwapStr != "" {
+		if v, err := strconv.ParseFloat(vwapStr, 64); err == nil {
+			ticker.VWAP = v
+		}
+	}
+
+	if rtTimeStr != "" {
+		if ms, err := strconv.ParseInt(rtTimeStr, 10, 64); err == nil {
+			ticker.RTTime = time.UnixMilli(ms)
+		}
+	}
+
+	if priceStr != "" {
+		price, err1 := strconv.ParseFloat(priceStr, 64)
+		size, err2 := strconv.ParseFloat(sizeStr, 64)
+		if err1 == nil && err2 == nil {
+			ticker.PrevLast = ticker.Last
+			ticker.PrevLastSize = ticker.LastSize
+			ticker.Last = price
+			ticker.LastSize = size
+
+			ticker.Ticks = append(ticker.Ticks, market.TickData{
+				Time: ib.state.LastTime, TickType: tickType, Price: price, Size: size,
+			})
+		}
+	}
+}
+
+func (ib *IB) processDividendTick(ticker *market.Ticker, value string) {
+	// Format: "past12,next12,nextDate,nextAmount"
+	parts := strings.Split(value, ",")
+	if len(parts) < 4 {
+		return
+	}
+
+	var past12, next12, nextAmount *float64
+	if parts[0] != "" {
+		if v, err := strconv.ParseFloat(parts[0], 64); err == nil {
+			past12 = &v
+		}
+	}
+	if parts[1] != "" {
+		if v, err := strconv.ParseFloat(parts[1], 64); err == nil {
+			next12 = &v
+		}
+	}
+	if parts[3] != "" {
+		if v, err := strconv.ParseFloat(parts[3], 64); err == nil {
+			nextAmount = &v
+		}
+	}
+
+	ticker.Dividends = &market.Dividends{
+		Past12Months: past12,
+		Next12Months: next12,
+		NextDate:     parts[2],
+		NextAmount:   nextAmount,
+	}
+}
+
+func (ib *IB) processFundamentalRatios(ticker *market.Ticker, value string) {
+	ratios := make(map[string]string)
+	for _, pair := range strings.Split(value, ";") {
+		if pair == "" {
+			continue
+		}
+		kv := strings.SplitN(pair, "=", 2)
+		if len(kv) == 2 {
+			ratios[kv[0]] = kv[1]
+		}
+	}
+	ticker.FundamentalRatios = ratios
 }
 
 // setTickerFloat sets a named float64 field on a Ticker.

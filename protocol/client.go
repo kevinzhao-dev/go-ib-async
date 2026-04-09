@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/kevinzhao-dev/go-ib-async/contract"
+	"github.com/kevinzhao-dev/go-ib-async/internal/throttle"
 )
 
 // ClientState represents the connection state.
@@ -43,7 +44,10 @@ type Client struct {
 	// handler receives decoded messages
 	handler Handler
 
-	done   chan struct{}
+	// Rate limiter
+	throttle *throttle.Limiter
+
+	done chan struct{}
 	doneMu sync.Mutex // protects closing done channel
 	mu     sync.Mutex
 	readWg sync.WaitGroup
@@ -56,13 +60,19 @@ type Client struct {
 
 	// OnMessage is called for every decoded message (after handshake)
 	OnMessage Handler
+
+	// OnDataArrived is called before processing each network packet
+	OnDataArrived func()
+	// OnDataProcessed is called after processing each network packet
+	OnDataProcessed func()
 }
 
 // NewClient creates a new Client.
 func NewClient() *Client {
 	c := &Client{
-		Conn: &Connection{},
-		done: make(chan struct{}),
+		Conn:     &Connection{},
+		done:     make(chan struct{}),
+		throttle: throttle.New(45, 1*time.Second), // 45 req/s default
 	}
 	return c
 }
@@ -200,6 +210,7 @@ func (c *Client) Done() <-chan struct{} {
 
 // Send serializes and sends a message with mixed field types.
 func (c *Client) Send(fields ...interface{}) error {
+	c.throttle.Wait()
 	msg := BuildMessage(fields...)
 	return c.Conn.SendMessage(msg)
 }
@@ -271,6 +282,11 @@ func (c *Client) readLoop() {
 			}
 		}
 
+		// Pre-message hook
+		if c.OnDataArrived != nil {
+			c.OnDataArrived()
+		}
+
 		// Dispatch to message handler
 		if c.OnMessage != nil {
 			if len(fields) > 0 {
@@ -286,6 +302,11 @@ func (c *Client) readLoop() {
 					c.OnMessage(msgID, reader)
 				}()
 			}
+		}
+
+		// Post-message hook
+		if c.OnDataProcessed != nil {
+			c.OnDataProcessed()
 		}
 	}
 }

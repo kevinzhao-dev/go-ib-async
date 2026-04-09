@@ -16,43 +16,27 @@ type OrderKey struct {
 	OrderID  int64
 }
 
-// Manager holds all connection state, mirroring Python's Wrapper class.
+// Manager holds all connection state, organized by domain.
 // All mutations happen on the reader goroutine; reads use RWMutex.
 type Manager struct {
 	Mu sync.RWMutex
 
-	// Account data
-	AccountValues map[string]*account.AccountValue // "account:tag:currency:modelCode" → value
-	Portfolio     map[string]map[int64]*account.PortfolioItem // account → conId → item
-	Positions     map[string]map[int64]*account.Position      // account → conId → position
-
-	// Order tracking
-	Trades       map[OrderKey]*order.Trade // (clientID, orderID) → trade
-	PermID2Trade map[int64]*order.Trade    // permID → trade
-	Fills        map[string]*order.Fill    // execID → fill
-
-	// Market data
-	Tickers        map[int64]*market.Ticker  // contract key → ticker
-	PendingTickers map[*market.Ticker]bool
-	ReqID2Ticker   map[int64]*market.Ticker  // reqID → ticker
-
-	// Subscriptions
-	ReqID2Subscriber map[int64]interface{} // reqID → BarDataList or ScanDataList
-
-	// PnL
-	ReqID2PnL       map[int64]*account.PnL
-	ReqID2PnLSingle map[int64]*account.PnLSingle
+	// Domain-specific state
+	OrderState
+	AccountState
+	MarketState
 
 	// Request-response tracking
 	Requests       *RequestMap
-	Results        map[int64]interface{} // reqID → accumulated results
+	Results        map[int64]interface{}
 	ReqID2Contract map[int64]*contract.Contract
 
 	// News
 	NewsBulletins map[int]*account.NewsBulletin
 
 	// Timing
-	LastTime time.Time
+	LastTime  time.Time
+	TimeFloat float64 // time.Time as float (for fast timestamp)
 
 	// Accounts
 	Accounts []string
@@ -62,22 +46,13 @@ type Manager struct {
 // NewManager creates a new state Manager with initialized maps.
 func NewManager() *Manager {
 	return &Manager{
-		AccountValues:    make(map[string]*account.AccountValue),
-		Portfolio:        make(map[string]map[int64]*account.PortfolioItem),
-		Positions:        make(map[string]map[int64]*account.Position),
-		Trades:           make(map[OrderKey]*order.Trade),
-		PermID2Trade:     make(map[int64]*order.Trade),
-		Fills:            make(map[string]*order.Fill),
-		Tickers:          make(map[int64]*market.Ticker),
-		PendingTickers:   make(map[*market.Ticker]bool),
-		ReqID2Ticker:     make(map[int64]*market.Ticker),
-		ReqID2Subscriber: make(map[int64]interface{}),
-		ReqID2PnL:        make(map[int64]*account.PnL),
-		ReqID2PnLSingle:  make(map[int64]*account.PnLSingle),
-		Requests:         NewRequestMap(),
-		Results:          make(map[int64]interface{}),
-		ReqID2Contract:   make(map[int64]*contract.Contract),
-		NewsBulletins:    make(map[int]*account.NewsBulletin),
+		OrderState:     newOrderState(),
+		AccountState:   newAccountState(),
+		MarketState:    newMarketState(),
+		Requests:       NewRequestMap(),
+		Results:        make(map[int64]interface{}),
+		ReqID2Contract: make(map[int64]*contract.Contract),
+		NewsBulletins:  make(map[int]*account.NewsBulletin),
 	}
 }
 
@@ -193,23 +168,30 @@ func (m *Manager) GetPortfolio(acct string) []account.PortfolioItem {
 	return result
 }
 
+// GetPendingTickers returns tickers with pending updates.
+func (m *Manager) GetPendingTickers() []*market.Ticker {
+	m.Mu.RLock()
+	defer m.Mu.RUnlock()
+	result := make([]*market.Ticker, 0, len(m.PendingTickers))
+	for t := range m.PendingTickers {
+		result = append(result, t)
+	}
+	return result
+}
+
+// MarkTickerPending marks a ticker as having pending updates.
+func (m *Manager) MarkTickerPending(t *market.Ticker) {
+	m.PendingTickers[t] = true
+}
+
 // Reset clears all state (called on disconnect).
 func (m *Manager) Reset() {
 	m.Mu.Lock()
 	defer m.Mu.Unlock()
 
-	m.AccountValues = make(map[string]*account.AccountValue)
-	m.Portfolio = make(map[string]map[int64]*account.PortfolioItem)
-	m.Positions = make(map[string]map[int64]*account.Position)
-	m.Trades = make(map[OrderKey]*order.Trade)
-	m.PermID2Trade = make(map[int64]*order.Trade)
-	m.Fills = make(map[string]*order.Fill)
-	m.Tickers = make(map[int64]*market.Ticker)
-	m.PendingTickers = make(map[*market.Ticker]bool)
-	m.ReqID2Ticker = make(map[int64]*market.Ticker)
-	m.ReqID2Subscriber = make(map[int64]interface{})
-	m.ReqID2PnL = make(map[int64]*account.PnL)
-	m.ReqID2PnLSingle = make(map[int64]*account.PnLSingle)
+	m.OrderState.reset()
+	m.AccountState.reset()
+	m.MarketState.reset()
 	m.Results = make(map[int64]interface{})
 	m.ReqID2Contract = make(map[int64]*contract.Contract)
 	m.NewsBulletins = make(map[int]*account.NewsBulletin)
