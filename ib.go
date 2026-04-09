@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"strings"
 	"time"
 
@@ -1341,40 +1342,181 @@ func (ib *IB) PlaceOrder(con *contract.Contract, ord *order.Order) (*order.Trade
 	if ord.OrderID == 0 {
 		ord.OrderID = ib.client.GetReqID()
 	}
+	version := ib.client.ServerVersion
+
+	// IB API BUG FIX: strip volatility for non-VOL orders
+	if !strings.HasPrefix(ord.OrderType, "VOL") {
+		ord.Volatility = UnsetDouble
+	}
 
 	trade := order.NewTrade(con, ord)
-
 	key := state.OrderKey{ClientID: int64(ib.client.ClientID), OrderID: ord.OrderID}
 	ib.state.Mu.Lock()
 	ib.state.Trades[key] = trade
 	ib.state.Mu.Unlock()
 
-	if err := ib.client.Send(
+	fields := []interface{}{
 		protocol.MsgPlaceOrder,
 		ord.OrderID,
 		con,
-		con.SecIDType,
-		con.SecID,
-		ord.Action,
-		ord.TotalQuantity,
-		ord.OrderType,
-		ord.LmtPrice,
-		ord.AuxPrice,
-		ord.TIF,
-		ord.OcaGroup,
-		ord.Account,
-		ord.OpenClose,
-		ord.Origin,
-		ord.OrderRef,
-		ord.Transmit,
-		ord.ParentID,
-		ord.BlockOrder,
-		ord.SweepToFill,
-		ord.DisplaySize,
-		ord.TriggerMethod,
-		ord.OutsideRTH,
-		ord.Hidden,
-	); err != nil {
+		con.SecIDType, con.SecID,
+		ord.Action, ord.TotalQuantity, ord.OrderType,
+		ord.LmtPrice, ord.AuxPrice, ord.TIF,
+		ord.OcaGroup, ord.Account, ord.OpenClose,
+		ord.Origin, ord.OrderRef, ord.Transmit,
+		ord.ParentID, ord.BlockOrder, ord.SweepToFill,
+		ord.DisplaySize, ord.TriggerMethod, ord.OutsideRTH, ord.Hidden,
+	}
+
+	// BAG combo legs
+	if con.SecType == "BAG" {
+		legs := con.ComboLegs
+		fields = append(fields, len(legs))
+		for _, leg := range legs {
+			fields = append(fields, leg.ConID, leg.Ratio, leg.Action, leg.Exchange,
+				leg.OpenClose, leg.ShortSaleSlot, leg.DesignatedLocation, leg.ExemptCode)
+		}
+		oLegs := ord.OrderComboLegs
+		fields = append(fields, len(oLegs))
+		for _, leg := range oLegs {
+			fields = append(fields, leg.Price)
+		}
+		params := ord.SmartComboRoutingParams
+		fields = append(fields, len(params))
+		for _, p := range params {
+			fields = append(fields, p.Tag, p.Value)
+		}
+	}
+
+	fields = append(fields,
+		"", // deprecated sharesAllocation
+		ord.DiscretionaryAmt, ord.GoodAfterTime, ord.GoodTillDate,
+		ord.FAGroup, ord.FAMethod, ord.FAPercentage,
+	)
+
+	if version < 177 {
+		fields = append(fields, "") // faProfile (obsolete)
+	}
+
+	fields = append(fields,
+		ord.ModelCode, ord.ShortSaleSlot, ord.DesignatedLocation,
+		ord.ExemptCode, ord.OcaType, ord.Rule80A, ord.SettlingFirm,
+		ord.AllOrNone, ord.MinQty, ord.PercentOffset,
+		ord.ETradeOnly, ord.FirmQuoteOnly, ord.NBBOPriceCap,
+		ord.AuctionStrategy, ord.StartingPrice, ord.StockRefPrice,
+		ord.Delta, ord.StockRangeLower, ord.StockRangeUpper,
+		ord.OverridePercentageConstraints,
+		ord.Volatility, ord.VolatilityType,
+		ord.DeltaNeutralOrderType, ord.DeltaNeutralAuxPrice,
+	)
+
+	if ord.DeltaNeutralOrderType != "" {
+		fields = append(fields,
+			ord.DeltaNeutralConID, ord.DeltaNeutralSettlingFirm,
+			ord.DeltaNeutralClearingAccount, ord.DeltaNeutralClearingIntent,
+			ord.DeltaNeutralOpenClose, ord.DeltaNeutralShortSale,
+			ord.DeltaNeutralShortSaleSlot, ord.DeltaNeutralDesignatedLocation,
+		)
+	}
+
+	fields = append(fields,
+		ord.ContinuousUpdate, ord.ReferencePriceType,
+		ord.TrailStopPrice, ord.TrailingPercent,
+		ord.ScaleInitLevelSize, ord.ScaleSubsLevelSize, ord.ScalePriceIncrement,
+	)
+
+	if ord.ScalePriceIncrement > 0 && ord.ScalePriceIncrement < UnsetDouble {
+		fields = append(fields,
+			ord.ScalePriceAdjustValue, ord.ScalePriceAdjustInterval,
+			ord.ScaleProfitOffset, ord.ScaleAutoReset,
+			ord.ScaleInitPosition, ord.ScaleInitFillQty, ord.ScaleRandomPercent,
+		)
+	}
+
+	fields = append(fields, ord.ScaleTable, ord.ActiveStartTime, ord.ActiveStopTime, ord.HedgeType)
+	if ord.HedgeType != "" {
+		fields = append(fields, ord.HedgeParam)
+	}
+
+	fields = append(fields, ord.OptOutSmartRouting, ord.ClearingAccount, ord.ClearingIntent, ord.NotHeld)
+
+	if con.DeltaNeutralContract != nil {
+		dnc := con.DeltaNeutralContract
+		fields = append(fields, true, dnc.ConID, dnc.Delta, dnc.Price)
+	} else {
+		fields = append(fields, false)
+	}
+
+	fields = append(fields, ord.AlgoStrategy)
+	if ord.AlgoStrategy != "" {
+		fields = append(fields, len(ord.AlgoParams))
+		for _, p := range ord.AlgoParams {
+			fields = append(fields, p.Tag, p.Value)
+		}
+	}
+
+	fields = append(fields, ord.AlgoID, ord.WhatIf, ord.OrderMiscOptions,
+		ord.Solicited, ord.RandomizeSize, ord.RandomizePrice,
+	)
+
+	if ord.OrderType == "PEG BENCH" || ord.OrderType == "PEGBENCH" {
+		fields = append(fields,
+			ord.ReferenceContractID, ord.IsPeggedChangeAmountDecrease,
+			ord.PeggedChangeAmount, ord.ReferenceChangeAmount, ord.ReferenceExchangeID,
+		)
+	}
+
+	fields = append(fields, len(ord.Conditions))
+	if len(ord.Conditions) > 0 {
+		for _, cond := range ord.Conditions {
+			fields = append(fields, encodeCondition(cond)...)
+		}
+		fields = append(fields, ord.ConditionsIgnoreRTH, ord.ConditionsCancelOrder)
+	}
+
+	fields = append(fields,
+		ord.AdjustedOrderType, ord.TriggerPrice, ord.LmtPriceOffset,
+		ord.AdjustedStopPrice, ord.AdjustedStopLimitPrice,
+		ord.AdjustedTrailingAmount, ord.AdjustableTrailingUnit,
+		ord.ExtOperator,
+		ord.SoftDollarTier.Name, ord.SoftDollarTier.Val,
+		ord.CashQty,
+		ord.Mifid2DecisionMaker, ord.Mifid2DecisionAlgo,
+		ord.Mifid2ExecutionTrader, ord.Mifid2ExecutionAlgo,
+		ord.DontUseAutoPriceForHedge, ord.IsOmsContainer,
+		ord.DiscretionaryUpToLimitPrice, ord.UsePriceMgmtAlgo,
+	)
+
+	if version >= 158 {
+		fields = append(fields, ord.Duration)
+	}
+	if version >= 160 {
+		fields = append(fields, ord.PostToAts)
+	}
+	if version >= 162 {
+		fields = append(fields, ord.AutoCancelParent)
+	}
+	if version >= 166 {
+		fields = append(fields, ord.AdvancedErrorOverride)
+	}
+	if version >= 169 {
+		fields = append(fields, ord.ManualOrderTime)
+	}
+	if version >= 170 {
+		if con.Exchange == "IBKRATS" {
+			fields = append(fields, ord.MinTradeQty)
+		}
+		if ord.OrderType == "PEG BEST" || ord.OrderType == "PEGBEST" {
+			fields = append(fields, ord.MinCompeteSize, ord.CompeteAgainstBestOffset)
+			if ord.CompeteAgainstBestOffset == math.Inf(1) {
+				fields = append(fields, ord.MidOffsetAtWhole, ord.MidOffsetAtHalf)
+			}
+		} else if ord.OrderType == "PEG MID" || ord.OrderType == "PEGMID" {
+			fields = append(fields, ord.MidOffsetAtWhole, ord.MidOffsetAtHalf)
+		}
+	}
+
+	if err := ib.client.Send(fields...); err != nil {
 		ib.state.Mu.Lock()
 		delete(ib.state.Trades, key)
 		ib.state.Mu.Unlock()
@@ -1383,6 +1525,25 @@ func (ib *IB) PlaceOrder(con *contract.Contract, ord *order.Order) (*order.Trade
 
 	ib.NewOrderEvent.Emit(trade)
 	return trade, nil
+}
+
+func encodeCondition(cond order.OrderCondition) []interface{} {
+	switch c := cond.(type) {
+	case *order.PriceCondition:
+		return []interface{}{c.CondType(), c.Conjunction, c.IsMore, c.Price, c.ConID, c.Exchange, c.TriggerMethod}
+	case *order.TimeCondition:
+		return []interface{}{c.CondType(), c.Conjunction, c.IsMore, c.Time}
+	case *order.MarginCondition:
+		return []interface{}{c.CondType(), c.Conjunction, c.IsMore, c.Percent}
+	case *order.ExecutionCondition:
+		return []interface{}{c.CondType(), c.Conjunction, c.SecType, c.Exchange, c.Symbol}
+	case *order.VolumeCondition:
+		return []interface{}{c.CondType(), c.Conjunction, c.IsMore, c.Volume, c.ConID, c.Exchange}
+	case *order.PercentChangeCondition:
+		return []interface{}{c.CondType(), c.Conjunction, c.IsMore, c.ChangePercent, c.ConID, c.Exchange}
+	default:
+		return nil
+	}
 }
 
 // CancelOrder cancels an order.
@@ -1397,40 +1558,52 @@ func (ib *IB) handleOpenOrderEnd(r *protocol.FieldReader) {
 }
 
 func (ib *IB) handleExecDetails(r *protocol.FieldReader) {
+	// Python: _, reqId, ex.orderId, c.conId, c.symbol, c.secType, ...contract..., ex.execId, time, ...exec...
+	// skip=2 default: msgId already skipped by Decoder, skip version here
 	r.Skip(1) // version
 	reqID := r.ReadInt()
 
-	exec := &order.Execution{
-		OrderID:    r.ReadInt(),
-		ExecID:     r.ReadString(),
-		Time:       parseBarDate(r.ReadString()),
-		AcctNumber: r.ReadString(),
-		Exchange:   r.ReadString(),
-		Side:       r.ReadString(),
-		Shares:     r.ReadFloat(),
-		Price:      r.ReadFloat(),
-		PermID:     r.ReadInt(),
-		ClientID:   r.ReadInt(),
-		Liquidation: int(r.ReadInt()),
-		CumQty:     r.ReadFloat(),
-		AvgPrice:   r.ReadFloat(),
-		OrderRef:   r.ReadString(),
-		EvRule:     r.ReadString(),
-		EvMultiplier: r.ReadFloat(),
-		ModelCode:  r.ReadString(),
-	}
+	exec := &order.Execution{}
+	c := &contract.Contract{}
 
-	if ib.client.ServerVersion >= 160 {
-		exec.LastLiquidity = int(r.ReadInt())
-	}
-	if ib.client.ServerVersion >= 164 {
+	// Order ID first
+	exec.OrderID = r.ReadInt()
+
+	// Embedded contract fields
+	c.ConID = r.ReadInt()
+	c.Symbol = r.ReadString()
+	c.SecType = r.ReadString()
+	c.LastTradeDateOrContractMonth = r.ReadString()
+	c.Strike = r.ReadFloat()
+	c.Right = r.ReadString()
+	c.Multiplier = r.ReadString()
+	c.Exchange = r.ReadString()
+	c.Currency = r.ReadString()
+	c.LocalSymbol = r.ReadString()
+	c.TradingClass = r.ReadString()
+
+	// Execution fields
+	exec.ExecID = r.ReadString()
+	exec.Time = parseBarDate(r.ReadString())
+	exec.AcctNumber = r.ReadString()
+	exec.Exchange = r.ReadString()
+	exec.Side = r.ReadString()
+	exec.Shares = r.ReadFloat()
+	exec.Price = r.ReadFloat()
+	exec.PermID = r.ReadInt()
+	exec.ClientID = r.ReadInt()
+	exec.Liquidation = int(r.ReadInt())
+	exec.CumQty = r.ReadFloat()
+	exec.AvgPrice = r.ReadFloat()
+	exec.OrderRef = r.ReadString()
+	exec.EvRule = r.ReadString()
+	exec.EvMultiplier = r.ReadFloat()
+	exec.ModelCode = r.ReadString()
+	exec.LastLiquidity = int(r.ReadInt())
+
+	if ib.client.ServerVersion >= 178 {
 		exec.PendingPriceRevision = r.ReadBool()
 	}
-
-	// Read contract fields embedded in exec message
-	c := &contract.Contract{ConID: exec.OrderID} // placeholder
-	// The actual contract is embedded before the execution in the wire format,
-	// but we skip it for now and use the trade's contract
 
 	fill := &order.Fill{
 		Contract:  c,
