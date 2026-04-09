@@ -21,9 +21,9 @@
 ### Implemented but NOT Live-Verified
 | Method | Status | Notes |
 |--------|--------|-------|
-| ReqRealTimeBars | ⚠️ partial | Handler + subscription, not tested live |
-| ReqAccountUpdates | ⚠️ partial | Subscription, no cancel |
-| ReqOpenOrders | ⚠️ partial | openOrder decoder done, reqOpenOrders sends |
+| ReqRealTimeBars | ⚠️ partial | Handler + subscription, not tested live. No public CancelRealTimeBars verified. |
+| ReqAccountUpdates | ⚠️ protocol only | Client.ReqAccountUpdates sends, handler exists, but NO public IB.ReqAccountUpdates method |
+| ReqOpenOrders | ⚠️ protocol only | Client.ReqOpenOrders sends, openOrder decoder done, but NO public IB.ReqOpenOrders method |
 
 ### NOT Implemented (Missing from Python ib_async)
 | Method | Priority | Python Location |
@@ -50,7 +50,9 @@
 
 **Handled: 29 / 82 message types defined**
 
-Covered: tickPrice, tickSize, orderStatus, errMsg, openOrder, updateAccountValue, updatePortfolio, updateAccountTime, nextValidId, contractDetails, execDetails, managedAccounts, historicalData, tickGeneric, tickString, currentTime, contractDetailsEnd, openOrderEnd, accountDownloadEnd, execDetailsEnd, commissionReport, position, positionEnd, accountSummary, accountSummaryEnd, realtimeBar, secDefOptParams, secDefOptParamsEnd, tickSnapshotEnd, marketDataType, historicalDataUpdate
+Covered (in handleMessage dispatch): tickPrice(1), tickSize(2), orderStatus(3), errMsg(4), openOrder(5), updateAccountValue(6), updatePortfolio(7), nextValidId(9), contractDetails(10), execDetails(11), managedAccounts(15), historicalData(17), tickGeneric(45), tickString(46), realtimeBar(50), contractDetailsEnd(52), openOrderEnd(53), accountDownloadEnd(54), execDetailsEnd(55), tickSnapshotEnd(57), marketDataType(58), commissionReport(59), position(61), positionEnd(62), accountSummary(63), accountSummaryEnd(64), secDefOptParams(75), secDefOptParamsEnd(76), historicalDataUpdate(90)
+
+NOT in dispatch (despite being claimed previously): updateAccountTime(8), currentTime(49)
 
 Not covered: bondContractDetails, scannerData, tickOptionComputation, tickEFP, fundamentalData, deltaNeutralValidation, tickReqParams, symbolSamples, mktDepthExchanges, tickNews, newsProviders, newsArticle, historicalNews, headTimestamp, histogramData, pnl, pnlSingle, historicalTicks, tickByTick, orderBound, completedOrder, completedOrdersEnd, wshMetaData, wshEventData, historicalSchedule, userInfo, and others
 

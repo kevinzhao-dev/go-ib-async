@@ -510,7 +510,6 @@ func (ib *IB) handleAccountSummaryEnd(r *protocol.FieldReader) {
 }
 
 func (ib *IB) handleOrderStatus(r *protocol.FieldReader) {
-	// Simplified order status handling
 	orderID := r.ReadInt()
 	status := r.ReadString()
 	filled := r.ReadFloat()
@@ -523,27 +522,62 @@ func (ib *IB) handleOrderStatus(r *protocol.FieldReader) {
 	whyHeld := r.ReadString()
 	mktCapPrice := r.ReadFloat()
 
-	key := state.OrderKey{ClientID: clientID, OrderID: orderID}
+	// Use same key logic as openOrder: try (clientId, orderId), fallback to permId for manual orders
 	ib.state.Mu.Lock()
+	key := orderKeyFromIDs(clientID, orderID, permID)
 	trade, ok := ib.state.Trades[key]
-	ib.state.Mu.Unlock()
+	if !ok && permID != 0 {
+		// Try permId lookup for manual/cross-client orders
+		trade, ok = ib.state.PermID2Trade[permID], ib.state.PermID2Trade[permID] != nil
+	}
 
 	if ok {
+		oldStatus := trade.OrderStatus.Status
 		trade.OrderStatus = &order.OrderStatus{
-			OrderID:      orderID,
-			Status:       status,
-			Filled:       filled,
-			Remaining:    remaining,
-			AvgFillPrice: avgFillPrice,
-			PermID:       permID,
-			ParentID:     parentID,
+			OrderID:       orderID,
+			Status:        status,
+			Filled:        filled,
+			Remaining:     remaining,
+			AvgFillPrice:  avgFillPrice,
+			PermID:        permID,
+			ParentID:      parentID,
 			LastFillPrice: lastFillPrice,
-			ClientID:     clientID,
-			WhyHeld:      whyHeld,
-			MktCapPrice:  mktCapPrice,
+			ClientID:      clientID,
+			WhyHeld:       whyHeld,
+			MktCapPrice:   mktCapPrice,
 		}
+		ib.state.Mu.Unlock()
+
+		// Log status change
+		if status != oldStatus {
+			logEntry := order.TradeLogEntry{
+				Time:    time.Now(),
+				Status:  status,
+				Message: "",
+			}
+			trade.Log = append(trade.Log, logEntry)
+		}
+
 		ib.OrderStatusEvent.Emit(trade)
+		trade.StatusEvent.Emit(trade)
+
+		if status != oldStatus {
+			if status == order.StatusFilled {
+				trade.FilledEvent.Emit(trade)
+			} else if status == order.StatusCancelled {
+				trade.CancelledEvent.Emit(trade)
+			}
+		}
+	} else {
+		ib.state.Mu.Unlock()
 	}
+}
+
+func orderKeyFromIDs(clientID, orderID, permID int64) state.OrderKey {
+	if orderID <= 0 {
+		return state.OrderKey{ClientID: 0, OrderID: permID}
+	}
+	return state.OrderKey{ClientID: clientID, OrderID: orderID}
 }
 
 func (ib *IB) handleOpenOrder(r *protocol.FieldReader) {
@@ -1349,11 +1383,35 @@ func (ib *IB) PlaceOrder(con *contract.Contract, ord *order.Order) (*order.Trade
 		ord.Volatility = UnsetDouble
 	}
 
-	trade := order.NewTrade(con, ord)
-	key := state.OrderKey{ClientID: int64(ib.client.ClientID), OrderID: ord.OrderID}
+	now := time.Now()
+	ord.ClientID = int64(ib.client.ClientID)
+	key := orderKeyFromIDs(ord.ClientID, ord.OrderID, ord.PermID)
+
 	ib.state.Mu.Lock()
-	ib.state.Trades[key] = trade
+	existingTrade, isModify := ib.state.Trades[key]
 	ib.state.Mu.Unlock()
+
+	var trade *order.Trade
+	if isModify {
+		// Modify existing order
+		trade = existingTrade
+		logEntry := order.TradeLogEntry{Time: now, Status: trade.OrderStatus.Status, Message: "Modify"}
+		trade.Log = append(trade.Log, logEntry)
+		trade.ModifyEvent.Emit(trade)
+	} else {
+		// New order
+		os := &order.OrderStatus{OrderID: ord.OrderID, Status: order.StatusPendingSubmit}
+		logEntry := order.TradeLogEntry{Time: now, Status: order.StatusPendingSubmit}
+		trade = &order.Trade{
+			Contract:    con,
+			Order:       ord,
+			OrderStatus: os,
+			Log:         []order.TradeLogEntry{logEntry},
+		}
+		ib.state.Mu.Lock()
+		ib.state.Trades[key] = trade
+		ib.state.Mu.Unlock()
+	}
 
 	fields := []interface{}{
 		protocol.MsgPlaceOrder,
@@ -1523,7 +1581,9 @@ func (ib *IB) PlaceOrder(con *contract.Contract, ord *order.Order) (*order.Trade
 		return nil, err
 	}
 
-	ib.NewOrderEvent.Emit(trade)
+	if !isModify {
+		ib.NewOrderEvent.Emit(trade)
+	}
 	return trade, nil
 }
 
@@ -1605,18 +1665,57 @@ func (ib *IB) handleExecDetails(r *protocol.FieldReader) {
 		exec.PendingPriceRevision = r.ReadBool()
 	}
 
-	fill := &order.Fill{
-		Contract:  c,
-		Execution: exec,
-		Time:      exec.Time,
+	// IB TWS bug: manual order executions have orderId == UNSET_INTEGER
+	if exec.OrderID == int64(math.MaxInt32) {
+		exec.OrderID = 0
 	}
 
+	fill := &order.Fill{
+		Contract:         c,
+		Execution:        exec,
+		CommissionReport: &order.CommissionReport{},
+		Time:             exec.Time,
+	}
+
+	// Find the trade for this execution
+	isLive := !ib.state.Requests.Has(reqID)
 	ib.state.Mu.Lock()
-	ib.state.Fills[exec.ExecID] = fill
+	// First try permId, then orderKey
+	trade := ib.state.PermID2Trade[exec.PermID]
+	if trade == nil {
+		key := orderKeyForExec(exec)
+		trade = ib.state.Trades[key]
+	}
+	if _, exists := ib.state.Fills[exec.ExecID]; !exists {
+		ib.state.Fills[exec.ExecID] = fill
+		if trade != nil {
+			trade.Fills = append(trade.Fills, fill)
+			logEntry := order.TradeLogEntry{
+				Time:    exec.Time,
+				Status:  trade.OrderStatus.Status,
+				Message: fmt.Sprintf("Fill %g@%g", exec.Shares, exec.Price),
+			}
+			trade.Log = append(trade.Log, logEntry)
+		}
+	}
 	ib.state.Mu.Unlock()
 
-	ib.state.AppendResult(reqID, fill)
-	ib.ExecDetailsEvent.Emit(fill)
+	if isLive && trade != nil {
+		ib.ExecDetailsEvent.Emit(fill)
+		trade.FillEvent.Emit(fill)
+	}
+
+	// For reqExecutions responses, accumulate results
+	if !isLive {
+		ib.state.AppendResult(reqID, fill)
+	}
+}
+
+func orderKeyForExec(exec *order.Execution) state.OrderKey {
+	if exec.OrderID <= 0 {
+		return state.OrderKey{ClientID: 0, OrderID: exec.PermID}
+	}
+	return state.OrderKey{ClientID: exec.ClientID, OrderID: exec.OrderID}
 }
 
 func (ib *IB) handleExecDetailsEnd(r *protocol.FieldReader) {
@@ -1636,12 +1735,32 @@ func (ib *IB) handleCommissionReport(r *protocol.FieldReader) {
 		YieldRedemptionDate: int(r.ReadInt()),
 	}
 
+	if cr.RealizedPNL == math.MaxFloat64 {
+		cr.RealizedPNL = 0
+	}
+	if cr.Yield == math.MaxFloat64 {
+		cr.Yield = 0
+	}
+
 	ib.state.Mu.Lock()
 	fill, ok := ib.state.Fills[cr.ExecID]
 	if ok {
 		fill.CommissionReport = cr
 	}
+	// Find trade for commission event
+	var trade *order.Trade
+	if ok {
+		trade = ib.state.PermID2Trade[fill.Execution.PermID]
+	}
 	ib.state.Mu.Unlock()
+
+	if trade != nil && fill != nil {
+		trade.CommissionReportEvent.Emit(fill)
+		// Check if fully filled
+		if trade.OrderStatus.Status == order.StatusFilled {
+			trade.FilledEvent.Emit(trade)
+		}
+	}
 }
 
 func (ib *IB) handleUpdatePortfolio(r *protocol.FieldReader) {
