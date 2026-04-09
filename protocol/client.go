@@ -225,6 +225,7 @@ func (c *Client) readLoop() {
 		}
 	}()
 
+	inBatch := false
 	for {
 		fields, err := c.Conn.ReadMessage()
 		if err != nil {
@@ -259,7 +260,10 @@ func (c *Client) readLoop() {
 		}
 
 		// Snoop for nextValidId (9) and managedAccounts (15) before API is ready
-		if !c.apiReady && len(fields) >= 3 {
+		c.mu.Lock()
+		ready := c.apiReady
+		c.mu.Unlock()
+		if !ready && len(fields) >= 3 {
 			msgID, _ := strconv.Atoi(fields[0])
 			if msgID == InMsgNextValidID {
 				validID, _ := strconv.ParseInt(fields[2], 10, 64)
@@ -282,9 +286,12 @@ func (c *Client) readLoop() {
 			}
 		}
 
-		// Pre-message hook
-		if c.OnDataArrived != nil {
-			c.OnDataArrived()
+		// Batch boundary: fire OnDataArrived at start of a new batch
+		if !inBatch {
+			inBatch = true
+			if c.OnDataArrived != nil {
+				c.OnDataArrived()
+			}
 		}
 
 		// Dispatch to message handler
@@ -304,9 +311,12 @@ func (c *Client) readLoop() {
 			}
 		}
 
-		// Post-message hook
-		if c.OnDataProcessed != nil {
-			c.OnDataProcessed()
+		// Batch boundary: fire OnDataProcessed only when no more buffered data
+		if !c.Conn.HasPending() {
+			inBatch = false
+			if c.OnDataProcessed != nil {
+				c.OnDataProcessed()
+			}
 		}
 	}
 }

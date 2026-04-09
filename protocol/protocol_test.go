@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -195,7 +196,7 @@ func TestConnectionSendReceive(t *testing.T) {
 	defer server.Close()
 	defer client.Close()
 
-	conn := &Connection{conn: client}
+	conn := &Connection{conn: client, reader: bufio.NewReader(client)}
 
 	// Send a message in a goroutine
 	go func() {
@@ -220,7 +221,7 @@ func TestConnectionReadMessage(t *testing.T) {
 	defer server.Close()
 	defer client.Close()
 
-	conn := &Connection{conn: client}
+	conn := &Connection{conn: client, reader: bufio.NewReader(client)}
 
 	// Write a framed message from "server" side
 	go func() {

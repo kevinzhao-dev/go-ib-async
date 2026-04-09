@@ -124,10 +124,8 @@ func (ib *IB) heartbeatLoop(ctx context.Context, cfg ReconnectConfig, done chan 
 			}
 
 			// Send probe and wait for response with timeout
-			probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 			err := ib.client.ReqCurrentTime()
 			if err != nil {
-				cancel()
 				log.Printf("ibgo: heartbeat write failed: %v", err)
 				ib.Disconnect()
 				return
@@ -135,9 +133,9 @@ func (ib *IB) heartbeatLoop(ctx context.Context, cfg ReconnectConfig, done chan 
 
 			// Wait for any response (currentTime handler updates LastTime)
 			timeBefore := ib.state.LastTime
+			timer := time.NewTimer(probeTimeout)
 			select {
-			case <-time.After(probeTimeout):
-				cancel()
+			case <-timer.C:
 				// Check if any data arrived since probe
 				if ib.state.LastTime.Equal(timeBefore) {
 					log.Printf("ibgo: heartbeat timeout — peer not responding, disconnecting")
@@ -145,10 +143,10 @@ func (ib *IB) heartbeatLoop(ctx context.Context, cfg ReconnectConfig, done chan 
 					return
 				}
 			case <-ib.client.Done():
-				cancel()
+				timer.Stop()
 				return
-			case <-probeCtx.Done():
-				cancel()
+			case <-ctx.Done():
+				timer.Stop()
 				return
 			}
 		case <-ib.client.Done():

@@ -2,6 +2,7 @@
 package protocol
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -14,8 +15,9 @@ import (
 
 // Connection manages a TCP connection to TWS/Gateway with IB message framing.
 type Connection struct {
-	conn net.Conn
-	mu   sync.Mutex // protects writes
+	conn   net.Conn
+	reader *bufio.Reader // buffered reader for batch detection
+	mu     sync.Mutex    // protects writes
 
 	NumBytesSent atomic.Int64
 	NumMsgSent   atomic.Int64
@@ -31,26 +33,35 @@ func (c *Connection) Connect(host string, port int) error {
 		return err
 	}
 	c.conn = conn
+	c.reader = bufio.NewReaderSize(conn, 64*1024)
 	return nil
 }
 
 // Disconnect closes the TCP connection.
+// The conn.Close() unblocks any pending ReadMessage call.
 func (c *Connection) Disconnect() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.conn == nil {
 		return nil
 	}
 	err := c.conn.Close()
 	c.conn = nil
+	c.reader = nil
 	return err
 }
 
 // IsConnected returns true if a TCP connection exists.
 func (c *Connection) IsConnected() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c.conn != nil
 }
 
 // Conn returns the underlying net.Conn (for setting deadlines, etc.).
 func (c *Connection) Conn() net.Conn {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c.conn
 }
 
@@ -94,13 +105,16 @@ func (c *Connection) SendMessage(payload []byte) error {
 // ReadMessage reads one length-prefixed message and splits on null bytes.
 // Returns the fields (without trailing empty string).
 func (c *Connection) ReadMessage() ([]string, error) {
-	if c.conn == nil {
+	c.mu.Lock()
+	r := c.reader
+	c.mu.Unlock()
+	if r == nil {
 		return nil, fmt.Errorf("not connected")
 	}
 
 	// Read 4-byte length prefix
 	header := make([]byte, 4)
-	if _, err := io.ReadFull(c.conn, header); err != nil {
+	if _, err := io.ReadFull(r, header); err != nil {
 		return nil, err
 	}
 	msgLen := binary.BigEndian.Uint32(header)
@@ -113,7 +127,7 @@ func (c *Connection) ReadMessage() ([]string, error) {
 
 	// Read message body
 	body := make([]byte, msgLen)
-	if _, err := io.ReadFull(c.conn, body); err != nil {
+	if _, err := io.ReadFull(r, body); err != nil {
 		return nil, err
 	}
 
@@ -128,4 +142,13 @@ func (c *Connection) ReadMessage() ([]string, error) {
 	}
 
 	return fields, nil
+}
+
+// HasPending returns true if the buffered reader has unprocessed data,
+// meaning more IB messages arrived in the same network read batch.
+func (c *Connection) HasPending() bool {
+	c.mu.Lock()
+	r := c.reader
+	c.mu.Unlock()
+	return r != nil && r.Buffered() > 0
 }

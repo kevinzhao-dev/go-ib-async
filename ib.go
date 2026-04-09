@@ -7,8 +7,9 @@ import (
 	"log"
 	"math"
 	"strconv"
-	"sync/atomic"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kevinzhao-dev/go-ib-async/account"
@@ -25,9 +26,14 @@ type IB struct {
 	client *protocol.Client
 	state  *state.Manager
 
-	// Synthetic request keys for messages without wire reqID
-	completedOrdersKey atomic.Int64
-	positionsKey       atomic.Int64
+	// Synthetic request key generator (always negative, unique)
+	syntheticReqID atomic.Int64
+
+	// Serialization for subscription-style requests (IB sends one response stream)
+	positionsMu       sync.Mutex
+	positionsReqID    int64 // active key, protected by positionsMu
+	completedOrdersMu sync.Mutex
+	completedReqID    int64 // active key, protected by completedOrdersMu
 
 	// Events
 	ConnectedEvent    event.Event[struct{}]
@@ -168,15 +174,19 @@ func (ib *IB) ReqContractDetails(ctx context.Context, con *contract.Contract) ([
 }
 
 // ReqPositions requests all positions.
+// Serialized: IB sends one positionEnd for all outstanding position requests.
 func (ib *IB) ReqPositions(ctx context.Context) ([]account.Position, error) {
-	reqID := ib.positionsKey.Add(1) * -1
-	ib.positionsKey.Store(reqID)
+	ib.positionsMu.Lock()
+	reqID := ib.syntheticReqID.Add(-1)
+	ib.positionsReqID = reqID
 	ch := ib.state.StartReq(reqID, nil)
 
 	if err := ib.client.ReqPositions(); err != nil {
 		ib.state.Requests.Cancel(reqID)
+		ib.positionsMu.Unlock()
 		return nil, err
 	}
+	ib.positionsMu.Unlock()
 
 	select {
 	case result := <-ch:
@@ -495,7 +505,12 @@ func (ib *IB) handlePosition(r *protocol.FieldReader) {
 }
 
 func (ib *IB) handlePositionEnd(r *protocol.FieldReader) {
-	ib.state.EndReq(ib.positionsKey.Load(), nil, nil)
+	ib.positionsMu.Lock()
+	key := ib.positionsReqID
+	ib.positionsMu.Unlock()
+	if key != 0 {
+		ib.state.EndReq(key, nil, nil)
+	}
 }
 
 func (ib *IB) handleUpdateAccountValue(r *protocol.FieldReader) {
@@ -2110,15 +2125,19 @@ func (ib *IB) CancelRealTimeBars(rtbl *market.RealTimeBarList) {
 }
 
 // ReqCompletedOrders requests all completed (filled/cancelled) orders.
+// Serialized: IB sends one completedOrdersEnd for all outstanding requests.
 func (ib *IB) ReqCompletedOrders(ctx context.Context, apiOnly bool) ([]*order.Trade, error) {
-	key := ib.completedOrdersKey.Add(1) * -1 // negative synthetic key
-	ib.completedOrdersKey.Store(key)          // store active key for handlers
+	ib.completedOrdersMu.Lock()
+	key := ib.syntheticReqID.Add(-1)
+	ib.completedReqID = key
 
 	ch := ib.state.StartReq(key, nil)
 	if err := ib.client.ReqCompletedOrders(apiOnly); err != nil {
 		ib.state.Requests.Cancel(key)
+		ib.completedOrdersMu.Unlock()
 		return nil, err
 	}
+	ib.completedOrdersMu.Unlock()
 	select {
 	case result := <-ch:
 		if result.Err != nil {
@@ -2367,11 +2386,21 @@ func (ib *IB) handleCompletedOrder(r *protocol.FieldReader) {
 	}
 	ib.state.Mu.Unlock()
 
-	ib.state.AppendResult(ib.completedOrdersKey.Load(), trade)
+	ib.completedOrdersMu.Lock()
+	key := ib.completedReqID
+	ib.completedOrdersMu.Unlock()
+	if key != 0 {
+		ib.state.AppendResult(key, trade)
+	}
 }
 
 func (ib *IB) handleCompletedOrdersEnd(r *protocol.FieldReader) {
-	ib.state.EndReq(ib.completedOrdersKey.Load(), nil, nil)
+	ib.completedOrdersMu.Lock()
+	key := ib.completedReqID
+	ib.completedOrdersMu.Unlock()
+	if key != 0 {
+		ib.state.EndReq(key, nil, nil)
+	}
 }
 
 func (ib *IB) handleOrderBound(r *protocol.FieldReader) {

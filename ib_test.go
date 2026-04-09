@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/binary"
 	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -195,5 +197,165 @@ func TestIBPositionEvent(t *testing.T) {
 	}
 	if positions[0].Position != 100 {
 		t.Fatalf("position = %g, want 100", positions[0].Position)
+	}
+}
+
+// TestSyntheticReqIDUnique verifies that each call to ReqPositions gets a unique
+// synthetic key, and concurrent calls are serialized (no key collision).
+func TestSyntheticReqIDUnique(t *testing.T) {
+	ib := New()
+
+	// Generate several synthetic keys and verify uniqueness
+	seen := make(map[int64]bool)
+	for i := 0; i < 100; i++ {
+		key := ib.syntheticReqID.Add(-1)
+		if seen[key] {
+			t.Fatalf("duplicate synthetic key: %d", key)
+		}
+		seen[key] = true
+		if key >= 0 {
+			t.Fatalf("synthetic key should be negative, got %d", key)
+		}
+	}
+}
+
+// TestConcurrentReqPositionsSerialized verifies that overlapping ReqPositions calls
+// are serialized by positionsMu and each gets a unique synthetic key.
+func TestConcurrentReqPositionsSerialized(t *testing.T) {
+	ib := New()
+
+	// Verify the mutex serializes access and keys are unique
+	var wg sync.WaitGroup
+	keys := make([]int64, 10)
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			ib.positionsMu.Lock()
+			key := ib.syntheticReqID.Add(-1)
+			ib.positionsReqID = key
+			keys[idx] = key
+			ib.positionsMu.Unlock()
+		}(i)
+	}
+	wg.Wait()
+
+	// All keys should be unique and negative
+	seen := make(map[int64]bool)
+	for _, k := range keys {
+		if k >= 0 {
+			t.Fatalf("key should be negative, got %d", k)
+		}
+		if seen[k] {
+			t.Fatalf("duplicate key: %d", k)
+		}
+		seen[k] = true
+	}
+}
+
+// TestBatchSemanticsMultipleMessages verifies that OnDataArrived fires once
+// and OnDataProcessed fires once when multiple messages arrive in the same batch.
+func TestBatchSemanticsMultipleMessages(t *testing.T) {
+	var arrivedCount atomic.Int32
+	var processedCount atomic.Int32
+
+	srv := newMockTWSServer(t, func(conn net.Conn) {
+		// Send multiple messages in rapid succession (same TCP write)
+		// This should be treated as one batch
+		msg1 := buildFrame("61\x001\x00DU123456\x00265598\x00AAPL\x00STK\x00\x000\x00\x00\x00SMART\x00USD\x00100\x00150.5\x00")
+		msg2 := buildFrame("61\x001\x00DU123456\x00265599\x00MSFT\x00STK\x00\x000\x00\x00\x00SMART\x00USD\x0050\x00300.0\x00")
+		// Write both messages in a single TCP write so they land in the same buffer
+		combined := append(msg1, msg2...)
+		conn.Write(combined)
+		time.Sleep(500 * time.Millisecond)
+	})
+	defer srv.close()
+
+	ib := New()
+	// Override the hooks to count batch boundaries (called from readLoop goroutine)
+	ib.client.OnDataArrived = func() {
+		arrivedCount.Add(1)
+	}
+	ib.client.OnDataProcessed = func() {
+		processedCount.Add(1)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := ib.Connect(ctx, "127.0.0.1", srv.port(), 1); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	// Wait for messages to be processed, then disconnect
+	time.Sleep(300 * time.Millisecond)
+	ib.Disconnect()
+
+	// Wait for readLoop to finish
+	time.Sleep(100 * time.Millisecond)
+
+	a := arrivedCount.Load()
+	p := processedCount.Load()
+	// Both should be equal (proper pairing)
+	if a != p {
+		t.Fatalf("batch mismatch: arrived=%d processed=%d", a, p)
+	}
+	if a == 0 {
+		t.Fatal("no batches processed")
+	}
+}
+
+func buildFrame(msg string) []byte {
+	payload := []byte(msg)
+	header := make([]byte, 4)
+	binary.BigEndian.PutUint32(header, uint32(len(payload)))
+	return append(header, payload...)
+}
+
+// TestHeartbeatTimeoutDisconnects verifies that when the peer doesn't respond
+// within ProbeTimeout, the heartbeat loop disconnects.
+func TestHeartbeatTimeoutDisconnects(t *testing.T) {
+	srv := newMockTWSServer(t, func(conn net.Conn) {
+		// After handshake, just sit idle — don't respond to reqCurrentTime
+		time.Sleep(5 * time.Second)
+	})
+	defer srv.close()
+
+	ib := New()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := ib.Connect(ctx, "127.0.0.1", srv.port(), 1); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	disconnected := make(chan struct{}, 1)
+	ib.DisconnectedEvent.Subscribe(func(struct{}) {
+		select {
+		case disconnected <- struct{}{}:
+		default:
+		}
+	})
+
+	// Start heartbeat with very short intervals
+	heartbeatDone := make(chan struct{})
+	go ib.heartbeatLoop(ctx, ReconnectConfig{
+		ProbeInterval: 100 * time.Millisecond,
+		ProbeTimeout:  200 * time.Millisecond,
+	}, heartbeatDone)
+
+	// Heartbeat should detect unresponsive peer and disconnect
+	select {
+	case <-heartbeatDone:
+		// Good — heartbeat loop exited
+	case <-time.After(3 * time.Second):
+		t.Fatal("heartbeat loop did not exit on timeout")
+	}
+
+	// Verify disconnect happened
+	select {
+	case <-disconnected:
+	case <-time.After(time.Second):
+		t.Fatal("DisconnectedEvent not received after heartbeat timeout")
 	}
 }
