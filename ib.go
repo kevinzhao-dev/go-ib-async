@@ -133,9 +133,11 @@ func (ib *IB) ReqContractDetails(ctx context.Context, con *contract.Contract) ([
 	}
 }
 
+const positionsReqID = int64(-1000) // dedicated key, avoids collision with IB's reqId=-1
+
 // ReqPositions requests all positions.
 func (ib *IB) ReqPositions(ctx context.Context) ([]account.Position, error) {
-	reqID := int64(-1) // positions use a fixed key
+	reqID := positionsReqID
 	ch := ib.state.StartReq(reqID, nil)
 
 	if err := ib.client.ReqPositions(); err != nil {
@@ -269,6 +271,12 @@ func (ib *IB) handleError(r *protocol.FieldReader) {
 	code := int(r.ReadInt())
 	msg := r.ReadString()
 
+	// Warning/info codes (2100-2199) are not real errors
+	if code >= 2100 && code < 2200 {
+		log.Printf("ibgo: info %d: %s", code, msg)
+		return
+	}
+
 	ibErr := &IBError{
 		ReqID:   reqID,
 		Code:    code,
@@ -285,13 +293,8 @@ func (ib *IB) handleError(r *protocol.FieldReader) {
 	ib.ErrorEvent.Emit(ibErr)
 
 	// If there's a pending request, complete it with the error
-	if ib.state.Requests.Has(reqID) {
+	if reqID >= 0 && ib.state.Requests.Has(reqID) {
 		ib.state.EndReq(reqID, nil, &RequestError{ReqID: reqID, Code: code, Message: msg})
-	}
-
-	if code >= 2100 && code < 2200 {
-		// Warning codes, don't treat as errors
-		log.Printf("ibgo: warning %d: %s", code, msg)
 	}
 }
 
@@ -361,7 +364,7 @@ func (ib *IB) handlePosition(r *protocol.FieldReader) {
 }
 
 func (ib *IB) handlePositionEnd(r *protocol.FieldReader) {
-	ib.state.EndReq(-1, nil, nil) // positions use reqID = -1
+	ib.state.EndReq(positionsReqID, nil, nil)
 }
 
 func (ib *IB) handleUpdateAccountValue(r *protocol.FieldReader) {
