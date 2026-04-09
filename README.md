@@ -2,7 +2,8 @@
 
 Go client for the Interactive Brokers TWS/Gateway API. Port of the Python [ib_async](https://github.com/ib-api-reloaded/ib_async) library.
 
-> **Status: Core subset.** See [STATUS.md](STATUS.md) for the full parity matrix.
+> **Status: Core subset only. Not production-ready. Not full parity with ib_async.**
+> See [STATUS.md](STATUS.md) for the complete parity matrix including what's implemented, partial, and missing.
 
 ## Quick Start
 
@@ -12,6 +13,7 @@ package main
 import (
     "context"
     "fmt"
+    "log"
     "time"
 
     ibgo "github.com/kevinzhao-dev/go-ib-async"
@@ -24,26 +26,37 @@ func main() {
     defer cancel()
 
     // Connect to IB Gateway (paper: 4002, live: 4001)
-    err := ib.Connect(ctx, "127.0.0.1", 4002, 1)
-    if err != nil {
-        panic(err)
+    if err := ib.Connect(ctx, "127.0.0.1", 4002, 1); err != nil {
+        log.Fatal(err)
     }
     defer ib.Disconnect()
 
     // Request contract details
-    details, _ := ib.ReqContractDetails(ctx, contract.Stock("AAPL", "SMART", "USD"))
+    details, err := ib.ReqContractDetails(ctx, contract.Stock("AAPL", "SMART", "USD"))
+    if err != nil {
+        log.Fatal(err)
+    }
+    if len(details) == 0 {
+        log.Fatal("no contract details returned")
+    }
     fmt.Printf("AAPL conId=%d\n", details[0].Contract.ConID)
 
     // Request historical data
-    bars, _ := ib.ReqHistoricalData(ctx, details[0].Contract,
+    bars, err := ib.ReqHistoricalData(ctx, details[0].Contract,
         "", "5 D", "1 day", "TRADES", true, 1)
+    if err != nil {
+        log.Fatal(err)
+    }
     for _, b := range bars {
         fmt.Printf("%s  O=%.2f H=%.2f L=%.2f C=%.2f\n",
             b.Date.Format("2006-01-02"), b.Open, b.High, b.Low, b.Close)
     }
 
     // Market data snapshot
-    ticker, _ := ib.ReqMktData(details[0].Contract, "", true, false)
+    ticker, err := ib.ReqMktData(details[0].Contract, "", true, false)
+    if err != nil {
+        log.Fatal(err)
+    }
     time.Sleep(2 * time.Second)
     fmt.Printf("bid=%.2f ask=%.2f last=%.2f\n", ticker.Bid, ticker.Ask, ticker.Last)
 }
@@ -63,7 +76,7 @@ func main() {
 | Place / Cancel Order | Implemented |
 | Real-Time Bars | Implemented |
 
-See [STATUS.md](STATUS.md) for full details on what's implemented, partial, and missing.
+10 methods live-verified against IB Gateway. 29/82 inbound message types handled. See [STATUS.md](STATUS.md) for full details.
 
 ## Architecture
 
@@ -78,35 +91,24 @@ ibgo (root)          IB facade - Connect, public API, message dispatch
   internal/state/    State manager, request tracking, tick maps
 ```
 
-**Concurrency model:** Single reader goroutine processes all inbound messages. Request-response matching via per-request buffered channels. All state mutations on the reader goroutine. Thread-safe read accessors via `sync.RWMutex`.
+**Concurrency model:** Single reader goroutine processes all inbound messages. Request-response matching via per-request buffered channels. State mutations on the reader goroutine, thread-safe reads via `sync.RWMutex`.
 
 ## Development
 
 ```bash
-# Build
-go build ./...
-
-# Test (with race detector)
-go test -race ./...
-
-# Benchmarks
-go test -bench=. -benchmem ./protocol/
-
-# Fuzz (10 seconds)
-go test -fuzz=FuzzDecodeMessage -fuzztime=10s ./protocol/
-
-# Coverage
-go test -cover ./...
-
-# Live smoke test (requires IB Gateway running)
-go run ./cmd/smoketest
+go build ./...                                          # build
+go test -race ./...                                     # test
+go test -bench=. -benchmem ./protocol/                  # benchmarks
+go test -fuzz=FuzzDecodeMessage -fuzztime=10s ./protocol/ # fuzz
+go test -cover ./...                                    # coverage
+go run ./cmd/smoketest                                  # live test (needs Gateway)
 ```
 
 ## Requirements
 
-- Go 1.21+
+- Go 1.24+
 - IB TWS or Gateway (for live testing)
 
 ## License
 
-Same as upstream ib_async.
+BSD 2-Clause. See [LICENSE](LICENSE).

@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"time"
 
 	ibgo "github.com/kevinzhao-dev/go-ib-async"
@@ -15,8 +16,9 @@ import (
 )
 
 func main() {
-	host := "127.0.0.1"
-	port := 4002 // IB Gateway paper trading default
+	host := envOr("IB_HOST", "127.0.0.1")
+	port := envIntOr("IB_PORT", 4002)
+	clientID := envIntOr("IB_CLIENT_ID", 99)
 
 	fmt.Printf("=== ibgo smoke test ===\n")
 	fmt.Printf("Connecting to %s:%d ...\n", host, port)
@@ -31,7 +33,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	err := ib.Connect(ctx, host, port, 99)
+	err := ib.Connect(ctx, host, port, clientID)
 	if err != nil {
 		fmt.Printf("FAIL: Connect error: %v\n", err)
 		os.Exit(1)
@@ -155,11 +157,24 @@ func main() {
 	fmt.Println("\n=== All tests complete ===")
 }
 
-// Position and AccountValue type aliases for cleaner main
-// type aliases not needed, using account package directly
-
 func reqWithTimeout(fn func(ctx context.Context) (interface{}, error)) (interface{}, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return fn(ctx)
+}
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func envIntOr(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return fallback
 }
