@@ -103,9 +103,15 @@ func (ib *IB) ConnectWithReconnect(ctx context.Context, host string, port, clien
 	}
 }
 
-// heartbeatLoop periodically sends reqCurrentTime to detect dead connections.
+// heartbeatLoop periodically probes the connection to detect dead peers.
+// Sends reqCurrentTime and waits for a response within ProbeTimeout.
 func (ib *IB) heartbeatLoop(ctx context.Context, cfg ReconnectConfig, done chan struct{}) {
 	defer close(done)
+
+	probeTimeout := cfg.ProbeTimeout
+	if probeTimeout == 0 {
+		probeTimeout = 4 * time.Second
+	}
 
 	ticker := time.NewTicker(cfg.ProbeInterval)
 	defer ticker.Stop()
@@ -116,10 +122,33 @@ func (ib *IB) heartbeatLoop(ctx context.Context, cfg ReconnectConfig, done chan 
 			if !ib.client.IsConnected() {
 				return
 			}
+
+			// Send probe and wait for response with timeout
+			probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 			err := ib.client.ReqCurrentTime()
 			if err != nil {
-				log.Printf("ibgo: heartbeat failed: %v", err)
+				cancel()
+				log.Printf("ibgo: heartbeat write failed: %v", err)
 				ib.Disconnect()
+				return
+			}
+
+			// Wait for any response (currentTime handler updates LastTime)
+			timeBefore := ib.state.LastTime
+			select {
+			case <-time.After(probeTimeout):
+				cancel()
+				// Check if any data arrived since probe
+				if ib.state.LastTime.Equal(timeBefore) {
+					log.Printf("ibgo: heartbeat timeout — peer not responding, disconnecting")
+					ib.Disconnect()
+					return
+				}
+			case <-ib.client.Done():
+				cancel()
+				return
+			case <-probeCtx.Done():
+				cancel()
 				return
 			}
 		case <-ib.client.Done():

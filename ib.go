@@ -7,6 +7,7 @@ import (
 	"log"
 	"math"
 	"strconv"
+	"sync/atomic"
 	"strings"
 	"time"
 
@@ -23,6 +24,10 @@ import (
 type IB struct {
 	client *protocol.Client
 	state  *state.Manager
+
+	// Synthetic request keys for messages without wire reqID
+	completedOrdersKey atomic.Int64
+	positionsKey       atomic.Int64
 
 	// Events
 	ConnectedEvent    event.Event[struct{}]
@@ -68,10 +73,13 @@ func New() *IB {
 		ib.DisconnectedEvent.Emit(struct{}{})
 	}
 	ib.client.OnDataArrived = func() {
+		// Set timestamp for this message batch
 		now := time.Now()
 		ib.state.LastTime = now
 		ib.state.TimeFloat = float64(now.UnixMilli()) / 1000.0
-		ib.state.ClearPendingTickers()
+		// NOTE: We do NOT clear pending tickers here. Tickers accumulate
+		// across messages in the same read cycle. They are cleared in
+		// OnDataProcessed after events are emitted.
 	}
 	ib.client.OnDataProcessed = func() {
 		ib.UpdateEvent.Emit(struct{}{})
@@ -86,6 +94,8 @@ func New() *IB {
 			}
 			ib.PendingTickersEvent.Emit(pending)
 		}
+		// Clear pending tickers and their tick lists AFTER emitting events
+		ib.state.ClearPendingTickers()
 	}
 	return ib
 }
@@ -157,11 +167,10 @@ func (ib *IB) ReqContractDetails(ctx context.Context, con *contract.Contract) ([
 	}
 }
 
-const positionsReqID = int64(-1000) // dedicated key, avoids collision with IB's reqId=-1
-
 // ReqPositions requests all positions.
 func (ib *IB) ReqPositions(ctx context.Context) ([]account.Position, error) {
-	reqID := positionsReqID
+	reqID := ib.positionsKey.Add(1) * -1
+	ib.positionsKey.Store(reqID)
 	ch := ib.state.StartReq(reqID, nil)
 
 	if err := ib.client.ReqPositions(); err != nil {
@@ -486,7 +495,7 @@ func (ib *IB) handlePosition(r *protocol.FieldReader) {
 }
 
 func (ib *IB) handlePositionEnd(r *protocol.FieldReader) {
-	ib.state.EndReq(positionsReqID, nil, nil)
+	ib.state.EndReq(ib.positionsKey.Load(), nil, nil)
 }
 
 func (ib *IB) handleUpdateAccountValue(r *protocol.FieldReader) {
@@ -998,7 +1007,7 @@ func (ib *IB) handleTickPrice(r *protocol.FieldReader) {
 		}
 	}
 
-	ticker.UpdateEvent.Emit(ticker)
+	ib.state.MarkTickerPending(ticker)
 }
 
 func (ib *IB) handleTickSize(r *protocol.FieldReader) {
@@ -1032,7 +1041,7 @@ func (ib *IB) handleTickSize(r *protocol.FieldReader) {
 		}
 	}
 
-	ticker.UpdateEvent.Emit(ticker)
+	ib.state.MarkTickerPending(ticker)
 }
 
 func (ib *IB) handleTickGeneric(r *protocol.FieldReader) {
@@ -1053,7 +1062,7 @@ func (ib *IB) handleTickGeneric(r *protocol.FieldReader) {
 		setTickerFloat(ticker, fieldName, value)
 	}
 
-	ticker.UpdateEvent.Emit(ticker)
+	ib.state.MarkTickerPending(ticker)
 }
 
 func (ib *IB) handleTickString(r *protocol.FieldReader) {
@@ -2102,9 +2111,12 @@ func (ib *IB) CancelRealTimeBars(rtbl *market.RealTimeBarList) {
 
 // ReqCompletedOrders requests all completed (filled/cancelled) orders.
 func (ib *IB) ReqCompletedOrders(ctx context.Context, apiOnly bool) ([]*order.Trade, error) {
-	ch := ib.state.StartReq(completedOrdersReqID, nil)
+	key := ib.completedOrdersKey.Add(1) * -1 // negative synthetic key
+	ib.completedOrdersKey.Store(key)          // store active key for handlers
+
+	ch := ib.state.StartReq(key, nil)
 	if err := ib.client.ReqCompletedOrders(apiOnly); err != nil {
-		ib.state.Requests.Cancel(completedOrdersReqID)
+		ib.state.Requests.Cancel(key)
 		return nil, err
 	}
 	select {
@@ -2124,14 +2136,12 @@ func (ib *IB) ReqCompletedOrders(ctx context.Context, apiOnly bool) ([]*order.Tr
 		}
 		return trades, nil
 	case <-ctx.Done():
-		ib.state.Requests.Cancel(completedOrdersReqID)
+		ib.state.Requests.Cancel(key)
 		return nil, ctx.Err()
 	case <-ib.client.Done():
 		return nil, ErrDisconnected
 	}
 }
-
-const completedOrdersReqID = int64(-2000)
 
 // --- completedOrder / orderBound / currentTime handlers ---
 
@@ -2357,18 +2367,28 @@ func (ib *IB) handleCompletedOrder(r *protocol.FieldReader) {
 	}
 	ib.state.Mu.Unlock()
 
-	ib.state.AppendResult(completedOrdersReqID, trade)
+	ib.state.AppendResult(ib.completedOrdersKey.Load(), trade)
 }
 
 func (ib *IB) handleCompletedOrdersEnd(r *protocol.FieldReader) {
-	ib.state.EndReq(completedOrdersReqID, nil, nil)
+	ib.state.EndReq(ib.completedOrdersKey.Load(), nil, nil)
 }
 
 func (ib *IB) handleOrderBound(r *protocol.FieldReader) {
 	// orderBound links an API order to its permId
-	_ = r.ReadInt() // reqId
-	_ = r.ReadInt() // apiClientId
-	_ = r.ReadInt() // apiOrderId
+	permID := r.ReadInt()
+	apiClientID := r.ReadInt()
+	apiOrderID := r.ReadInt()
+
+	if permID != 0 && apiOrderID != 0 {
+		key := state.OrderKey{ClientID: apiClientID, OrderID: apiOrderID}
+		ib.state.Mu.Lock()
+		if trade, ok := ib.state.Trades[key]; ok {
+			trade.Order.PermID = permID
+			ib.state.PermID2Trade[permID] = trade
+		}
+		ib.state.Mu.Unlock()
+	}
 }
 
 func (ib *IB) handleCurrentTime(r *protocol.FieldReader) {
