@@ -130,6 +130,28 @@ func main() {
 		}
 	}
 
+	// Test 6: Request option chain for AAPL
+	fmt.Println("\n--- 6. ReqSecDefOptParams (AAPL) ---")
+	if details != nil {
+		cds := details.([]contract.ContractDetails)
+		if len(cds) > 0 {
+			chains, err := reqWithTimeout(func(ctx context.Context) (interface{}, error) {
+				return ib.ReqSecDefOptParams(ctx, "AAPL", "", "STK", cds[0].Contract.ConID)
+			})
+			if err != nil {
+				fmt.Printf("FAIL: %v\n", err)
+			} else {
+				optChains := chains.([]market.OptionChain)
+				fmt.Printf("OK: %d option chains\n", len(optChains))
+				for _, ch := range optChains {
+					fmt.Printf("  %s class=%s mult=%s expirations=%d strikes=%d\n",
+						ch.Exchange, ch.TradingClass, ch.Multiplier,
+						len(ch.Expirations), len(ch.Strikes))
+				}
+			}
+		}
+	}
+
 	fmt.Println("\n=== All tests complete ===")
 }
 

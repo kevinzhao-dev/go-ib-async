@@ -265,7 +265,14 @@ func (c *Client) readLoop() {
 				msgID, _ := strconv.Atoi(fields[0])
 				reader := NewFieldReader(fields)
 				reader.Skip(1)
-				c.OnMessage(msgID, reader)
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							log.Printf("ibgo: panic in handler for msgID %d: %v", msgID, r)
+						}
+					}()
+					c.OnMessage(msgID, reader)
+				}()
 			}
 		}
 	}
