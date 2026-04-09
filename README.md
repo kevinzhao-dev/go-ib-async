@@ -97,13 +97,18 @@ ibgo (root)          IB facade - Connect, public API, message dispatch
 ## Development
 
 ```bash
-go build ./...                                          # build
-go test -race ./...                                     # test
-go test -bench=. -benchmem ./protocol/                  # benchmarks
-go test -fuzz=FuzzDecodeMessage -fuzztime=10s ./protocol/ # fuzz
-go test -cover ./...                                    # coverage
-go run ./cmd/smoketest                                  # live test (needs Gateway)
+make                  # build + vet + test (no Gateway needed)
+make test-race        # tests with race detector
+make test-live        # integration tests (needs Gateway running)
+make smoke            # live smoke test (needs Gateway)
+make bench            # benchmarks
+make fuzz             # fuzz decoder for 10 seconds
+make test-cover       # coverage report
 ```
+
+Tests are split by build tag:
+- **Unit tests** (`make test`): use mock servers, run in CI, no Gateway needed
+- **Integration tests** (`make test-live`): require a live IB Gateway, tagged `//go:build integration`, skipped in CI
 
 ## Known Limitations
 
