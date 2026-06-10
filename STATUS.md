@@ -56,13 +56,22 @@ NOT in dispatch (despite being claimed previously): updateAccountTime(8), curren
 
 Not covered: bondContractDetails, scannerData, tickOptionComputation, tickEFP, fundamentalData, deltaNeutralValidation, tickReqParams, symbolSamples, mktDepthExchanges, tickNews, newsProviders, newsArticle, historicalNews, headTimestamp, histogramData, pnl, pnlSingle, historicalTicks, tickByTick, orderBound, completedOrder, completedOrdersEnd, wshMetaData, wshEventData, historicalSchedule, userInfo, and others
 
-## Known Gaps (from GPT review)
+## Known Gaps
 
-1. **tickString**: does not parse timestamp, RT volume, fundamental ratios, dividends
-2. **Events**: UpdateEvent and PendingTickersEvent declared but never emitted
-3. **Throttle**: config constants defined, no runtime enforcement
-4. **BarDataList lifecycle**: ReqHistoricalData returns []BarData, not BarDataList with keepUpToDate
-5. **State locking**: Mu exported for cross-package access; works but not ideal long-term
+1. **BarDataList lifecycle**: ReqHistoricalData returns []BarData, not BarDataList with keepUpToDate (handler exists but no public API registers the subscription)
+2. **State locking**: Mu exported for cross-package access; works but not ideal long-term
+3. **Trade cross-goroutine reads**: Trade fields are mutated under state.Mu on the reader goroutine; reading them outside event callbacks is not yet synchronized (Ticker has a proper lock contract, Trade does not)
+4. **Concurrent ReqPositions/ReqCompletedOrders**: overlapping calls share one synthetic completion key; the earlier caller can hang until its context expires
+5. **Snapshot ReqMktData leak**: ticker map entries are not removed after tickSnapshotEnd
+6. **No write deadlines**: a stuck peer blocks all senders; heartbeat only detects read-side death
+
+Resolved since the GPT review: tickString parsing (timestamp/RT volume/ratios/dividends), UpdateEvent + PendingTickersEvent emission, runtime throttling (45 msg/s in Client.Send), execDetails/position wire offsets, Results map race, ticker/LastTime synchronization, error→order-state wiring per ib_async wrapper.error.
+
+## Testing Guardrails
+
+- **Wire-format goldens** (`guard_wire_test.go`): fixtures derived from the ib_async reference decoder with provenance comments, plus FieldReader.Overflow full-consumption checks. Never derive a fixture from this library's own handler.
+- **Concurrency guards** (`guard_race_test.go`): scripted in-process TWS driving the real readLoop against concurrent user goroutines — meaningful under `make test-race`, which CI must keep running.
+- **Order lifecycle error path** (`guard_order_lifecycle_test.go`): rejection/warning/request-error semantics transcribed from ib_async wrapper.error().
 
 ## Test Coverage
 

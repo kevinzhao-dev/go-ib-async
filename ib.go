@@ -338,37 +338,104 @@ func (ib *IB) handleMessage(msgID int, r *protocol.FieldReader) {
 	}
 }
 
+// warningCodes are error codes that do not terminate a request or an order.
+// Transcribed from ib_async wrapper.py Wrapper.error():
+//
+//	105 - order being modified does not match original order
+//	110 - price does not conform to minimum price variation
+//	165 - historical market data service query message
+//	321 - server error when validating an API client request
+//	329 - order modify failed, cannot change to the new order type
+//	399 - order message error
+//	404 - shares not immediately available for short sale (order held)
+//	434 - order size cannot be zero
+//	492, 10167 - undocumented warnings
+var warningCodes = map[int]bool{
+	105: true, 110: true, 165: true, 321: true, 329: true,
+	399: true, 404: true, 434: true, 492: true, 10167: true,
+}
+
 func (ib *IB) handleError(r *protocol.FieldReader) {
 	r.Skip(1) // version
 	reqID := r.ReadInt()
 	code := int(r.ReadInt())
 	msg := r.ReadString()
-
-	// Warning/info codes (2100-2199) are not real errors
-	if code >= 2100 && code < 2200 {
-		log.Printf("ibgo: info %d: %s", code, msg)
-		return
+	advancedOrderReject := ""
+	if ib.client.ServerVersion >= 166 {
+		advancedOrderReject = r.ReadString()
 	}
 
-	ibErr := &IBError{
-		ReqID:   reqID,
-		Code:    code,
-		Message: msg,
+	isRequest := ib.state.Requests.Has(reqID)
+
+	// reqID is a local orderId when the error refers to an order; -1 otherwise.
+	var trade *order.Trade
+	if reqID != -1 {
+		ib.state.Mu.RLock()
+		trade = ib.state.Trades[state.OrderKey{ClientID: int64(ib.client.ClientID), OrderID: reqID}]
+		ib.state.Mu.RUnlock()
 	}
 
-	// Look up associated contract
+	// Capture contract context before EndReq (which clears ReqID2Contract).
+	ibErr := &IBError{ReqID: reqID, Code: code, Message: msg}
 	ib.state.Mu.RLock()
 	if con, ok := ib.state.ReqID2Contract[reqID]; ok {
 		ibErr.Contract = con
 	}
 	ib.state.Mu.RUnlock()
 
-	ib.ErrorEvent.Emit(ibErr)
-
-	// If there's a pending request, complete it with the error
-	if reqID >= 0 && ib.state.Requests.Has(reqID) {
-		ib.state.EndReq(reqID, nil, &RequestError{ReqID: reqID, Code: code, Message: msg})
+	isWarning := warningCodes[code] || (code >= 2100 && code < 2200)
+	if code == 110 && isRequest {
+		// whatIf/request failed
+		isWarning = false
 	}
+	if code == 110 && trade != nil && trade.OrderStatus.Status == order.StatusPendingSubmit {
+		// invalid price on a new order must cancel it
+		isWarning = false
+	}
+
+	if isWarning {
+		if trade != nil {
+			// Order is STILL LIVE at the broker; record but do not cancel.
+			ib.state.Mu.Lock()
+			trade.OrderStatus.Status = order.StatusValidationError
+			trade.Log = append(trade.Log, order.TradeLogEntry{
+				Time: time.Now(), Status: order.StatusValidationError, Message: msg, ErrorCode: code,
+			})
+			ib.state.Mu.Unlock()
+			ib.OrderStatusEvent.Emit(trade)
+			trade.StatusEvent.Emit(trade)
+		} else {
+			log.Printf("ibgo: warning %d (reqId %d): %s", code, reqID, msg)
+		}
+	} else {
+		log.Printf("ibgo: error %d (reqId %d): %s", code, reqID, msg)
+		if isRequest {
+			// The request failed
+			ib.state.EndReq(reqID, nil, &RequestError{ReqID: reqID, Code: code, Message: msg})
+		} else if trade != nil {
+			// Order rejected or server-cancelled
+			ib.state.Mu.Lock()
+			if advancedOrderReject != "" {
+				trade.AdvancedError = advancedOrderReject
+			}
+			done := trade.IsDone()
+			if !done {
+				trade.OrderStatus.Status = order.StatusCancelled
+				trade.Log = append(trade.Log, order.TradeLogEntry{
+					Time: time.Now(), Status: order.StatusCancelled, Message: msg, ErrorCode: code,
+				})
+			}
+			ib.state.Mu.Unlock()
+			if !done {
+				ib.OrderStatusEvent.Emit(trade)
+				trade.StatusEvent.Emit(trade)
+				trade.CancelledEvent.Emit(trade)
+			}
+		}
+	}
+
+	// Always emitted, warnings included (parity with ib_async errorEvent).
+	ib.ErrorEvent.Emit(ibErr)
 }
 
 func (ib *IB) handleContractDetails(r *protocol.FieldReader) {
