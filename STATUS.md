@@ -58,14 +58,11 @@ Not covered: bondContractDetails, scannerData, tickOptionComputation, tickEFP, f
 
 ## Known Gaps
 
-1. **BarDataList lifecycle**: ReqHistoricalData returns []BarData, not BarDataList with keepUpToDate (handler exists but no public API registers the subscription)
+1. **BarDataList lifecycle**: ReqHistoricalData returns []BarData, not BarDataList with keepUpToDate (handler exists but no public API registers the subscription); BarDataList/RealTimeBarList fields have no cross-goroutine read contract yet (read inside their UpdateEvent callbacks)
 2. **State locking**: Mu exported for cross-package access; works but not ideal long-term
-3. **Trade cross-goroutine reads**: Trade fields are mutated under state.Mu on the reader goroutine; reading them outside event callbacks is not yet synchronized (Ticker has a proper lock contract, Trade does not)
-4. **Concurrent ReqPositions/ReqCompletedOrders**: overlapping calls share one synthetic completion key; the earlier caller can hang until its context expires
-5. **Snapshot ReqMktData leak**: ticker map entries are not removed after tickSnapshotEnd
-6. **No write deadlines**: a stuck peer blocks all senders; heartbeat only detects read-side death
+3. **Reconnection does not restore subscriptions**: re-subscribe in the onConnect callback
 
-Resolved since the GPT review: tickString parsing (timestamp/RT volume/ratios/dividends), UpdateEvent + PendingTickersEvent emission, runtime throttling (45 msg/s in Client.Send), execDetails/position wire offsets, Results map race, ticker/LastTime synchronization, error→order-state wiring per ib_async wrapper.error.
+Resolved since the GPT review: tickString parsing (timestamp/RT volume/ratios/dividends), UpdateEvent + PendingTickersEvent emission, runtime throttling (45 msg/s in Client.Send), execDetails/position wire offsets, Results map race, ticker/Trade/LastTime synchronization contracts, error→order-state wiring per ib_async wrapper.error, concurrent ReqPositions/ReqCompletedOrders fan-out, snapshot ticker cleanup, single-write framing with write deadlines.
 
 ## Testing Guardrails
 

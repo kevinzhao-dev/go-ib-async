@@ -11,13 +11,23 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
+
+// DefaultWriteTimeout bounds how long a single write may block on a wedged
+// peer before the connection is declared dead.
+const DefaultWriteTimeout = 10 * time.Second
 
 // Connection manages a TCP connection to TWS/Gateway with IB message framing.
 type Connection struct {
 	conn   net.Conn
 	reader *bufio.Reader // buffered reader for batch detection
-	mu     sync.Mutex    // protects writes
+	mu     sync.Mutex    // protects conn/reader and serializes writes
+
+	// WriteTimeout is the per-write deadline. Zero disables it. A write
+	// that fails (including by timeout) leaves the stream in an undefined
+	// state, so the connection is closed.
+	WriteTimeout time.Duration
 
 	NumBytesSent atomic.Int64
 	NumMsgSent   atomic.Int64
@@ -32,8 +42,10 @@ func (c *Connection) Connect(host string, port int) error {
 	if err != nil {
 		return err
 	}
+	c.mu.Lock()
 	c.conn = conn
 	c.reader = bufio.NewReaderSize(conn, 64*1024)
+	c.mu.Unlock()
 	return nil
 }
 
@@ -69,11 +81,7 @@ func (c *Connection) Conn() net.Conn {
 func (c *Connection) SendRaw(data []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.conn == nil {
-		return fmt.Errorf("not connected")
-	}
-	_, err := c.conn.Write(data)
-	if err != nil {
+	if err := c.writeLocked(data); err != nil {
 		return err
 	}
 	c.NumBytesSent.Add(int64(len(data)))
@@ -81,24 +89,42 @@ func (c *Connection) SendRaw(data []byte) error {
 }
 
 // SendMessage writes a length-prefixed message: [4-byte big-endian len][payload].
+// Header and payload go out in a single write — both for atomicity (a failure
+// between two writes would desync the framing) and to avoid a separate 4-byte
+// TCP segment under TCP_NODELAY.
 func (c *Connection) SendMessage(payload []byte) error {
+	frame := make([]byte, 4+len(payload))
+	binary.BigEndian.PutUint32(frame, uint32(len(payload)))
+	copy(frame[4:], payload)
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if err := c.writeLocked(frame); err != nil {
+		return err
+	}
+	c.NumBytesSent.Add(int64(len(frame)))
+	c.NumMsgSent.Add(1)
+	return nil
+}
+
+// writeLocked performs one deadline-bounded write. Must hold c.mu.
+// On any write error the connection is closed: a partial or timed-out write
+// leaves the stream desynced, and closing also unblocks the read loop so the
+// normal disconnect path runs.
+func (c *Connection) writeLocked(data []byte) error {
 	if c.conn == nil {
 		return fmt.Errorf("not connected")
 	}
-	header := make([]byte, 4)
-	binary.BigEndian.PutUint32(header, uint32(len(payload)))
-	_, err := c.conn.Write(header)
-	if err != nil {
-		return err
+	if c.WriteTimeout > 0 {
+		c.conn.SetWriteDeadline(time.Now().Add(c.WriteTimeout))
 	}
-	_, err = c.conn.Write(payload)
+	_, err := c.conn.Write(data)
 	if err != nil {
-		return err
+		c.conn.Close()
+		c.conn = nil
+		c.reader = nil
+		return fmt.Errorf("write failed, closing connection: %w", err)
 	}
-	c.NumBytesSent.Add(int64(4 + len(payload)))
-	c.NumMsgSent.Add(1)
 	return nil
 }
 

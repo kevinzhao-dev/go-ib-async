@@ -70,7 +70,7 @@ type Client struct {
 // NewClient creates a new Client.
 func NewClient() *Client {
 	c := &Client{
-		Conn:     &Connection{},
+		Conn:     &Connection{WriteTimeout: DefaultWriteTimeout},
 		done:     make(chan struct{}),
 		throttle: throttle.New(45, 1*time.Second), // 45 req/s default
 	}
