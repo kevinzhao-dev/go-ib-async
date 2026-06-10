@@ -81,6 +81,8 @@ func main() {
 
 ## Architecture
 
+> See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed diagrams — component model, request/response data flow, and concurrency model.
+
 ```
 ibgo (root)          IB facade - Connect, public API, message dispatch
   contract/          Contract, Stock, Option, Future, etc.
