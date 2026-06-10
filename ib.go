@@ -145,7 +145,7 @@ func (ib *IB) ReqContractDetails(ctx context.Context, con *contract.Contract) ([
 	ch := ib.state.StartReq(reqID, con)
 
 	if err := ib.client.ReqContractDetails(reqID, con); err != nil {
-		ib.state.Requests.Cancel(reqID)
+		ib.state.CancelReq(reqID)
 		return nil, err
 	}
 
@@ -166,7 +166,7 @@ func (ib *IB) ReqContractDetails(ctx context.Context, con *contract.Contract) ([
 		}
 		return details, nil
 	case <-ctx.Done():
-		ib.state.Requests.Cancel(reqID)
+		ib.state.CancelReq(reqID)
 		return nil, ctx.Err()
 	case <-ib.client.Done():
 		return nil, ErrDisconnected
@@ -182,7 +182,7 @@ func (ib *IB) ReqPositions(ctx context.Context) ([]account.Position, error) {
 	ch := ib.state.StartReq(reqID, nil)
 
 	if err := ib.client.ReqPositions(); err != nil {
-		ib.state.Requests.Cancel(reqID)
+		ib.state.CancelReq(reqID)
 		ib.positionsMu.Unlock()
 		return nil, err
 	}
@@ -195,7 +195,7 @@ func (ib *IB) ReqPositions(ctx context.Context) ([]account.Position, error) {
 		}
 		return ib.state.GetPositions(), nil
 	case <-ctx.Done():
-		ib.state.Requests.Cancel(reqID)
+		ib.state.CancelReq(reqID)
 		return nil, ctx.Err()
 	case <-ib.client.Done():
 		return nil, ErrDisconnected
@@ -208,7 +208,7 @@ func (ib *IB) ReqAccountSummary(ctx context.Context, groupName, tags string) ([]
 	ch := ib.state.StartReq(reqID, nil)
 
 	if err := ib.client.ReqAccountSummary(reqID, groupName, tags); err != nil {
-		ib.state.Requests.Cancel(reqID)
+		ib.state.CancelReq(reqID)
 		return nil, err
 	}
 
@@ -229,7 +229,7 @@ func (ib *IB) ReqAccountSummary(ctx context.Context, groupName, tags string) ([]
 		}
 		return values, nil
 	case <-ctx.Done():
-		ib.state.Requests.Cancel(reqID)
+		ib.state.CancelReq(reqID)
 		return nil, ctx.Err()
 	case <-ib.client.Done():
 		return nil, ErrDisconnected
@@ -1484,7 +1484,7 @@ func (ib *IB) ReqHistoricalData(ctx context.Context, con *contract.Contract, end
 	ch := ib.state.StartReq(reqID, con)
 
 	if err := ib.client.ReqHistoricalData(reqID, con, endDateTime, durationStr, barSizeSetting, whatToShow, useRTH, formatDate, false, nil); err != nil {
-		ib.state.Requests.Cancel(reqID)
+		ib.state.CancelReq(reqID)
 		return nil, err
 	}
 
@@ -1498,7 +1498,7 @@ func (ib *IB) ReqHistoricalData(ctx context.Context, con *contract.Contract, end
 		}
 		return nil, nil
 	case <-ctx.Done():
-		ib.state.Requests.Cancel(reqID)
+		ib.state.CancelReq(reqID)
 		return nil, ctx.Err()
 	case <-ib.client.Done():
 		return nil, ErrDisconnected
@@ -2065,7 +2065,7 @@ func (ib *IB) ReqSecDefOptParams(ctx context.Context, underlyingSymbol, futFopEx
 	ch := ib.state.StartReq(reqID, nil)
 
 	if err := ib.client.ReqSecDefOptParams(reqID, underlyingSymbol, futFopExchange, underlyingSecType, underlyingConID); err != nil {
-		ib.state.Requests.Cancel(reqID)
+		ib.state.CancelReq(reqID)
 		return nil, err
 	}
 
@@ -2086,7 +2086,7 @@ func (ib *IB) ReqSecDefOptParams(ctx context.Context, underlyingSymbol, futFopEx
 		}
 		return chains, nil
 	case <-ctx.Done():
-		ib.state.Requests.Cancel(reqID)
+		ib.state.CancelReq(reqID)
 		return nil, ctx.Err()
 	case <-ib.client.Done():
 		return nil, ErrDisconnected
@@ -2135,7 +2135,7 @@ func (ib *IB) ReqCompletedOrders(ctx context.Context, apiOnly bool) ([]*order.Tr
 
 	ch := ib.state.StartReq(key, nil)
 	if err := ib.client.ReqCompletedOrders(apiOnly); err != nil {
-		ib.state.Requests.Cancel(key)
+		ib.state.CancelReq(key)
 		ib.completedOrdersMu.Unlock()
 		return nil, err
 	}
@@ -2157,7 +2157,7 @@ func (ib *IB) ReqCompletedOrders(ctx context.Context, apiOnly bool) ([]*order.Tr
 		}
 		return trades, nil
 	case <-ctx.Done():
-		ib.state.Requests.Cancel(key)
+		ib.state.CancelReq(key)
 		return nil, ctx.Err()
 	case <-ib.client.Done():
 		return nil, ErrDisconnected

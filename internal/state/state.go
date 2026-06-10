@@ -57,13 +57,15 @@ func NewManager() *Manager {
 }
 
 // StartReq begins tracking a request-response cycle.
+// Called from user goroutines; Results is also touched by the reader
+// goroutine (AppendResult/EndReq), so all access must hold Mu.
 func (m *Manager) StartReq(reqID int64, con *contract.Contract) <-chan Result {
+	m.Mu.Lock()
 	if con != nil {
-		m.Mu.Lock()
 		m.ReqID2Contract[reqID] = con
-		m.Mu.Unlock()
 	}
 	m.Results[reqID] = nil
+	m.Mu.Unlock()
 	return m.Requests.Start(reqID)
 }
 
@@ -83,6 +85,8 @@ func (m *Manager) EndReq(reqID int64, value interface{}, err error) {
 
 // AppendResult accumulates a partial result for a multi-message response.
 func (m *Manager) AppendResult(reqID int64, item interface{}) {
+	m.Mu.Lock()
+	defer m.Mu.Unlock()
 	existing, ok := m.Results[reqID]
 	if !ok {
 		return
@@ -92,6 +96,16 @@ func (m *Manager) AppendResult(reqID int64, item interface{}) {
 	} else {
 		m.Results[reqID] = append(existing.([]interface{}), item)
 	}
+}
+
+// CancelReq abandons a pending request (e.g. on context cancellation or
+// send failure) and cleans up all tracking state for its reqID.
+func (m *Manager) CancelReq(reqID int64) {
+	m.Mu.Lock()
+	delete(m.Results, reqID)
+	delete(m.ReqID2Contract, reqID)
+	m.Mu.Unlock()
+	m.Requests.Cancel(reqID)
 }
 
 // --- Read-only accessors (thread-safe) ---
