@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/binary"
 	"net"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -216,40 +215,6 @@ func TestSyntheticReqIDUnique(t *testing.T) {
 		if key >= 0 {
 			t.Fatalf("synthetic key should be negative, got %d", key)
 		}
-	}
-}
-
-// TestConcurrentReqPositionsSerialized verifies that overlapping ReqPositions calls
-// are serialized by positionsMu and each gets a unique synthetic key.
-func TestConcurrentReqPositionsSerialized(t *testing.T) {
-	ib := New()
-
-	// Verify the mutex serializes access and keys are unique
-	var wg sync.WaitGroup
-	keys := make([]int64, 10)
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			ib.positionsMu.Lock()
-			key := ib.syntheticReqID.Add(-1)
-			ib.positionsReqID = key
-			keys[idx] = key
-			ib.positionsMu.Unlock()
-		}(i)
-	}
-	wg.Wait()
-
-	// All keys should be unique and negative
-	seen := make(map[int64]bool)
-	for _, k := range keys {
-		if k >= 0 {
-			t.Fatalf("key should be negative, got %d", k)
-		}
-		if seen[k] {
-			t.Fatalf("duplicate key: %d", k)
-		}
-		seen[k] = true
 	}
 }
 

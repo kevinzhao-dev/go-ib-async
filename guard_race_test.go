@@ -197,6 +197,87 @@ func TestGuardConcurrentRequestFlow(t *testing.T) {
 	}
 }
 
+// TestGuardConcurrentReqPositions issues overlapping ReqPositions calls.
+// IB streams one set of positions and one positionEnd per wire request;
+// every concurrent caller must complete — none may hang until its context
+// expires or return before data arrives.
+func TestGuardConcurrentReqPositions(t *testing.T) {
+	srv := newGuardServer(t, func(s *guardServer, msg []string) {
+		if msg[0] == "61" { // reqPositions (outbound)
+			s.send("61", "3", "DU123456",
+				"265598", "AAPL", "STK", "", "0", "", "", "NASDAQ", "USD", "AAPL", "NMS",
+				"100", "150.5")
+			s.send("62", "1") // positionEnd
+		}
+	})
+	defer srv.close()
+
+	ib := guardConnect(t, srv)
+	defer ib.Disconnect()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	const callers = 4
+	var wg sync.WaitGroup
+	errs := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			positions, err := ib.ReqPositions(ctx)
+			if err != nil {
+				errs <- fmt.Errorf("ReqPositions: %w", err)
+				return
+			}
+			if len(positions) != 1 {
+				errs <- fmt.Errorf("got %d positions, want 1", len(positions))
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+}
+
+// TestGuardConcurrentReqCompletedOrders is the same guard for the other
+// synthetic-key request. The server answers with completedOrdersEnd only;
+// both callers must return (empty) instead of hanging.
+func TestGuardConcurrentReqCompletedOrders(t *testing.T) {
+	srv := newGuardServer(t, func(s *guardServer, msg []string) {
+		if msg[0] == "99" { // reqCompletedOrders (outbound)
+			s.send("102") // completedOrdersEnd
+		}
+	})
+	defer srv.close()
+
+	ib := guardConnect(t, srv)
+	defer ib.Disconnect()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	const callers = 3
+	var wg sync.WaitGroup
+	errs := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := ib.ReqCompletedOrders(ctx, false); err != nil {
+				errs <- fmt.Errorf("ReqCompletedOrders: %w", err)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+}
+
 // TestGuardTickerStreamCrossGoroutineRead streams ticks from the server while
 // a subscriber goroutine reads ticker fields, which is the usage shown in the
 // README (subscribe to UpdateEvent, then read ticker.Bid/Ask/Last).

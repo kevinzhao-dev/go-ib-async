@@ -29,11 +29,13 @@ type IB struct {
 	// Synthetic request key generator (always negative, unique)
 	syntheticReqID atomic.Int64
 
-	// Serialization for subscription-style requests (IB sends one response stream)
+	// Serialization for subscription-style requests (IB sends one response stream).
+	// Concurrent callers share one in-flight wire request; the end-message
+	// completes every waiter (fan-out).
 	positionsMu       sync.Mutex
-	positionsReqID    int64 // active key, protected by positionsMu
+	positionsWaiters  []int64 // synthetic keys of waiting ReqPositions callers
 	completedOrdersMu sync.Mutex
-	completedReqID    int64 // active key, protected by completedOrdersMu
+	completedWaiters  []int64 // synthetic keys of waiting ReqCompletedOrders callers
 
 	// Events
 	ConnectedEvent    event.Event[struct{}]
@@ -174,17 +176,22 @@ func (ib *IB) ReqContractDetails(ctx context.Context, con *contract.Contract) ([
 }
 
 // ReqPositions requests all positions.
-// Serialized: IB sends one positionEnd for all outstanding position requests.
+// Concurrent callers share one in-flight wire request: positions are
+// account-level state, so every waiter receives the same snapshot when
+// positionEnd arrives.
 func (ib *IB) ReqPositions(ctx context.Context) ([]account.Position, error) {
 	ib.positionsMu.Lock()
 	reqID := ib.syntheticReqID.Add(-1)
-	ib.positionsReqID = reqID
 	ch := ib.state.StartReq(reqID, nil)
-
-	if err := ib.client.ReqPositions(); err != nil {
-		ib.state.CancelReq(reqID)
-		ib.positionsMu.Unlock()
-		return nil, err
+	first := len(ib.positionsWaiters) == 0
+	ib.positionsWaiters = append(ib.positionsWaiters, reqID)
+	if first {
+		if err := ib.client.ReqPositions(); err != nil {
+			ib.positionsWaiters = removeWaiter(ib.positionsWaiters, reqID)
+			ib.positionsMu.Unlock()
+			ib.state.CancelReq(reqID)
+			return nil, err
+		}
 	}
 	ib.positionsMu.Unlock()
 
@@ -195,11 +202,23 @@ func (ib *IB) ReqPositions(ctx context.Context) ([]account.Position, error) {
 		}
 		return ib.state.GetPositions(), nil
 	case <-ctx.Done():
+		ib.positionsMu.Lock()
+		ib.positionsWaiters = removeWaiter(ib.positionsWaiters, reqID)
+		ib.positionsMu.Unlock()
 		ib.state.CancelReq(reqID)
 		return nil, ctx.Err()
 	case <-ib.client.Done():
 		return nil, ErrDisconnected
 	}
+}
+
+func removeWaiter(waiters []int64, key int64) []int64 {
+	for i, w := range waiters {
+		if w == key {
+			return append(waiters[:i], waiters[i+1:]...)
+		}
+	}
+	return waiters
 }
 
 // ReqAccountSummary requests account summary values.
@@ -576,9 +595,10 @@ func (ib *IB) handlePosition(r *protocol.FieldReader) {
 
 func (ib *IB) handlePositionEnd(r *protocol.FieldReader) {
 	ib.positionsMu.Lock()
-	key := ib.positionsReqID
+	waiters := ib.positionsWaiters
+	ib.positionsWaiters = nil
 	ib.positionsMu.Unlock()
-	if key != 0 {
+	for _, key := range waiters {
 		ib.state.EndReq(key, nil, nil)
 	}
 }
@@ -2208,17 +2228,21 @@ func (ib *IB) CancelRealTimeBars(rtbl *market.RealTimeBarList) {
 }
 
 // ReqCompletedOrders requests all completed (filled/cancelled) orders.
-// Serialized: IB sends one completedOrdersEnd for all outstanding requests.
+// Concurrent callers share one in-flight wire request; every waiter
+// receives the accumulated trades when completedOrdersEnd arrives.
 func (ib *IB) ReqCompletedOrders(ctx context.Context, apiOnly bool) ([]*order.Trade, error) {
 	ib.completedOrdersMu.Lock()
 	key := ib.syntheticReqID.Add(-1)
-	ib.completedReqID = key
-
 	ch := ib.state.StartReq(key, nil)
-	if err := ib.client.ReqCompletedOrders(apiOnly); err != nil {
-		ib.state.CancelReq(key)
-		ib.completedOrdersMu.Unlock()
-		return nil, err
+	first := len(ib.completedWaiters) == 0
+	ib.completedWaiters = append(ib.completedWaiters, key)
+	if first {
+		if err := ib.client.ReqCompletedOrders(apiOnly); err != nil {
+			ib.completedWaiters = removeWaiter(ib.completedWaiters, key)
+			ib.completedOrdersMu.Unlock()
+			ib.state.CancelReq(key)
+			return nil, err
+		}
 	}
 	ib.completedOrdersMu.Unlock()
 	select {
@@ -2238,6 +2262,9 @@ func (ib *IB) ReqCompletedOrders(ctx context.Context, apiOnly bool) ([]*order.Tr
 		}
 		return trades, nil
 	case <-ctx.Done():
+		ib.completedOrdersMu.Lock()
+		ib.completedWaiters = removeWaiter(ib.completedWaiters, key)
+		ib.completedOrdersMu.Unlock()
 		ib.state.CancelReq(key)
 		return nil, ctx.Err()
 	case <-ib.client.Done():
@@ -2470,18 +2497,19 @@ func (ib *IB) handleCompletedOrder(r *protocol.FieldReader) {
 	ib.state.Mu.Unlock()
 
 	ib.completedOrdersMu.Lock()
-	key := ib.completedReqID
+	waiters := append([]int64(nil), ib.completedWaiters...)
 	ib.completedOrdersMu.Unlock()
-	if key != 0 {
+	for _, key := range waiters {
 		ib.state.AppendResult(key, trade)
 	}
 }
 
 func (ib *IB) handleCompletedOrdersEnd(r *protocol.FieldReader) {
 	ib.completedOrdersMu.Lock()
-	key := ib.completedReqID
+	waiters := ib.completedWaiters
+	ib.completedWaiters = nil
 	ib.completedOrdersMu.Unlock()
-	if key != 0 {
+	for _, key := range waiters {
 		ib.state.EndReq(key, nil, nil)
 	}
 }
