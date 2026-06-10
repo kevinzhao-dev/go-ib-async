@@ -81,8 +81,7 @@ func New() *IB {
 	ib.client.OnDataArrived = func() {
 		// Set timestamp for this message batch
 		now := time.Now()
-		ib.state.LastTime = now
-		ib.state.TimeFloat = float64(now.UnixMilli()) / 1000.0
+		ib.state.SetNow(now, float64(now.UnixMilli())/1000.0)
 		// NOTE: We do NOT clear pending tickers here. Tickers accumulate
 		// across messages in the same read cycle. They are cleared in
 		// OnDataProcessed after events are emitted.
@@ -91,11 +90,12 @@ func New() *IB {
 		ib.UpdateEvent.Emit(struct{}{})
 		pending := ib.state.GetPendingTickers()
 		if len(pending) > 0 {
-			t := ib.state.LastTime
-			ts := ib.state.TimeFloat
+			t, ts := ib.state.Now()
 			for _, ticker := range pending {
+				ticker.Lock()
 				ticker.Time = t
 				ticker.Timestamp = ts
+				ticker.Unlock()
 				ticker.UpdateEvent.Emit(ticker)
 			}
 			ib.PendingTickersEvent.Emit(pending)
@@ -602,17 +602,16 @@ func (ib *IB) handleOrderStatus(r *protocol.FieldReader) {
 			WhyHeld:       whyHeld,
 			MktCapPrice:   mktCapPrice,
 		}
-		ib.state.Mu.Unlock()
-
-		// Log status change
+		// Log status change (inside the lock — Trade mutations happen
+		// under state.Mu on the reader goroutine)
 		if status != oldStatus {
-			logEntry := order.TradeLogEntry{
+			trade.Log = append(trade.Log, order.TradeLogEntry{
 				Time:    time.Now(),
 				Status:  status,
 				Message: "",
-			}
-			trade.Log = append(trade.Log, logEntry)
+			})
 		}
+		ib.state.Mu.Unlock()
 
 		ib.OrderStatusEvent.Emit(trade)
 		trade.StatusEvent.Emit(trade)
@@ -1002,6 +1001,7 @@ func (ib *IB) handleTickPrice(r *protocol.FieldReader) {
 		return
 	}
 
+	ticker.Lock()
 	// Bid/Ask/Last are handled specially (tick types 1,2,4 + delayed 66,67,68)
 	switch tickType {
 	case 1, 66: // BID
@@ -1024,6 +1024,7 @@ func (ib *IB) handleTickPrice(r *protocol.FieldReader) {
 			setTickerFloat(ticker, fieldName, price)
 		}
 	}
+	ticker.Unlock()
 
 	ib.state.MarkTickerPending(ticker)
 }
@@ -1042,6 +1043,7 @@ func (ib *IB) handleTickSize(r *protocol.FieldReader) {
 		return
 	}
 
+	ticker.Lock()
 	// Bid/Ask/Last size are tick types 0,3,5 (and delayed 69,70,71)
 	switch tickType {
 	case 0, 69: // BID_SIZE
@@ -1058,6 +1060,7 @@ func (ib *IB) handleTickSize(r *protocol.FieldReader) {
 			setTickerFloat(ticker, fieldName, size)
 		}
 	}
+	ticker.Unlock()
 
 	ib.state.MarkTickerPending(ticker)
 }
@@ -1076,9 +1079,11 @@ func (ib *IB) handleTickGeneric(r *protocol.FieldReader) {
 		return
 	}
 
+	ticker.Lock()
 	if fieldName, ok := state.GenericTickMap[tickType]; ok {
 		setTickerFloat(ticker, fieldName, value)
 	}
+	ticker.Unlock()
 
 	ib.state.MarkTickerPending(ticker)
 }
@@ -1097,13 +1102,17 @@ func (ib *IB) handleTickString(r *protocol.FieldReader) {
 		return
 	}
 
+	// Capture batch time before taking the ticker lock (lock order: Mu → ticker).
+	lastTime, _ := ib.state.Now()
+
+	ticker.Lock()
 	switch {
 	case tickType == 45 || tickType == 88:
 		// Timestamp ticks (lastTimestamp, delayedLastTimestamp)
 		ib.processTimestampTick(ticker, tickType, value)
 	case tickType == 48 || tickType == 77:
 		// RT Volume / RT Trade Volume
-		ib.processRtVolumeTick(ticker, tickType, value)
+		ib.processRtVolumeTick(ticker, tickType, value, lastTime)
 	case tickType == 59:
 		// Dividends: "past12,next12,nextDate,nextAmount"
 		ib.processDividendTick(ticker, value)
@@ -1115,6 +1124,7 @@ func (ib *IB) handleTickString(r *protocol.FieldReader) {
 			setTickerString(ticker, fieldName, value)
 		}
 	}
+	ticker.Unlock()
 
 	ib.state.MarkTickerPending(ticker)
 }
@@ -1137,7 +1147,7 @@ func (ib *IB) processTimestampTick(ticker *market.Ticker, tickType int, value st
 	}
 }
 
-func (ib *IB) processRtVolumeTick(ticker *market.Ticker, tickType int, value string) {
+func (ib *IB) processRtVolumeTick(ticker *market.Ticker, tickType int, value string, lastTime time.Time) {
 	// Format: price;size;ms_since_epoch;total_volume;VWAP;single_trade
 	parts := strings.Split(value, ";")
 	if len(parts) < 6 {
@@ -1179,7 +1189,7 @@ func (ib *IB) processRtVolumeTick(ticker *market.Ticker, tickType int, value str
 			ticker.LastSize = size
 
 			ticker.Ticks = append(ticker.Ticks, market.TickData{
-				Time: ib.state.LastTime, TickType: tickType, Price: price, Size: size,
+				Time: lastTime, TickType: tickType, Price: price, Size: size,
 			})
 		}
 	}
@@ -1472,7 +1482,9 @@ func (ib *IB) handleMarketDataType(r *protocol.FieldReader) {
 	ib.state.Mu.RUnlock()
 
 	if ok {
+		ticker.Lock()
 		ticker.MarketDataType = mktDataType
+		ticker.Unlock()
 	}
 }
 
@@ -1580,8 +1592,10 @@ func (ib *IB) PlaceOrder(con *contract.Contract, ord *order.Order) (*order.Trade
 	if isModify {
 		// Modify existing order
 		trade = existingTrade
+		ib.state.Mu.Lock()
 		logEntry := order.TradeLogEntry{Time: now, Status: trade.OrderStatus.Status, Message: "Modify"}
 		trade.Log = append(trade.Log, logEntry)
+		ib.state.Mu.Unlock()
 		trade.ModifyEvent.Emit(trade)
 	} else {
 		// New order

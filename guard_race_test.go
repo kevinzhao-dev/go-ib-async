@@ -248,9 +248,11 @@ func TestGuardTickerStreamCrossGoroutineRead(t *testing.T) {
 		select {
 		case <-ch:
 			received++
-			// Cross-goroutine read of streaming fields — this is the
-			// documented usage and must be race-free.
+			// Cross-goroutine read of streaming fields — per the Ticker
+			// concurrency contract this requires the read lock.
+			ticker.RLock()
 			raceSink = ticker.Bid + ticker.Ask + ticker.Last + float64(len(ticker.Ticks))
+			ticker.RUnlock()
 		case <-deadline:
 			t.Fatalf("timed out after %d ticker updates", received)
 		}

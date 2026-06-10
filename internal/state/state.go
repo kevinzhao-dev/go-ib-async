@@ -195,7 +195,40 @@ func (m *Manager) GetPendingTickers() []*market.Ticker {
 
 // MarkTickerPending marks a ticker as having pending updates.
 func (m *Manager) MarkTickerPending(t *market.Ticker) {
+	m.Mu.Lock()
 	m.PendingTickers[t] = true
+	m.Mu.Unlock()
+}
+
+// ClearPendingTickers clears pending tickers and resets their tick lists.
+// Called after each batch's events have been emitted. Lock order is
+// Manager.Mu, then each Ticker's own lock — keep that order everywhere.
+func (m *Manager) ClearPendingTickers() {
+	m.Mu.Lock()
+	defer m.Mu.Unlock()
+	for ticker := range m.PendingTickers {
+		ticker.Lock()
+		ticker.Ticks = nil
+		ticker.TickByTicks = nil
+		ticker.DomTicks = nil
+		ticker.Unlock()
+	}
+	m.PendingTickers = make(map[*market.Ticker]bool)
+}
+
+// SetNow records the arrival timestamp for the current message batch.
+func (m *Manager) SetNow(t time.Time, ts float64) {
+	m.Mu.Lock()
+	m.LastTime = t
+	m.TimeFloat = ts
+	m.Mu.Unlock()
+}
+
+// Now returns the most recent batch arrival timestamp.
+func (m *Manager) Now() (time.Time, float64) {
+	m.Mu.RLock()
+	defer m.Mu.RUnlock()
+	return m.LastTime, m.TimeFloat
 }
 
 // Reset clears all state (called on disconnect).

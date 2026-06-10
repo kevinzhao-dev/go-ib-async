@@ -27,14 +27,3 @@ func (m *MarketState) reset() {
 	m.ReqID2Ticker = make(map[int64]*market.Ticker)
 	m.ReqID2Subscriber = make(map[int64]interface{})
 }
-
-// ClearPendingTickers clears pending tickers and resets their tick lists.
-// Called at the start of each network packet (tcpDataArrived).
-func (m *MarketState) ClearPendingTickers() {
-	for ticker := range m.PendingTickers {
-		ticker.Ticks = nil
-		ticker.TickByTicks = nil
-		ticker.DomTicks = nil
-	}
-	m.PendingTickers = make(map[*market.Ticker]bool)
-}

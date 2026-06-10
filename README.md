@@ -59,7 +59,9 @@ func main() {
     }
     ch := ticker.UpdateEvent.Once()
     <-ch // wait for first tick update
+    ticker.RLock() // cross-goroutine reads require the ticker's read lock
     fmt.Printf("bid=%.2f ask=%.2f last=%.2f\n", ticker.Bid, ticker.Ask, ticker.Last)
+    ticker.RUnlock()
 }
 ```
 
@@ -94,6 +96,13 @@ ibgo (root)          IB facade - Connect, public API, message dispatch
 
 **Concurrency model:** Single reader goroutine processes all inbound messages. Request-response matching via per-request buffered channels. State mutations on the reader goroutine, thread-safe reads via `sync.RWMutex`.
 
+**Reading streaming objects safely:**
+
+- `Ticker` fields are written by the reader goroutine under the ticker's embedded lock.
+  - Inside `UpdateEvent.Subscribe` callbacks (which run on the reader goroutine): read fields directly, no locking.
+  - From any other goroutine (`Chan`/`Once` subscriptions, polling): hold the read lock — `ticker.RLock()` … `ticker.RUnlock()`.
+- `Trade`, `BarDataList`, `RealTimeBarList`: read inside their event callbacks; cross-goroutine polling of their fields is not yet synchronized.
+
 ## Development
 
 ```bash
@@ -113,9 +122,9 @@ Tests are split by build tag:
 ## Known Limitations
 
 - **Not production-ready for live trading.** Order execution edge cases (partial fills, status transitions, commission timing) need more coverage.
-- **No reconnection / heartbeat.** IB Gateway disconnects are routine; this library does not auto-reconnect.
+- **Reconnection does not restore subscriptions.** `ConnectWithReconnect` reconnects and probes with a heartbeat, but state is reset on reconnect — re-subscribe market data and re-sync orders in the `onConnect` callback.
 - **35% message coverage** (29/82 inbound types). Many advanced features are not yet implemented.
-- **No request throttling** at runtime (constants defined, enforcement not implemented).
+- **Request throttling** is enforced at 45 msg/s on every outbound message (no priority lane for cancels).
 
 ## Requirements
 

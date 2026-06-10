@@ -3,6 +3,7 @@ package market
 
 import (
 	"math"
+	"sync"
 	"time"
 
 	"github.com/kevinzhao-dev/go-ib-async/contract"
@@ -12,7 +13,17 @@ import (
 var nan = math.NaN()
 
 // Ticker holds current market data for a contract.
+//
+// Concurrency contract: all fields are written by the connection's reader
+// goroutine while holding the embedded write lock. Reads are safe in two
+// ways:
+//   - inside UpdateEvent callbacks (Subscribe), which run synchronously on
+//     the reader goroutine — no locking needed;
+//   - from any other goroutine (channel subscriptions, polling) by holding
+//     the read lock: t.RLock(); v := t.Bid; t.RUnlock().
 type Ticker struct {
+	sync.RWMutex
+
 	Contract      *contract.Contract
 	Time          time.Time
 	Timestamp     float64

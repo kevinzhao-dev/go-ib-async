@@ -131,13 +131,14 @@ func (ib *IB) heartbeatLoop(ctx context.Context, cfg ReconnectConfig, done chan 
 				return
 			}
 
-			// Wait for any response (currentTime handler updates LastTime)
-			timeBefore := ib.state.LastTime
+			// Wait for any response (any inbound data updates LastTime)
+			timeBefore, _ := ib.state.Now()
 			timer := time.NewTimer(probeTimeout)
 			select {
 			case <-timer.C:
 				// Check if any data arrived since probe
-				if ib.state.LastTime.Equal(timeBefore) {
+				timeAfter, _ := ib.state.Now()
+				if timeAfter.Equal(timeBefore) {
 					log.Printf("ibgo: heartbeat timeout — peer not responding, disconnecting")
 					ib.Disconnect()
 					return
