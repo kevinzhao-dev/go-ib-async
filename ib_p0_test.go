@@ -72,8 +72,9 @@ func TestPartialFillAccumulation(t *testing.T) {
 
 func sendExecDetails(t *testing.T, ib *IB, execID string, shares, price float64, permID, clientID, orderID int64) {
 	t.Helper()
+	// No version field for server >= 147.
 	fields := []string{
-		"11", "1", "-1",
+		"11", "-1",
 		itoa(orderID),
 		"265598", "AAPL", "STK", "", "0", "", "", "SMART", "USD", "", "",
 		execID, "20260409 10:00:00", "DU123", "SMART", "BOT",

@@ -131,12 +131,13 @@ func TestExecDetailsFillLinkedToTrade(t *testing.T) {
 	})
 
 	// Simulate execDetails message (msgId=11)
-	// Format: msgId, version, reqId, orderId, conId, symbol, secType, lastTradeDate,
-	//         strike, right, multiplier, exchange, currency, localSymbol, tradingClass,
-	//         execId, time, acctNumber, exchange, side, shares, price, permId, clientId,
-	//         liquidation, cumQty, avgPrice, orderRef, evRule, evMultiplier, modelCode, lastLiquidity
+	// Format (no version field for server >= 147): msgId, reqId, orderId, conId,
+	//         symbol, secType, lastTradeDate, strike, right, multiplier, exchange,
+	//         currency, localSymbol, tradingClass, execId, time, acctNumber, exchange,
+	//         side, shares, price, permId, clientId, liquidation, cumQty, avgPrice,
+	//         orderRef, evRule, evMultiplier, modelCode, lastLiquidity, pendingPriceRevision
 	fields := []string{
-		"11", "1", "-1",
+		"11", "-1",
 		"42",
 		"265598", "AAPL", "STK", "", "0", "", "", "SMART", "USD", "", "",
 		"exec001", "20260409 10:00:00", "DU123", "SMART", "BOT",
@@ -198,7 +199,7 @@ func TestExecDetailsDuplicateFillIgnored(t *testing.T) {
 	ib.state.PermID2Trade[999] = trade
 
 	fields := []string{
-		"11", "1", "-1", "42",
+		"11", "-1", "42",
 		"265598", "AAPL", "STK", "", "0", "", "", "SMART", "USD", "", "",
 		"exec001", "20260409 10:00:00", "DU123", "SMART", "BOT",
 		"50", "150.50", "999", "1", "0", "50", "150.50",

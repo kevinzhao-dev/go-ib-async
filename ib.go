@@ -469,6 +469,7 @@ func (ib *IB) handleContractDetailsEnd(r *protocol.FieldReader) {
 func (ib *IB) handlePosition(r *protocol.FieldReader) {
 	r.Skip(1) // version
 	acct := r.ReadString()
+	// ib_async decoder.position: contract includes localSymbol and tradingClass
 	c := &contract.Contract{
 		ConID:    r.ReadInt(),
 		Symbol:   r.ReadString(),
@@ -479,6 +480,8 @@ func (ib *IB) handlePosition(r *protocol.FieldReader) {
 		Multiplier: r.ReadString(),
 		Exchange: r.ReadString(),
 		Currency: r.ReadString(),
+		LocalSymbol:  r.ReadString(),
+		TradingClass: r.ReadString(),
 	}
 	pos := r.ReadFloat()
 	avgCost := r.ReadFloat()
@@ -1804,9 +1807,8 @@ func (ib *IB) handleOpenOrderEnd(r *protocol.FieldReader) {
 }
 
 func (ib *IB) handleExecDetails(r *protocol.FieldReader) {
-	// Python: _, reqId, ex.orderId, c.conId, c.symbol, c.secType, ...contract..., ex.execId, time, ...exec...
-	// skip=2 default: msgId already skipped by Decoder, skip version here
-	r.Skip(1) // version
+	// No version field for server >= 147 (this library requires >= 157).
+	// ib_async decoder.execDetails: (_, reqId, ex.orderId, c.conId, ...)
 	reqID := r.ReadInt()
 
 	exec := &order.Execution{}

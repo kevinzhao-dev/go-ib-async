@@ -166,8 +166,8 @@ func TestIBPositionEvent(t *testing.T) {
 		buf := make([]byte, msgLen)
 		conn.Read(buf)
 
-		// Send position (msgId=61)
-		sendMsg(conn, "61\x001\x00DU123456\x00265598\x00AAPL\x00STK\x00\x000\x00\x00\x00SMART\x00USD\x00100\x00150.5\x00")
+		// Send position (msgId=61) — contract includes localSymbol + tradingClass
+		sendMsg(conn, "61\x001\x00DU123456\x00265598\x00AAPL\x00STK\x00\x000\x00\x00\x00SMART\x00USD\x00AAPL\x00NMS\x00100\x00150.5\x00")
 		// Send positionEnd (msgId=62)
 		sendMsg(conn, "62\x001\x00")
 		time.Sleep(100 * time.Millisecond)
@@ -262,8 +262,8 @@ func TestBatchSemanticsMultipleMessages(t *testing.T) {
 	srv := newMockTWSServer(t, func(conn net.Conn) {
 		// Send multiple messages in rapid succession (same TCP write)
 		// This should be treated as one batch
-		msg1 := buildFrame("61\x001\x00DU123456\x00265598\x00AAPL\x00STK\x00\x000\x00\x00\x00SMART\x00USD\x00100\x00150.5\x00")
-		msg2 := buildFrame("61\x001\x00DU123456\x00265599\x00MSFT\x00STK\x00\x000\x00\x00\x00SMART\x00USD\x0050\x00300.0\x00")
+		msg1 := buildFrame("61\x001\x00DU123456\x00265598\x00AAPL\x00STK\x00\x000\x00\x00\x00SMART\x00USD\x00AAPL\x00NMS\x00100\x00150.5\x00")
+		msg2 := buildFrame("61\x001\x00DU123456\x00265599\x00MSFT\x00STK\x00\x000\x00\x00\x00SMART\x00USD\x00MSFT\x00NMS\x0050\x00300.0\x00")
 		// Write both messages in a single TCP write so they land in the same buffer
 		combined := append(msg1, msg2...)
 		conn.Write(combined)
