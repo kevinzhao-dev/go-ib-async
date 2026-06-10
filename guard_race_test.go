@@ -341,6 +341,58 @@ func TestGuardTickerStreamCrossGoroutineRead(t *testing.T) {
 	ib.CancelMktData(con)
 }
 
+// TestGuardSnapshotReleasesTicker requests market data snapshots and checks
+// that the ticker bookkeeping is released after tickSnapshotEnd — snapshots
+// are fire-and-forget, so leaked map entries accumulate per request in
+// long-running processes.
+func TestGuardSnapshotReleasesTicker(t *testing.T) {
+	srv := newGuardServer(t, func(s *guardServer, msg []string) {
+		if msg[0] == "1" { // reqMktData
+			reqID := msg[2]
+			s.send("1", "6", reqID, "1", "150.10", "200", "0") // bid tick
+			s.send("57", "1", reqID)                           // tickSnapshotEnd
+		}
+	})
+	defer srv.close()
+
+	ib := guardConnect(t, srv)
+	defer ib.Disconnect()
+
+	for i := 0; i < 2; i++ {
+		con := contract.Stock("AAPL", "SMART", "USD")
+		con.ConID = 265598
+		ticker, err := ib.ReqMktData(con, "", true, false)
+		if err != nil {
+			t.Fatalf("ReqMktData: %v", err)
+		}
+
+		// Wait for the snapshot to complete and the mappings to be released.
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			ib.state.Mu.RLock()
+			reqMapLen := len(ib.state.ReqID2Ticker)
+			tickerMapLen := len(ib.state.Tickers)
+			ib.state.Mu.RUnlock()
+			if reqMapLen == 0 && tickerMapLen == 0 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("snapshot %d leaked: ReqID2Ticker=%d Tickers=%d after tickSnapshotEnd",
+					i, reqMapLen, tickerMapLen)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+
+		// The ticker itself must still carry the snapshot data.
+		ticker.RLock()
+		bid := ticker.Bid
+		ticker.RUnlock()
+		if bid != 150.10 {
+			t.Fatalf("snapshot %d: bid = %g, want 150.10", i, bid)
+		}
+	}
+}
+
 // TestGuardDisconnectDuringTickStream disconnects while ticks are mid-flight.
 // Guards: state.Reset (user goroutine) vs pending-ticker bookkeeping on the
 // reader goroutine.

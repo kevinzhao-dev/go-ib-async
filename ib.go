@@ -1556,6 +1556,20 @@ func parseBarDate(s string) time.Time {
 func (ib *IB) handleTickSnapshotEnd(r *protocol.FieldReader) {
 	r.Skip(1) // version
 	reqID := r.ReadInt()
+
+	// The snapshot subscription is over: release the ticker mappings so
+	// repeated snapshots don't leak (parity: ib_async endTicker). The
+	// ticker itself stays valid for anyone holding a reference.
+	ib.state.Mu.Lock()
+	if ticker, ok := ib.state.ReqID2Ticker[reqID]; ok {
+		delete(ib.state.ReqID2Ticker, reqID)
+		key := ticker.Contract.Key()
+		if cur, ok := ib.state.Tickers[key]; ok && cur == ticker {
+			delete(ib.state.Tickers, key)
+		}
+	}
+	ib.state.Mu.Unlock()
+
 	ib.state.EndReq(reqID, nil, nil)
 }
 
@@ -1617,17 +1631,21 @@ func (ib *IB) ReqMktData(con *contract.Contract, genericTickList string, snapsho
 	ib.state.ReqID2Ticker[reqID] = ticker
 	ib.state.Mu.Unlock()
 
+	// Snapshot tracking must be registered BEFORE the request is sent, or
+	// a fast tickSnapshotEnd could arrive before the request is tracked.
+	if snapshot || regulatorySnapshot {
+		ib.state.StartReq(reqID, con)
+	}
+
 	if err := ib.client.ReqMktData(reqID, con, genericTickList, snapshot, regulatorySnapshot, nil); err != nil {
 		ib.state.Mu.Lock()
 		delete(ib.state.Tickers, key)
 		delete(ib.state.ReqID2Ticker, reqID)
 		ib.state.Mu.Unlock()
+		if snapshot || regulatorySnapshot {
+			ib.state.CancelReq(reqID)
+		}
 		return nil, err
-	}
-
-	// For snapshot requests, set up request tracking
-	if snapshot || regulatorySnapshot {
-		ib.state.StartReq(reqID, con)
 	}
 
 	return ticker, nil
