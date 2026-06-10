@@ -101,7 +101,8 @@ ibgo (root)          IB facade - Connect, public API, message dispatch
 - `Ticker` fields are written by the reader goroutine under the ticker's embedded lock.
   - Inside `UpdateEvent.Subscribe` callbacks (which run on the reader goroutine): read fields directly, no locking.
   - From any other goroutine (`Chan`/`Once` subscriptions, polling): hold the read lock — `ticker.RLock()` … `ticker.RUnlock()`.
-- `Trade`, `BarDataList`, `RealTimeBarList`: read inside their event callbacks; cross-goroutine polling of their fields is not yet synchronized.
+- `Trade` mutations hold its embedded lock; read fields and call helpers (`IsDone`, `FilledQty`, …) under `trade.RLock()` … `trade.RUnlock()` from your goroutines.
+- `BarDataList`, `RealTimeBarList`: read inside their `UpdateEvent` callbacks; cross-goroutine polling of their fields is not yet synchronized.
 
 ## Development
 

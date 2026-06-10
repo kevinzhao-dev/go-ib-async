@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/kevinzhao-dev/go-ib-async/contract"
+	"github.com/kevinzhao-dev/go-ib-async/order"
 )
 
 // guardServer is a scripted in-process TWS: it performs the handshake and
@@ -339,6 +340,114 @@ func TestGuardTickerStreamCrossGoroutineRead(t *testing.T) {
 		}
 	}
 	ib.CancelMktData(con)
+}
+
+// TestGuardTradeCrossGoroutineRead places an order, then reads the trade's
+// fields from a polling goroutine (under the Trade read lock, per the
+// contract) while the reader goroutine streams status updates and fills and
+// another user goroutine issues concurrent order modifications.
+func TestGuardTradeCrossGoroutineRead(t *testing.T) {
+	streamed := make(map[string]bool)
+	srv := newGuardServer(t, func(s *guardServer, msg []string) {
+		if msg[0] != "3" { // placeOrder (outbound)
+			return
+		}
+		orderID := msg[1]
+		if streamed[orderID] {
+			return // modifications don't restart the stream
+		}
+		streamed[orderID] = true
+		go func() {
+			for i := 0; i < 40; i++ {
+				if !s.send("3", orderID, "Submitted", "0", "100", "0", "999", "0", "0", "1", "", "0") {
+					return
+				}
+				if i%10 == 5 {
+					execID := fmt.Sprintf("exec-%s-%d", orderID, i)
+					if !s.send("11", "-1", orderID,
+						"265598", "AAPL", "STK", "", "0", "", "", "ISLAND", "USD", "AAPL", "NMS",
+						execID, "20260610 09:30:01", "DU123456", "ISLAND", "BOT",
+						"10", "150.25", "999", "1", "0", "10", "150.25",
+						"", "", "0", "", "1", "0") {
+						return
+					}
+				}
+				time.Sleep(time.Millisecond)
+			}
+			s.send("3", orderID, "Filled", "100", "0", "150.25", "999", "0", "150.25", "1", "", "0")
+		}()
+	})
+	defer srv.close()
+
+	ib := guardConnect(t, srv)
+	defer ib.Disconnect()
+
+	con := contract.Stock("AAPL", "SMART", "USD")
+	con.ConID = 265598
+	ord := order.NewOrder()
+	ord.Action = "BUY"
+	ord.OrderType = "LMT"
+	ord.TotalQuantity = 100
+	ord.LmtPrice = 150.25
+
+	trade, err := ib.PlaceOrder(con, ord)
+	if err != nil {
+		t.Fatalf("PlaceOrder: %v", err)
+	}
+
+	filled := make(chan struct{}, 1)
+	trade.FilledEvent.Subscribe(func(*order.Trade) {
+		select {
+		case filled <- struct{}{}:
+		default:
+		}
+	})
+
+	// Concurrent modifications from a user goroutine (mutates trade.Log).
+	modDone := make(chan struct{})
+	go func() {
+		defer close(modDone)
+		for i := 0; i < 10; i++ {
+			if _, err := ib.PlaceOrder(con, ord); err != nil {
+				return
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+
+	// Poll trade fields cross-goroutine under the read lock.
+	pollDone := make(chan struct{})
+	go func() {
+		defer close(pollDone)
+		for {
+			select {
+			case <-filled:
+				return
+			case <-time.After(time.Millisecond):
+				trade.RLock()
+				raceSink = float64(len(trade.Fills)) + float64(len(trade.Log))
+				_ = trade.OrderStatus.Status
+				_ = trade.IsDone()
+				trade.RUnlock()
+			}
+		}
+	}()
+
+	select {
+	case <-pollDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("trade never reached Filled")
+	}
+	<-modDone
+
+	trade.RLock()
+	defer trade.RUnlock()
+	if trade.OrderStatus.Status != order.StatusFilled {
+		t.Fatalf("status = %q, want Filled", trade.OrderStatus.Status)
+	}
+	if len(trade.Fills) == 0 {
+		t.Fatal("expected at least one fill")
+	}
 }
 
 // TestGuardSnapshotReleasesTicker requests market data snapshots and checks

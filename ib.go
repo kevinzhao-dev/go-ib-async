@@ -388,9 +388,13 @@ func (ib *IB) handleError(r *protocol.FieldReader) {
 
 	// reqID is a local orderId when the error refers to an order; -1 otherwise.
 	var trade *order.Trade
+	tradeStatus := ""
 	if reqID != -1 {
 		ib.state.Mu.RLock()
 		trade = ib.state.Trades[state.OrderKey{ClientID: int64(ib.client.ClientID), OrderID: reqID}]
+		if trade != nil {
+			tradeStatus = trade.OrderStatus.Status
+		}
 		ib.state.Mu.RUnlock()
 	}
 
@@ -407,7 +411,7 @@ func (ib *IB) handleError(r *protocol.FieldReader) {
 		// whatIf/request failed
 		isWarning = false
 	}
-	if code == 110 && trade != nil && trade.OrderStatus.Status == order.StatusPendingSubmit {
+	if code == 110 && trade != nil && tradeStatus == order.StatusPendingSubmit {
 		// invalid price on a new order must cancel it
 		isWarning = false
 	}
@@ -416,10 +420,12 @@ func (ib *IB) handleError(r *protocol.FieldReader) {
 		if trade != nil {
 			// Order is STILL LIVE at the broker; record but do not cancel.
 			ib.state.Mu.Lock()
+			trade.Lock()
 			trade.OrderStatus.Status = order.StatusValidationError
 			trade.Log = append(trade.Log, order.TradeLogEntry{
 				Time: time.Now(), Status: order.StatusValidationError, Message: msg, ErrorCode: code,
 			})
+			trade.Unlock()
 			ib.state.Mu.Unlock()
 			ib.OrderStatusEvent.Emit(trade)
 			trade.StatusEvent.Emit(trade)
@@ -434,6 +440,7 @@ func (ib *IB) handleError(r *protocol.FieldReader) {
 		} else if trade != nil {
 			// Order rejected or server-cancelled
 			ib.state.Mu.Lock()
+			trade.Lock()
 			if advancedOrderReject != "" {
 				trade.AdvancedError = advancedOrderReject
 			}
@@ -444,6 +451,7 @@ func (ib *IB) handleError(r *protocol.FieldReader) {
 					Time: time.Now(), Status: order.StatusCancelled, Message: msg, ErrorCode: code,
 				})
 			}
+			trade.Unlock()
 			ib.state.Mu.Unlock()
 			if !done {
 				ib.OrderStatusEvent.Emit(trade)
@@ -675,6 +683,7 @@ func (ib *IB) handleOrderStatus(r *protocol.FieldReader) {
 	}
 
 	if ok {
+		trade.Lock()
 		oldStatus := trade.OrderStatus.Status
 		trade.OrderStatus = &order.OrderStatus{
 			OrderID:       orderID,
@@ -689,8 +698,6 @@ func (ib *IB) handleOrderStatus(r *protocol.FieldReader) {
 			WhyHeld:       whyHeld,
 			MktCapPrice:   mktCapPrice,
 		}
-		// Log status change (inside the lock — Trade mutations happen
-		// under state.Mu on the reader goroutine)
 		if status != oldStatus {
 			trade.Log = append(trade.Log, order.TradeLogEntry{
 				Time:    time.Now(),
@@ -698,6 +705,7 @@ func (ib *IB) handleOrderStatus(r *protocol.FieldReader) {
 				Message: "",
 			})
 		}
+		trade.Unlock()
 		ib.state.Mu.Unlock()
 
 		ib.OrderStatusEvent.Emit(trade)
@@ -1006,12 +1014,14 @@ func (ib *IB) handleOpenOrder(r *protocol.FieldReader) {
 	trade, exists := ib.state.Trades[key]
 	if exists {
 		// Update existing trade
+		trade.Lock()
 		trade.Order.PermID = o.PermID
 		trade.Order.TotalQuantity = o.TotalQuantity
 		trade.Order.LmtPrice = o.LmtPrice
 		trade.Order.AuxPrice = o.AuxPrice
 		trade.Order.OrderType = o.OrderType
 		trade.Order.OrderRef = o.OrderRef
+		trade.Unlock()
 	} else {
 		// New trade from TWS or another client
 		os := &order.OrderStatus{OrderID: o.OrderID, Status: st.Status}
@@ -1698,8 +1708,10 @@ func (ib *IB) PlaceOrder(con *contract.Contract, ord *order.Order) (*order.Trade
 		// Modify existing order
 		trade = existingTrade
 		ib.state.Mu.Lock()
+		trade.Lock()
 		logEntry := order.TradeLogEntry{Time: now, Status: trade.OrderStatus.Status, Message: "Modify"}
 		trade.Log = append(trade.Log, logEntry)
+		trade.Unlock()
 		ib.state.Mu.Unlock()
 		trade.ModifyEvent.Emit(trade)
 	} else {
@@ -1996,13 +2008,14 @@ func (ib *IB) handleExecDetails(r *protocol.FieldReader) {
 	if _, exists := ib.state.Fills[exec.ExecID]; !exists {
 		ib.state.Fills[exec.ExecID] = fill
 		if trade != nil {
+			trade.Lock()
 			trade.Fills = append(trade.Fills, fill)
-			logEntry := order.TradeLogEntry{
+			trade.Log = append(trade.Log, order.TradeLogEntry{
 				Time:    exec.Time,
 				Status:  trade.OrderStatus.Status,
 				Message: fmt.Sprintf("Fill %g@%g", exec.Shares, exec.Price),
-			}
-			trade.Log = append(trade.Log, logEntry)
+			})
+			trade.Unlock()
 		}
 	}
 	ib.state.Mu.Unlock()
@@ -2051,13 +2064,19 @@ func (ib *IB) handleCommissionReport(r *protocol.FieldReader) {
 
 	ib.state.Mu.Lock()
 	fill, ok := ib.state.Fills[cr.ExecID]
-	if ok {
-		fill.CommissionReport = cr
-	}
 	// Find trade for commission event
 	var trade *order.Trade
 	if ok {
 		trade = ib.state.PermID2Trade[fill.Execution.PermID]
+		// The fill may be reachable through trade.Fills, so its mutation
+		// follows the Trade lock contract when a trade owns it.
+		if trade != nil {
+			trade.Lock()
+		}
+		fill.CommissionReport = cr
+		if trade != nil {
+			trade.Unlock()
+		}
 	}
 	ib.state.Mu.Unlock()
 
@@ -2542,7 +2561,9 @@ func (ib *IB) handleOrderBound(r *protocol.FieldReader) {
 		key := state.OrderKey{ClientID: apiClientID, OrderID: apiOrderID}
 		ib.state.Mu.Lock()
 		if trade, ok := ib.state.Trades[key]; ok {
+			trade.Lock()
 			trade.Order.PermID = permID
+			trade.Unlock()
 			ib.state.PermID2Trade[permID] = trade
 		}
 		ib.state.Mu.Unlock()

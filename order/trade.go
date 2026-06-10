@@ -1,6 +1,7 @@
 package order
 
 import (
+	"sync"
 	"time"
 
 	"github.com/kevinzhao-dev/go-ib-async/contract"
@@ -68,7 +69,21 @@ type ExecutionFilter struct {
 }
 
 // Trade tracks an order, its status, and all its fills.
+//
+// Concurrency contract: every mutation (by the connection's reader
+// goroutine, and by PlaceOrder when modifying an order) holds the embedded
+// write lock. Read fields — or call the helper methods below — while
+// holding the read lock from your own goroutines:
+//
+//	trade.RLock()
+//	status := trade.OrderStatus.Status
+//	trade.RUnlock()
+//
+// Helper methods (IsDone, FilledQty, ...) do not lock themselves so they
+// can be composed under a single RLock without re-entrancy hazards.
 type Trade struct {
+	sync.RWMutex
+
 	Contract      *contract.Contract
 	Order         *Order
 	OrderStatus   *OrderStatus
