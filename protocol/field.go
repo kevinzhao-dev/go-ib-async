@@ -9,6 +9,10 @@ import (
 type FieldReader struct {
 	Fields []string
 	Pos    int
+	// Overflow counts reads attempted past the end of Fields. A non-zero
+	// value after decoding a complete message means the decoder expects
+	// more fields than the wire provides (a field-offset bug).
+	Overflow int
 }
 
 // NewFieldReader creates a FieldReader from a slice of fields.
@@ -24,6 +28,7 @@ func (r *FieldReader) HasMore() bool {
 // ReadString reads the next field as a string.
 func (r *FieldReader) ReadString() string {
 	if r.Pos >= len(r.Fields) {
+		r.Overflow++
 		return ""
 	}
 	v := r.Fields[r.Pos]
@@ -73,6 +78,7 @@ func (r *FieldReader) ReadIntList(n int) []int64 {
 func (r *FieldReader) Skip(n int) {
 	r.Pos += n
 	if r.Pos > len(r.Fields) {
+		r.Overflow += r.Pos - len(r.Fields)
 		r.Pos = len(r.Fields)
 	}
 }
