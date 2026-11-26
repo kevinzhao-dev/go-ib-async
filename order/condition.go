@@ -38,9 +38,9 @@ type PriceCondition struct {
 	TriggerMethod int
 }
 
-func (c *PriceCondition) CondType() int              { return c.condType }
-func (c *PriceCondition) GetConjunction() string      { return c.Conjunction }
-func (c *PriceCondition) SetConjunction(s string)     { c.Conjunction = s }
+func (c *PriceCondition) CondType() int           { return c.condType }
+func (c *PriceCondition) GetConjunction() string  { return c.Conjunction }
+func (c *PriceCondition) SetConjunction(s string) { c.Conjunction = s }
 
 // TimeCondition triggers at a specific time.
 type TimeCondition struct {
@@ -50,9 +50,9 @@ type TimeCondition struct {
 	Time        string
 }
 
-func (c *TimeCondition) CondType() int              { return c.condType }
-func (c *TimeCondition) GetConjunction() string      { return c.Conjunction }
-func (c *TimeCondition) SetConjunction(s string)     { c.Conjunction = s }
+func (c *TimeCondition) CondType() int           { return c.condType }
+func (c *TimeCondition) GetConjunction() string  { return c.Conjunction }
+func (c *TimeCondition) SetConjunction(s string) { c.Conjunction = s }
 
 // MarginCondition triggers when margin level changes.
 type MarginCondition struct {
@@ -62,9 +62,9 @@ type MarginCondition struct {
 	Percent     int
 }
 
-func (c *MarginCondition) CondType() int              { return c.condType }
-func (c *MarginCondition) GetConjunction() string      { return c.Conjunction }
-func (c *MarginCondition) SetConjunction(s string)     { c.Conjunction = s }
+func (c *MarginCondition) CondType() int           { return c.condType }
+func (c *MarginCondition) GetConjunction() string  { return c.Conjunction }
+func (c *MarginCondition) SetConjunction(s string) { c.Conjunction = s }
 
 // ExecutionCondition triggers after an execution in another contract.
 type ExecutionCondition struct {
@@ -75,9 +75,9 @@ type ExecutionCondition struct {
 	Symbol      string
 }
 
-func (c *ExecutionCondition) CondType() int              { return c.condType }
-func (c *ExecutionCondition) GetConjunction() string      { return c.Conjunction }
-func (c *ExecutionCondition) SetConjunction(s string)     { c.Conjunction = s }
+func (c *ExecutionCondition) CondType() int           { return c.condType }
+func (c *ExecutionCondition) GetConjunction() string  { return c.Conjunction }
+func (c *ExecutionCondition) SetConjunction(s string) { c.Conjunction = s }
 
 // VolumeCondition triggers when volume reaches a threshold.
 type VolumeCondition struct {
@@ -89,9 +89,9 @@ type VolumeCondition struct {
 	Exchange    string
 }
 
-func (c *VolumeCondition) CondType() int              { return c.condType }
-func (c *VolumeCondition) GetConjunction() string      { return c.Conjunction }
-func (c *VolumeCondition) SetConjunction(s string)     { c.Conjunction = s }
+func (c *VolumeCondition) CondType() int           { return c.condType }
+func (c *VolumeCondition) GetConjunction() string  { return c.Conjunction }
+func (c *VolumeCondition) SetConjunction(s string) { c.Conjunction = s }
 
 // PercentChangeCondition triggers on percent change.
 type PercentChangeCondition struct {
@@ -103,6 +103,6 @@ type PercentChangeCondition struct {
 	Exchange      string
 }
 
-func (c *PercentChangeCondition) CondType() int              { return c.condType }
-func (c *PercentChangeCondition) GetConjunction() string      { return c.Conjunction }
-func (c *PercentChangeCondition) SetConjunction(s string)     { c.Conjunction = s }
+func (c *PercentChangeCondition) CondType() int           { return c.condType }
+func (c *PercentChangeCondition) GetConjunction() string  { return c.Conjunction }
+func (c *PercentChangeCondition) SetConjunction(s string) { c.Conjunction = s }

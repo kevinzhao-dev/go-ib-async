@@ -104,10 +104,10 @@ func TestMidpointNoData(t *testing.T) {
 
 func TestMarketPrice(t *testing.T) {
 	tests := []struct {
-		name string
-		bid, ask, last float64
+		name             string
+		bid, ask, last   float64
 		bidSize, askSize float64
-		want float64
+		want             float64
 	}{
 		{"last within spread", 150, 152, 151, 100, 100, 151},
 		{"last outside spread", 150, 152, 155, 100, 100, 151},
@@ -137,10 +137,10 @@ func TestMarketPrice(t *testing.T) {
 
 func TestOptionComputationAdd(t *testing.T) {
 	a := &OptionComputation{
-		Delta:  Float64Ptr(0.5),
-		Gamma:  Float64Ptr(0.01),
-		Theta:  Float64Ptr(-0.05),
-		Vega:   Float64Ptr(0.1),
+		Delta:    Float64Ptr(0.5),
+		Gamma:    Float64Ptr(0.01),
+		Theta:    Float64Ptr(-0.05),
+		Vega:     Float64Ptr(0.1),
 		UndPrice: Float64Ptr(150),
 	}
 	b := &OptionComputation{

@@ -342,8 +342,8 @@ func TestClientHandshake(t *testing.T) {
 	if !client.IsReady() {
 		t.Fatal("should be ready")
 	}
-	if client.ServerVersion != 178 {
-		t.Fatalf("ServerVersion = %d, want 178", client.ServerVersion)
+	if client.ServerVersion() != 178 {
+		t.Fatalf("ServerVersion = %d, want 178", client.ServerVersion())
 	}
 
 	accounts := client.Accounts()

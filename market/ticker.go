@@ -13,9 +13,9 @@ var nan = math.NaN()
 
 // Ticker holds current market data for a contract.
 type Ticker struct {
-	Contract      *contract.Contract
-	Time          time.Time
-	Timestamp     float64
+	Contract       *contract.Contract
+	Time           time.Time
+	Timestamp      float64
 	MarketDataType int
 
 	// Bid/Ask
@@ -31,7 +31,7 @@ type Ticker struct {
 	Last          float64
 	LastSize      float64
 	LastExchange  string
-	LastTimestamp  time.Time
+	LastTimestamp time.Time
 	LastYield     float64
 
 	// Previous values
@@ -73,16 +73,16 @@ type Ticker struct {
 	RTTime           time.Time
 
 	// Volume & trade stats
-	AvVolume      float64
-	TradeCount    float64
-	TradeRate     float64
-	VolumeRate    float64
-	VolumeRate3Min float64
-	VolumeRate5Min float64
+	AvVolume        float64
+	TradeCount      float64
+	TradeRate       float64
+	VolumeRate      float64
+	VolumeRate3Min  float64
+	VolumeRate5Min  float64
 	VolumeRate10Min float64
 
 	// Short info
-	Shortable      float64
+	Shortable       float64
 	ShortableShares float64
 
 	// Futures
@@ -114,20 +114,20 @@ type Ticker struct {
 
 	// Delayed
 	DelayedLastTimestamp time.Time
-	DelayedHalted       float64
+	DelayedHalted        float64
 
 	// Reuters
 	ReutersMutualFunds string
 
 	// ETF NAV
-	EtfNavClose     float64
+	EtfNavClose      float64
 	EtfNavPriorClose float64
-	EtfNavBid       float64
-	EtfNavAsk       float64
-	EtfNavLast      float64
+	EtfNavBid        float64
+	EtfNavAsk        float64
+	EtfNavLast       float64
 	EtfFrozenNavLast float64
-	EtfNavHigh      float64
-	EtfNavLow       float64
+	EtfNavHigh       float64
+	EtfNavLow        float64
 
 	// Social
 	SocialMarketAnalytics string
@@ -137,9 +137,9 @@ type Ticker struct {
 	FinalIpoLast         float64
 
 	// Auction
-	AuctionVolume    float64
-	AuctionPrice     float64
-	AuctionImbalance float64
+	AuctionVolume       float64
+	AuctionPrice        float64
+	AuctionImbalance    float64
 	RegulatoryImbalance float64
 
 	// Greeks
@@ -159,7 +159,7 @@ type Ticker struct {
 	CloseEfp *EfpData
 
 	// Dividends / Fundamentals
-	Dividends        *Dividends
+	Dividends         *Dividends
 	FundamentalRatios map[string]string
 
 	// Tick collections
@@ -180,9 +180,9 @@ type Ticker struct {
 // NewTicker creates a Ticker with NaN defaults for all numeric fields.
 func NewTicker(c *contract.Contract) *Ticker {
 	return &Ticker{
-		Contract:      c,
+		Contract:       c,
 		MarketDataType: 1,
-		MinTick:       nan, Bid: nan, BidSize: nan, Ask: nan, AskSize: nan,
+		MinTick:        nan, Bid: nan, BidSize: nan, Ask: nan, AskSize: nan,
 		Last: nan, LastSize: nan, LastYield: nan,
 		PrevBid: nan, PrevBidSize: nan, PrevAsk: nan, PrevAskSize: nan,
 		PrevLast: nan, PrevLastSize: nan,
@@ -197,10 +197,10 @@ func NewTicker(c *contract.Contract) *Ticker {
 		IndexFuturePremium: nan, FuturesOpenInterest: nan,
 		PutOpenInterest: nan, CallOpenInterest: nan, PutVolume: nan, CallVolume: nan,
 		AvOptionVolume: nan, HistVolatility: nan, ImpliedVolatility: nan, OpenInterest: nan,
-		LastRthTrade: nan,
+		LastRthTrade:         nan,
 		BondFactorMultiplier: nan, CreditmanMarkPrice: nan, CreditmanSlowMarkPrice: nan,
 		DelayedHalted: nan,
-		EtfNavClose: nan, EtfNavPriorClose: nan, EtfNavBid: nan, EtfNavAsk: nan,
+		EtfNavClose:   nan, EtfNavPriorClose: nan, EtfNavBid: nan, EtfNavAsk: nan,
 		EtfNavLast: nan, EtfFrozenNavLast: nan, EtfNavHigh: nan, EtfNavLow: nan,
 		EstimatedIpoMidpoint: nan, FinalIpoLast: nan,
 		AuctionVolume: nan, AuctionPrice: nan, AuctionImbalance: nan, RegulatoryImbalance: nan,

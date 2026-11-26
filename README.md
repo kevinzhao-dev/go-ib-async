@@ -2,7 +2,7 @@
 
 Go client for the Interactive Brokers TWS/Gateway API. Port of the Python [ib_async](https://github.com/ib-api-reloaded/ib_async) library.
 
-> **Status: Core subset only. Not production-ready. Not full parity with ib_async.**
+> **Status: Core subset. Not production-ready. Not full parity with ib_async.**
 > See [STATUS.md](STATUS.md) for the complete parity matrix including what's implemented, partial, and missing.
 
 ## Quick Start
@@ -63,36 +63,114 @@ func main() {
 }
 ```
 
+## Trading
+
+```go
+con := details[0].Contract
+
+// Optional safety layers: pre-trade risk checks and a write-ahead journal.
+rm := risk.New(risk.Limits{
+    MaxOrderQuantity:    500,
+    MaxPositionQuantity: 1000,
+    MaxOrdersPerWindow:  10, // per second
+    MaxDailyLoss:        2000,
+}, ib)
+ib.SetRiskManager(rm)
+
+j, err := journal.Open("orders-2026-11-26.jsonl", journal.Options{})
+if err != nil {
+    log.Fatal(err)
+}
+defer j.Close()
+ib.SetJournal(j)
+
+// What-if: margin/commission impact without placing.
+st, err := ib.WhatIfOrder(ctx, con, order.LimitOrder("BUY", 100, 150))
+
+// Place, modify, cancel.
+trade, err := ib.PlaceOrder(con, order.LimitOrder("BUY", 100, 150))
+filled := trade.FilledEvent.Once()
+trade.FillEvent.Subscribe(func(f *order.Fill) { /* partial fill */ })
+
+mod := *trade.Order
+mod.LmtPrice = 150.5
+ib.PlaceOrder(con, &mod) // same orderId = modification
+
+ib.CancelOrder(trade.Order)
+
+// Bracket: limit entry + take-profit + stop-loss, released together.
+b, err := ib.BracketOrder("BUY", 100, 150, 160, 145)
+legs, err := ib.PlaceBracketOrder(con, b)
+```
+
+Read trade state through the locked accessors (`trade.Status()`,
+`trade.StatusSnapshot()`, `trade.FillsSnapshot()`, `trade.FilledQty()`),
+not the struct fields: trades are updated on the reader goroutine.
+
+### Reconnect and order synchronisation
+
+```go
+cfg := ibgo.DefaultReconnectConfig() // heartbeat + SyncOrders after each connect
+go ib.ConnectWithReconnect(ctx, "127.0.0.1", 4002, 1, cfg, func() {
+    // re-subscribe market data here
+})
+```
+
+An automatic reconnect keeps orders, fills and positions, so `*order.Trade`
+objects held by the application stay valid. `SyncOrders` then refreshes open
+orders, fetches executions (missed fills are added to their trades),
+finalises orders that completed while disconnected and refreshes positions.
+After a process restart use `SyncOrders(ctx, SyncOptions{IncludeCompleted: true})`
+and `journal.Reconcile(journal.Replay(records), ib.Trades(), clientID)` to
+compare the journal with what the broker reports.
+
 ## What Works
 
 | Feature | Status |
 |---------|--------|
-| Connect / Disconnect | Verified |
-| Contract Details | Verified |
-| Historical Data (bars) | Verified |
-| Market Data (snapshot) | Verified |
-| Positions | Verified |
-| Account Summary | Verified |
-| Option Chains | Verified |
-| Place / Cancel Order | Implemented |
-| Real-Time Bars | Implemented |
+| Connect / Disconnect / handshake | Verified live |
+| Contract Details, Historical Data, Market Data (snapshot) | Verified live |
+| Positions, Account Summary, Option Chains | Verified live (positions decoder fixed since) |
+| Place / Modify / Cancel order, partial fills, commissions | E2E-tested against fake gateway |
+| Open order sync (`ReqOpenOrders`, `ReqAllOpenOrders`, `ReqExecutions`, `ReqCompletedOrders`, `SyncOrders`) | E2E-tested against fake gateway |
+| Bracket orders, OCA helper, WhatIf | E2E-tested against fake gateway |
+| Reconnect with heartbeat + post-connect sync | E2E-tested against fake gateway |
+| Pre-trade risk manager (`risk`) | Unit + E2E tested |
+| Persistent order journal (`journal`) | Unit + E2E tested |
+| Real-Time Bars | Implemented, not verified |
 
-10 methods live-verified against IB Gateway. 29/82 inbound message types handled. See [STATUS.md](STATUS.md) for full details.
+"E2E-tested against fake gateway" means the real client (protocol, decoders,
+state, events) runs against `internal/fakegw`, an in-process TWS fake that
+speaks the v178 wire protocol (layouts follow ib_async). A live paper-account
+trading test exists (`integration_trading_test.go`) but must be run by you:
+
+```bash
+IB_E2E_TRADING=1 go test -tags=integration -v -run TestIntegrationTrading .
+```
+
+See [STATUS.md](STATUS.md) for full details.
 
 ## Architecture
 
 ```
 ibgo (root)          IB facade - Connect, public API, message dispatch
   contract/          Contract, Stock, Option, Future, etc.
-  order/             Order, Trade, OrderStatus, conditions
+  order/             Order, Trade, OrderStatus, conditions, brackets
   market/            Ticker, BarData, OptionComputation, depth
   account/           AccountValue, Position, PnL, news
   event/             Generic Event[T] pub/sub
+  risk/              Pre-trade risk checks, kill switch, daily loss limit
+  journal/           Append-only JSONL order journal, replay, reconcile
   protocol/          TCP connection, wire encoder/decoder, client
   internal/state/    State manager, request tracking, tick maps
+  internal/fakegw/   Fake TWS for end-to-end tests
 ```
 
-**Concurrency model:** Single reader goroutine processes all inbound messages. Request-response matching via per-request buffered channels. State mutations on the reader goroutine, thread-safe reads via `sync.RWMutex`.
+**Concurrency model:** Single reader goroutine processes all inbound messages
+and runs event callbacks. Request-response matching via per-request buffered
+channels. State maps are guarded by a `sync.RWMutex`; `Trade` has its own lock
+and accessor methods. Order placement is serialised so risk checks cannot be
+raced.
 
 ## Development
 
@@ -107,15 +185,15 @@ make test-cover       # coverage report
 ```
 
 Tests are split by build tag:
-- **Unit tests** (`make test`): use mock servers, run in CI, no Gateway needed
+- **Unit + E2E tests** (`make test`): mock servers and the fake gateway, run in CI, no Gateway needed
 - **Integration tests** (`make test-live`): require a live IB Gateway, tagged `//go:build integration`, skipped in CI
 
 ## Known Limitations
 
-- **Not production-ready for live trading.** Order execution edge cases (partial fills, status transitions, commission timing) need more coverage.
-- **No reconnection / heartbeat.** IB Gateway disconnects are routine; this library does not auto-reconnect.
-- **35% message coverage** (29/82 inbound types). Many advanced features are not yet implemented.
-- **No request throttling** at runtime (constants defined, enforcement not implemented).
+- **Not production-ready for live trading.** The trading paths are tested against a fake gateway, not yet against a live account.
+- **Ticker and bar-list fields are not locked.** They are written on the reader goroutine; read them inside `UpdateEvent`/`PendingTickersEvent` callbacks, or accept racy reads.
+- **Market data subscriptions are not restored** after a reconnect; re-subscribe in the `onConnect` callback.
+- **Partial message coverage.** Many advanced request types (tick-by-tick, scanners, news, PnL subscriptions, ...) are not implemented yet; see STATUS.md.
 
 ## Requirements
 

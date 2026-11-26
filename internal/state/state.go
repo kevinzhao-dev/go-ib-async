@@ -17,7 +17,8 @@ type OrderKey struct {
 }
 
 // Manager holds all connection state, organized by domain.
-// All mutations happen on the reader goroutine; reads use RWMutex.
+// Every map in the Manager is guarded by Mu: the reader goroutine mutates it
+// while user goroutines start requests and read snapshots concurrently.
 type Manager struct {
 	Mu sync.RWMutex
 
@@ -34,7 +35,7 @@ type Manager struct {
 	// News
 	NewsBulletins map[int]*account.NewsBulletin
 
-	// Timing
+	// Timing (guarded by Mu; use SetLastTime/GetLastTime)
 	LastTime  time.Time
 	TimeFloat float64 // time.Time as float (for fast timestamp)
 
@@ -58,13 +59,23 @@ func NewManager() *Manager {
 
 // StartReq begins tracking a request-response cycle.
 func (m *Manager) StartReq(reqID int64, con *contract.Contract) <-chan Result {
+	m.Mu.Lock()
 	if con != nil {
-		m.Mu.Lock()
 		m.ReqID2Contract[reqID] = con
-		m.Mu.Unlock()
 	}
 	m.Results[reqID] = nil
+	m.Mu.Unlock()
 	return m.Requests.Start(reqID)
+}
+
+// CancelReq abandons a pending request (e.g. on context cancellation) and
+// drops any partial results accumulated for it.
+func (m *Manager) CancelReq(reqID int64) {
+	m.Mu.Lock()
+	delete(m.ReqID2Contract, reqID)
+	delete(m.Results, reqID)
+	m.Mu.Unlock()
+	m.Requests.Cancel(reqID)
 }
 
 // EndReq completes a request-response cycle.
@@ -83,15 +94,40 @@ func (m *Manager) EndReq(reqID int64, value interface{}, err error) {
 
 // AppendResult accumulates a partial result for a multi-message response.
 func (m *Manager) AppendResult(reqID int64, item interface{}) {
+	m.Mu.Lock()
+	defer m.Mu.Unlock()
 	existing, ok := m.Results[reqID]
 	if !ok {
 		return
 	}
 	if existing == nil {
 		m.Results[reqID] = []interface{}{item}
-	} else {
-		m.Results[reqID] = append(existing.([]interface{}), item)
+	} else if list, ok := existing.([]interface{}); ok {
+		m.Results[reqID] = append(list, item)
 	}
+}
+
+// HasResult reports whether a request with the given key is collecting results.
+func (m *Manager) HasResult(reqID int64) bool {
+	m.Mu.RLock()
+	defer m.Mu.RUnlock()
+	_, ok := m.Results[reqID]
+	return ok
+}
+
+// SetLastTime records the arrival time of the current network batch.
+func (m *Manager) SetLastTime(t time.Time) {
+	m.Mu.Lock()
+	m.LastTime = t
+	m.TimeFloat = float64(t.UnixMilli()) / 1000.0
+	m.Mu.Unlock()
+}
+
+// GetLastTime returns the arrival time of the current network batch.
+func (m *Manager) GetLastTime() (time.Time, float64) {
+	m.Mu.RLock()
+	defer m.Mu.RUnlock()
+	return m.LastTime, m.TimeFloat
 }
 
 // --- Read-only accessors (thread-safe) ---
@@ -181,10 +217,32 @@ func (m *Manager) GetPendingTickers() []*market.Ticker {
 
 // MarkTickerPending marks a ticker as having pending updates.
 func (m *Manager) MarkTickerPending(t *market.Ticker) {
+	m.Mu.Lock()
 	m.PendingTickers[t] = true
+	m.Mu.Unlock()
 }
 
-// Reset clears all state (called on disconnect).
+// ClearPendingTickers clears pending tickers and their per-batch tick lists.
+func (m *Manager) ClearPendingTickers() {
+	m.Mu.Lock()
+	m.MarketState.ClearPendingTickers()
+	m.Mu.Unlock()
+}
+
+// ResetSession clears per-connection state (market data subscriptions,
+// pending request results) but keeps orders, fills, positions and account
+// values so that Trade objects held by callers survive a reconnect and can be
+// re-synchronised with the broker.
+func (m *Manager) ResetSession() {
+	m.Mu.Lock()
+	defer m.Mu.Unlock()
+
+	m.MarketState.reset()
+	m.Results = make(map[int64]interface{})
+	m.ReqID2Contract = make(map[int64]*contract.Contract)
+}
+
+// Reset clears all state (called on explicit disconnect).
 func (m *Manager) Reset() {
 	m.Mu.Lock()
 	defer m.Mu.Unlock()

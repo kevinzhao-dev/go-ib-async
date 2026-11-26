@@ -78,7 +78,7 @@ var StringTickMap = map[int]string{
 	25: "OptionBidExch", 26: "OptionAskExch",
 	32: "BidExchange", 33: "AskExchange",
 	84: "LastExchange", 85: "LastRegTime",
-	91: "ReutersMutualFunds",
+	91:  "ReutersMutualFunds",
 	100: "SocialMarketAnalytics",
 }
 

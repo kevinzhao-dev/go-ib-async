@@ -6,9 +6,9 @@ import (
 
 // MarketState holds all market data related state.
 type MarketState struct {
-	Tickers        map[int64]*market.Ticker
-	PendingTickers map[*market.Ticker]bool
-	ReqID2Ticker   map[int64]*market.Ticker
+	Tickers          map[int64]*market.Ticker
+	PendingTickers   map[*market.Ticker]bool
+	ReqID2Ticker     map[int64]*market.Ticker
 	ReqID2Subscriber map[int64]interface{}
 }
 

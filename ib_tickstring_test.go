@@ -11,7 +11,7 @@ import (
 
 func setupTickerIB() (*IB, *market.Ticker) {
 	ib := New()
-	ib.client.ServerVersion = 178
+	ib.client.SetServerVersion(178)
 
 	c := contract.Stock("AAPL", "SMART", "USD")
 	c.ConID = 265598

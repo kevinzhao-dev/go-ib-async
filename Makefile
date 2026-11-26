@@ -11,10 +11,10 @@ vet:
 
 # Unit tests only (no IB Gateway required, safe for CI)
 test:
-	go test -tags='!integration' ./...
+	go test ./...
 
 test-race:
-	go test -race -count=1 -tags='!integration' ./...
+	go test -race -count=1 ./...
 
 # Integration tests (requires IB Gateway running)
 # Usage: make test-live IB_PORT=4002
@@ -26,7 +26,7 @@ smoke:
 	go run ./cmd/smoketest
 
 test-cover:
-	go test -cover -tags='!integration' ./...
+	go test -cover ./...
 
 fuzz:
 	go test -fuzz=FuzzDecodeMessage -fuzztime=10s ./protocol/
