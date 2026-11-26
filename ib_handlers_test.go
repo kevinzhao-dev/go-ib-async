@@ -14,7 +14,7 @@ import (
 
 func TestPlaceOrderNewOrderInit(t *testing.T) {
 	ib := New()
-	ib.client.ServerVersion = 178
+	ib.client.SetServerVersion(178)
 	// Fake connection state so Send doesn't fail - use a pipe
 	ib.client.ConnState = protocol.Connected
 
@@ -104,7 +104,7 @@ func TestOrderStatusManualOrderLookup(t *testing.T) {
 
 func TestExecDetailsFillLinkedToTrade(t *testing.T) {
 	ib := New()
-	ib.client.ServerVersion = 178
+	ib.client.SetServerVersion(178)
 
 	// Create a trade
 	con := contract.Stock("AAPL", "SMART", "USD")
@@ -136,7 +136,7 @@ func TestExecDetailsFillLinkedToTrade(t *testing.T) {
 	//         execId, time, acctNumber, exchange, side, shares, price, permId, clientId,
 	//         liquidation, cumQty, avgPrice, orderRef, evRule, evMultiplier, modelCode, lastLiquidity
 	fields := []string{
-		"11", "1", "-1",
+		"11", "-1",
 		"42",
 		"265598", "AAPL", "STK", "", "0", "", "", "SMART", "USD", "", "",
 		"exec001", "20260409 10:00:00", "DU123", "SMART", "BOT",
@@ -182,7 +182,7 @@ func TestExecDetailsFillLinkedToTrade(t *testing.T) {
 
 func TestExecDetailsDuplicateFillIgnored(t *testing.T) {
 	ib := New()
-	ib.client.ServerVersion = 178
+	ib.client.SetServerVersion(178)
 
 	con := contract.Stock("AAPL", "SMART", "USD")
 	ord := order.NewOrder()
@@ -198,7 +198,7 @@ func TestExecDetailsDuplicateFillIgnored(t *testing.T) {
 	ib.state.PermID2Trade[999] = trade
 
 	fields := []string{
-		"11", "1", "-1", "42",
+		"11", "-1", "42",
 		"265598", "AAPL", "STK", "", "0", "", "", "SMART", "USD", "", "",
 		"exec001", "20260409 10:00:00", "DU123", "SMART", "BOT",
 		"50", "150.50", "999", "1", "0", "50", "150.50",

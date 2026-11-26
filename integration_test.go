@@ -3,12 +3,14 @@
 // Integration tests require a live IB Gateway / TWS connection.
 //
 // Run with:
-//   go test -tags=integration -v -run TestIntegration .
+//
+//	go test -tags=integration -v -run TestIntegration .
 //
 // Environment variables:
-//   IB_HOST       (default: 127.0.0.1)
-//   IB_PORT       (default: 4002)
-//   IB_CLIENT_ID  (default: 99)
+//
+//	IB_HOST       (default: 127.0.0.1)
+//	IB_PORT       (default: 4002)
+//	IB_CLIENT_ID  (default: 99)
 package ibgo
 
 import (

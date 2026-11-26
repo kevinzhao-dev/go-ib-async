@@ -18,7 +18,7 @@ import (
 
 func TestPartialFillAccumulation(t *testing.T) {
 	ib := New()
-	ib.client.ServerVersion = 178
+	ib.client.SetServerVersion(178)
 
 	con := contract.Stock("AAPL", "SMART", "USD")
 	con.ConID = 265598
@@ -73,7 +73,7 @@ func TestPartialFillAccumulation(t *testing.T) {
 func sendExecDetails(t *testing.T, ib *IB, execID string, shares, price float64, permID, clientID, orderID int64) {
 	t.Helper()
 	fields := []string{
-		"11", "1", "-1",
+		"11", "-1",
 		itoa(orderID),
 		"265598", "AAPL", "STK", "", "0", "", "", "SMART", "USD", "", "",
 		execID, "20260409 10:00:00", "DU123", "SMART", "BOT",

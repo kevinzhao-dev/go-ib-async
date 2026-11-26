@@ -3,8 +3,8 @@ package ibgo
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"net"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -167,7 +167,7 @@ func TestIBPositionEvent(t *testing.T) {
 		conn.Read(buf)
 
 		// Send position (msgId=61)
-		sendMsg(conn, "61\x001\x00DU123456\x00265598\x00AAPL\x00STK\x00\x000\x00\x00\x00SMART\x00USD\x00100\x00150.5\x00")
+		sendMsg(conn, "61\x001\x00DU123456\x00265598\x00AAPL\x00STK\x00\x000\x00\x00\x00SMART\x00USD\x00AAPL\x00NMS\x00100\x00150.5\x00")
 		// Send positionEnd (msgId=62)
 		sendMsg(conn, "62\x001\x00")
 		time.Sleep(100 * time.Millisecond)
@@ -219,37 +219,45 @@ func TestSyntheticReqIDUnique(t *testing.T) {
 	}
 }
 
-// TestConcurrentReqPositionsSerialized verifies that overlapping ReqPositions calls
-// are serialized by positionsMu and each gets a unique synthetic key.
+// TestConcurrentReqPositionsSerialized verifies that overlapping id-less
+// requests are serialized: the second waits until the first releases the slot,
+// and each gets a unique synthetic key.
 func TestConcurrentReqPositionsSerialized(t *testing.T) {
 	ib := New()
+	sr := ib.positionsReq
 
-	// Verify the mutex serializes access and keys are unique
-	var wg sync.WaitGroup
-	keys := make([]int64, 10)
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			ib.positionsMu.Lock()
-			key := ib.syntheticReqID.Add(-1)
-			ib.positionsReqID = key
-			keys[idx] = key
-			ib.positionsMu.Unlock()
-		}(i)
+	// Occupy the slot as an in-flight request would.
+	sr.sem <- struct{}{}
+	sr.key.Store(-42)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, err := ib.runSingle(ctx, sr, func() error {
+		t.Fatal("second request must not be sent while the first is in flight")
+		return nil
+	})
+	if err != context.DeadlineExceeded {
+		t.Fatalf("second request err = %v, want deadline exceeded", err)
 	}
-	wg.Wait()
+	if sr.active() != -42 {
+		t.Fatalf("active key changed to %d while slot was held", sr.active())
+	}
 
-	// All keys should be unique and negative
-	seen := make(map[int64]bool)
-	for _, k := range keys {
-		if k >= 0 {
-			t.Fatalf("key should be negative, got %d", k)
-		}
-		if seen[k] {
-			t.Fatalf("duplicate key: %d", k)
-		}
-		seen[k] = true
+	// Release; the next request gets a fresh negative key.
+	sr.key.Store(0)
+	<-sr.sem
+	var sentKey int64
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel2()
+	_, _ = ib.runSingle(ctx2, sr, func() error {
+		sentKey = sr.active()
+		return errors.New("not connected")
+	})
+	if sentKey >= 0 {
+		t.Fatalf("synthetic key should be negative, got %d", sentKey)
+	}
+	if sr.active() != 0 {
+		t.Fatalf("slot key not cleared after request, got %d", sr.active())
 	}
 }
 
@@ -262,8 +270,8 @@ func TestBatchSemanticsMultipleMessages(t *testing.T) {
 	srv := newMockTWSServer(t, func(conn net.Conn) {
 		// Send multiple messages in rapid succession (same TCP write)
 		// This should be treated as one batch
-		msg1 := buildFrame("61\x001\x00DU123456\x00265598\x00AAPL\x00STK\x00\x000\x00\x00\x00SMART\x00USD\x00100\x00150.5\x00")
-		msg2 := buildFrame("61\x001\x00DU123456\x00265599\x00MSFT\x00STK\x00\x000\x00\x00\x00SMART\x00USD\x0050\x00300.0\x00")
+		msg1 := buildFrame("61\x001\x00DU123456\x00265598\x00AAPL\x00STK\x00\x000\x00\x00\x00SMART\x00USD\x00AAPL\x00NMS\x00100\x00150.5\x00")
+		msg2 := buildFrame("61\x001\x00DU123456\x00265599\x00MSFT\x00STK\x00\x000\x00\x00\x00SMART\x00USD\x00MSFT\x00NMS\x0050\x00300.0\x00")
 		// Write both messages in a single TCP write so they land in the same buffer
 		combined := append(msg1, msg2...)
 		conn.Write(combined)
@@ -342,7 +350,7 @@ func TestHeartbeatTimeoutDisconnects(t *testing.T) {
 	go ib.heartbeatLoop(ctx, ReconnectConfig{
 		ProbeInterval: 100 * time.Millisecond,
 		ProbeTimeout:  200 * time.Millisecond,
-	}, heartbeatDone)
+	}, ib.client.Done(), heartbeatDone)
 
 	// Heartbeat should detect unresponsive peer and disconnect
 	select {

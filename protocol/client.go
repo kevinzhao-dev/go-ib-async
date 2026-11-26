@@ -3,6 +3,7 @@ package protocol
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -24,22 +25,29 @@ const (
 	Connected
 )
 
+// ErrAlreadyConnected is returned by Connect when the client is already
+// connected or a connection attempt is in progress.
+var ErrAlreadyConnected = errors.New("ibgo: already connected")
+
 // Client manages the IB TWS connection, handshake, message sending and reading.
 type Client struct {
-	Conn          *Connection
-	Decoder       *Decoder
-	Host          string
-	Port          int
-	ClientID      int
-	ServerVersion int
-	ConnState     ClientState
-	OptCapab      string
+	Conn     *Connection
+	Decoder  *Decoder
+	Host     string
+	Port     int
+	ClientID int
+	OptCapab string
 
-	reqIDSeq  atomic.Int64
-	accounts  []string
-	hasReqID  bool
-	apiReady  bool
-	startTime time.Time
+	// ConnState is the connection state. Read it via State/IsConnected;
+	// it is written under mu.
+	ConnState ClientState
+
+	serverVersion atomic.Int64
+	reqIDSeq      atomic.Int64
+	accounts      []string
+	hasReqID      bool
+	apiReady      bool
+	startTime     time.Time
 
 	// handler receives decoded messages
 	handler Handler
@@ -47,8 +55,8 @@ type Client struct {
 	// Rate limiter
 	throttle *throttle.Limiter
 
-	done chan struct{}
-	doneMu sync.Mutex // protects closing done channel
+	done   chan struct{}
+	doneMu sync.Mutex // protects done (replaced on every Connect) and closing it
 	mu     sync.Mutex
 	readWg sync.WaitGroup
 
@@ -77,25 +85,61 @@ func NewClient() *Client {
 	return c
 }
 
+// ServerVersion returns the negotiated server version (0 before handshake).
+func (c *Client) ServerVersion() int {
+	return int(c.serverVersion.Load())
+}
+
+// SetServerVersion overrides the negotiated server version.
+// Intended for tests and decoders that run without a live connection.
+func (c *Client) SetServerVersion(v int) {
+	c.serverVersion.Store(int64(v))
+}
+
+// CurrentClientID returns the client id of the current/last connection.
+func (c *Client) CurrentClientID() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ClientID
+}
+
+// State returns the current connection state.
+func (c *Client) State() ClientState {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ConnState
+}
+
 // Connect establishes a connection to TWS/Gateway and performs the handshake.
 func (c *Client) Connect(ctx context.Context, host string, port, clientID int) error {
+	c.mu.Lock()
+	if c.ConnState != Disconnected {
+		c.mu.Unlock()
+		return ErrAlreadyConnected
+	}
+	c.ConnState = Connecting
 	c.Host = host
 	c.Port = port
 	c.ClientID = clientID
-	c.ConnState = Connecting
-	c.ServerVersion = 0
 	c.hasReqID = false
 	c.apiReady = false
 	c.accounts = nil
 	c.startTime = time.Now()
+	c.mu.Unlock()
+	c.serverVersion.Store(0)
 
 	// Wait for any previous readLoop to finish
 	c.readWg.Wait()
+	c.doneMu.Lock()
 	c.done = make(chan struct{})
-	// done channel is fresh, no need to reset mutex
+	done := c.done
+	c.doneMu.Unlock()
 
-	if err := c.Conn.Connect(host, port); err != nil {
+	if err := c.Conn.Connect(ctx, host, port); err != nil {
+		c.mu.Lock()
 		c.ConnState = Disconnected
+		c.mu.Unlock()
+		c.closeDone()
 		return fmt.Errorf("connect to %s:%d: %w", host, port, err)
 	}
 
@@ -131,7 +175,8 @@ func (c *Client) Connect(ctx context.Context, host string, port, clientID int) e
 	select {
 	case <-readyCh:
 		return nil
-	case <-c.done:
+	case <-done:
+		c.Disconnect()
 		return fmt.Errorf("connection closed during handshake")
 	case <-ctx.Done():
 		c.Disconnect()
@@ -149,6 +194,11 @@ func (c *Client) Disconnect() {
 	c.Conn.Disconnect()
 
 	c.closeDone()
+}
+
+// Wait blocks until the reader goroutine of the current connection has exited.
+func (c *Client) Wait() {
+	c.readWg.Wait()
 }
 
 func (c *Client) closeDone() {
@@ -203,13 +253,20 @@ func (c *Client) Accounts() []string {
 	return result
 }
 
-// Done returns a channel that's closed when the connection ends.
+// Done returns a channel that's closed when the current connection ends.
+// A new channel is created on every Connect, so callers should fetch it
+// once per wait rather than caching it across reconnects.
 func (c *Client) Done() <-chan struct{} {
+	c.doneMu.Lock()
+	defer c.doneMu.Unlock()
 	return c.done
 }
 
 // Send serializes and sends a message with mixed field types.
 func (c *Client) Send(fields ...interface{}) error {
+	if !c.Conn.IsConnected() {
+		return fmt.Errorf("ibgo: not connected")
+	}
 	c.throttle.Wait()
 	msg := BuildMessage(fields...)
 	return c.Conn.SendMessage(msg)
@@ -218,10 +275,18 @@ func (c *Client) Send(fields ...interface{}) error {
 // readLoop is the main reader goroutine.
 func (c *Client) readLoop() {
 	defer c.readWg.Done()
+	var exitErr error
 	defer func() {
+		// The peer may have closed the socket: make sure the client state
+		// reflects reality before anybody is notified.
+		c.mu.Lock()
+		c.ConnState = Disconnected
+		c.apiReady = false
+		c.mu.Unlock()
+		c.Conn.Disconnect()
 		c.closeDone()
 		if c.OnDisconnect != nil {
-			c.OnDisconnect(nil)
+			c.OnDisconnect(exitErr)
 		}
 	}()
 
@@ -234,28 +299,34 @@ func (c *Client) readLoop() {
 			c.mu.Unlock()
 			if !isDisconnected {
 				log.Printf("ibgo: read error: %v", err)
+				exitErr = err
 			}
 			return
 		}
 
 		// Handshake: first message is [version, connTime]
-		if c.ServerVersion == 0 && len(fields) == 2 {
+		if c.ServerVersion() == 0 && len(fields) == 2 {
 			version, err := strconv.Atoi(fields[0])
 			if err != nil {
 				log.Printf("ibgo: invalid server version: %s", fields[0])
+				exitErr = fmt.Errorf("invalid server version %q", fields[0])
 				return
 			}
 			if version < MinClientVersion {
 				log.Printf("ibgo: server version %d < minimum %d", version, MinClientVersion)
+				exitErr = fmt.Errorf("server version %d < minimum %d", version, MinClientVersion)
 				return
 			}
-			c.ServerVersion = version
+			c.serverVersion.Store(int64(version))
 			c.mu.Lock()
 			c.ConnState = Connected
 			c.mu.Unlock()
 
 			// Send startApi
-			c.Send(MsgStartApi, 2, c.ClientID, c.OptCapab)
+			if err := c.Send(MsgStartApi, 2, c.ClientID, c.OptCapab); err != nil {
+				exitErr = err
+				return
+			}
 			continue
 		}
 
@@ -265,24 +336,22 @@ func (c *Client) readLoop() {
 		c.mu.Unlock()
 		if !ready && len(fields) >= 3 {
 			msgID, _ := strconv.Atoi(fields[0])
+			c.mu.Lock()
 			if msgID == InMsgNextValidID {
 				validID, _ := strconv.ParseInt(fields[2], 10, 64)
 				c.UpdateReqID(validID)
 				c.hasReqID = true
 			} else if msgID == InMsgManagedAccounts {
-				accts := fields[2]
-				c.mu.Lock()
-				c.accounts = splitAccounts(accts)
-				c.mu.Unlock()
+				c.accounts = splitAccounts(fields[2])
 			}
-
-			if c.hasReqID && len(c.Accounts()) > 0 {
-				c.mu.Lock()
+			becameReady := c.hasReqID && len(c.accounts) > 0
+			if becameReady {
 				c.apiReady = true
-				c.mu.Unlock()
-				if c.OnReady != nil {
-					c.OnReady()
-				}
+			}
+			onReady := c.OnReady
+			c.mu.Unlock()
+			if becameReady && onReady != nil {
+				onReady()
 			}
 		}
 
@@ -369,7 +438,7 @@ func (c *Client) ReqContractDetails(reqID int64, con *contract.Contract) error {
 		MsgReqContractDetails, 8, reqID, con,
 		con.IncludeExpired, con.SecIDType, con.SecID,
 	}
-	if c.ServerVersion >= 176 {
+	if c.ServerVersion() >= 176 {
 		fields = append(fields, con.IssuerID)
 	}
 	return c.Send(fields...)
@@ -436,7 +505,7 @@ func (c *Client) CancelAccountSummary(reqID int64) error {
 
 func (c *Client) CancelOrder(orderID int64, manualCancelOrderTime string) error {
 	fields := []interface{}{MsgCancelOrder, 1, orderID}
-	if c.ServerVersion >= 169 {
+	if c.ServerVersion() >= 169 {
 		fields = append(fields, manualCancelOrderTime)
 	}
 	return c.Send(fields...)

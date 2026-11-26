@@ -66,15 +66,21 @@ func (e *Event[T]) Chan(bufSize int) (<-chan T, uint64) {
 func (e *Event[T]) Once() <-chan T {
 	ch := make(chan T, 1)
 	var once sync.Once
-	var subID uint64
-	subID = e.Subscribe(func(val T) {
+	// Allocate the id and register under the lock, so an Emit on another
+	// goroutine can never observe the callback before its id is known.
+	e.mu.Lock()
+	e.nextID++
+	id := e.nextID
+	e.callbacks = append(e.callbacks, callbackEntry[T]{id: id, fn: func(val T) {
 		once.Do(func() {
 			ch <- val
 			close(ch)
-			// Unsubscribe in a goroutine to avoid deadlock (Emit holds RLock).
-			go e.Unsubscribe(subID)
+			// Safe to call synchronously: Emit does not hold the lock
+			// while invoking callbacks.
+			e.Unsubscribe(id)
 		})
-	})
+	}})
+	e.mu.Unlock()
 	return ch
 }
 

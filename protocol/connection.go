@@ -3,6 +3,7 @@ package protocol
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Connection manages a TCP connection to TWS/Gateway with IB message framing.
@@ -23,18 +25,39 @@ type Connection struct {
 	NumMsgSent   atomic.Int64
 	NumBytesRecv atomic.Int64
 	NumMsgRecv   atomic.Int64
+
+	// lastRecvNano is the wall-clock time (UnixNano) of the last received message.
+	lastRecvNano atomic.Int64
 }
 
 // Connect establishes a TCP connection to host:port.
-func (c *Connection) Connect(host string, port int) error {
+// The dial honours ctx cancellation/deadline so an unreachable host cannot
+// block the caller for the OS-level TCP timeout.
+func (c *Connection) Connect(ctx context.Context, host string, port int) error {
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
-	conn, err := net.Dial("tcp", addr)
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.conn != nil {
+		conn.Close()
+		return fmt.Errorf("already connected")
 	}
 	c.conn = conn
 	c.reader = bufio.NewReaderSize(conn, 64*1024)
 	return nil
+}
+
+// LastRecv returns the time the last message was received (zero if none).
+func (c *Connection) LastRecv() time.Time {
+	n := c.lastRecvNano.Load()
+	if n == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, n)
 }
 
 // Disconnect closes the TCP connection.
@@ -87,17 +110,15 @@ func (c *Connection) SendMessage(payload []byte) error {
 	if c.conn == nil {
 		return fmt.Errorf("not connected")
 	}
-	header := make([]byte, 4)
-	binary.BigEndian.PutUint32(header, uint32(len(payload)))
-	_, err := c.conn.Write(header)
-	if err != nil {
+	// Single write of header+payload so a partial failure can never leave a
+	// dangling length prefix on the wire.
+	frame := make([]byte, 4+len(payload))
+	binary.BigEndian.PutUint32(frame, uint32(len(payload)))
+	copy(frame[4:], payload)
+	if _, err := c.conn.Write(frame); err != nil {
 		return err
 	}
-	_, err = c.conn.Write(payload)
-	if err != nil {
-		return err
-	}
-	c.NumBytesSent.Add(int64(4 + len(payload)))
+	c.NumBytesSent.Add(int64(len(frame)))
 	c.NumMsgSent.Add(1)
 	return nil
 }
@@ -133,6 +154,7 @@ func (c *Connection) ReadMessage() ([]string, error) {
 
 	c.NumBytesRecv.Add(int64(4 + msgLen))
 	c.NumMsgRecv.Add(1)
+	c.lastRecvNano.Store(time.Now().UnixNano())
 
 	// Split on null bytes, remove trailing empty element
 	msg := string(body)

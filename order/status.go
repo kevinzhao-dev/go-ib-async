@@ -4,17 +4,17 @@ import "math"
 
 // OrderStatus tracks the current state of an order.
 type OrderStatus struct {
-	OrderID      int64
-	Status       string
-	Filled       float64
-	Remaining    float64
-	AvgFillPrice float64
-	PermID       int64
-	ParentID     int64
+	OrderID       int64
+	Status        string
+	Filled        float64
+	Remaining     float64
+	AvgFillPrice  float64
+	PermID        int64
+	ParentID      int64
 	LastFillPrice float64
-	ClientID     int64
-	WhyHeld      string
-	MktCapPrice  float64
+	ClientID      int64
+	WhyHeld       string
+	MktCapPrice   float64
 }
 
 // Total returns the total order size (filled + remaining).
@@ -24,16 +24,16 @@ func (s *OrderStatus) Total() float64 {
 
 // Status string constants.
 const (
-	StatusPendingSubmit  = "PendingSubmit"
-	StatusPendingCancel  = "PendingCancel"
-	StatusPreSubmitted   = "PreSubmitted"
-	StatusSubmitted      = "Submitted"
-	StatusApiPending     = "ApiPending"
-	StatusApiCancelled   = "ApiCancelled"
-	StatusApiUpdate      = "ApiUpdate"
-	StatusCancelled      = "Cancelled"
-	StatusFilled         = "Filled"
-	StatusInactive       = "Inactive"
+	StatusPendingSubmit   = "PendingSubmit"
+	StatusPendingCancel   = "PendingCancel"
+	StatusPreSubmitted    = "PreSubmitted"
+	StatusSubmitted       = "Submitted"
+	StatusApiPending      = "ApiPending"
+	StatusApiCancelled    = "ApiCancelled"
+	StatusApiUpdate       = "ApiUpdate"
+	StatusCancelled       = "Cancelled"
+	StatusFilled          = "Filled"
+	StatusInactive        = "Inactive"
 	StatusValidationError = "ValidationError"
 )
 
@@ -47,12 +47,12 @@ var DoneStates = map[string]bool{
 
 // ActiveStates are states where the order could execute.
 var ActiveStates = map[string]bool{
-	StatusPendingSubmit:  true,
-	StatusApiPending:     true,
-	StatusPreSubmitted:   true,
-	StatusSubmitted:      true,
+	StatusPendingSubmit:   true,
+	StatusApiPending:      true,
+	StatusPreSubmitted:    true,
+	StatusSubmitted:       true,
 	StatusValidationError: true,
-	StatusApiUpdate:      true,
+	StatusApiUpdate:       true,
 }
 
 // WaitingStates are states before the order is live.
@@ -64,9 +64,9 @@ var WaitingStates = map[string]bool{
 
 // WorkingStates are states where the order is live at the exchange.
 var WorkingStates = map[string]bool{
-	StatusSubmitted:      true,
+	StatusSubmitted:       true,
 	StatusValidationError: true,
-	StatusApiUpdate:      true,
+	StatusApiUpdate:       true,
 }
 
 // OrderState holds what-if and pre-trade margin impact information.
