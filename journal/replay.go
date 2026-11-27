@@ -90,6 +90,11 @@ func (e *OrderEntry) IsDone() bool {
 func Replay(records []Record) map[Key]*OrderEntry {
 	entries := make(map[Key]*OrderEntry)
 	byPerm := make(map[int64]Key)
+	type commissionKey struct {
+		order Key
+		exec  string
+	}
+	commissions := make(map[commissionKey]*CommissionSnapshot)
 
 	get := func(r Record) *OrderEntry {
 		k := r.KeyOf()
@@ -152,9 +157,20 @@ func Replay(records []Record) map[Key]*OrderEntry {
 				}
 			}
 		case TypeCommission:
-			if r.Commission != nil {
-				e.Commission += r.Commission.Commission
-				e.RealizedPNL += r.Commission.RealizedPNL
+			if cr := r.Commission; cr != nil {
+				fee, pnl := cr.Commission, cr.RealizedPNL
+				if cr.ExecID != "" {
+					// reqExecutions can replay a report. Book only the
+					// change from the previous report for this execution.
+					k := commissionKey{e.Key, cr.ExecID}
+					if prev := commissions[k]; prev != nil {
+						fee -= prev.Commission
+						pnl -= prev.RealizedPNL
+					}
+					commissions[k] = cr
+				}
+				e.Commission += fee
+				e.RealizedPNL += pnl
 			}
 		case TypeError:
 			e.LastErrorCode = r.ErrorCode

@@ -76,6 +76,28 @@ Field layouts were checked against ib_async's `decoder.py` (server version
 157–178) and, for every message marked live above, against captured Gateway
 traffic.
 
+## Trading scenarios tested on November 27, 2026
+
+The Go client ran against the local v178 gateway simulator. The regression
+tests compare the client view, broker orders and messages, and journal replay.
+IBKR scopes individual cancellations to the API client and sends a full set of
+positions on the initial subscription. [IBKR order cancellation](https://www.interactivebrokers.com/docs/tws-api/doc/orders/cancel-order) · [IBKR positions](https://www.interactivebrokers.com/docs/tws-api/doc/accounts/positions)
+
+| Scenario | Observed before the fix | Behavior covered by regression tests |
+|---|---|---|
+| Two clients share order ID 1000 | Modifying or cancelling a trade returned by `ReqAllOpenOrders` for the other client changed the current client's order | `ErrOrderIdentity` is returned before transmission. A valid local order with the default client ID can still be modified or cancelled. The tests include a peer using client ID 0. |
+| Explicit IDs and delayed acknowledgements | A new order overwrote a staged order with ID 1001. A bracket with an explicit parent assigned 1001 to a child as well. An unsolicited status for order 5000 still allowed automatic ID 1000. | Placing an order reserves its ID locally. A broker status advances the allocator even for an unknown order. Conflicting bracket IDs fail before any leg is sent. |
+| Three-leg bracket with room for two | A bracket rejected at the rate limit used up the duplicate window for its unsent parent. | The built-in risk manager counts all three open-order slots and rolls back the group's rate and duplicate entries on a risk rejection. Custom checkers still receive each leg. |
+| Missing broker state or unknown share count | An absent state source satisfied position and open-order limits. Cash-sized orders with zero specified shares passed quantity limits and could qualify as reducing during a halt. | The applicable limits reject an order whose exposure cannot be established. Cash-sized orders remain supported when these share limits are disabled. |
+| Partial fills, cancellation and two execution syncs | Two fills incurred 2 in commission and 9.5 in net realized P&L. Journal replay returned 6 and 28.5. | Replay counts each identified execution's latest commission report. A fill snapshot taken in the execution callback also retains the fee information available at that instant. |
+| Two accounts hold the same contract across a disconnect | A position closed offline remained in `Positions()` and the order sync report | An interrupted download preserves cached positions. A complete download removes the omitted account's position and emits a zero-quantity position event. |
+
+The suite also checks a fill that wins a race with cancellation, 12 concurrent
+half-share orders competing for a 1.5-share limit, and a late snapshot tick
+arriving after cancellation while its contract still has a streaming ticker.
+See [trading scenarios](trading_scenarios_test.go), [risk cases](risk/risk_edge_test.go),
+and [journal replay cases](journal/journal_edge_test.go).
+
 ## Fixed after the second review (November 2026)
 
 1. `cmd/ibguard` passed reqOpenOrders, which binds manual TWS orders for client id 0 (TWS may cancel and resubmit them). It is now blocked for client 0 and before startApi, and only allowlisted message ids pass. `SyncOrders` uses reqAllOpenOrders for client 0.
@@ -142,12 +164,19 @@ Other:
 2. A streaming subscription rejected by TWS (e.g. missing permissions) stays registered (and is re-sent after a reconnect) until cancelled.
    The depth book of a re-requested stream is emptied when its first update arrives, so it shows the old rows until then.
 3. With real-time subscriptions, option quotes and stock tick-by-tick / 5-second bars have only been checked outside US market hours (permissions confirmed, no data yet); futures were verified streaming.
-4. See "Not Implemented" above.
+4. The risk manager's `StateSource` exposes cached positions and open trades without a freshness or initial-sync flag. An empty cache can mean the initial download is still pending. Applications relying on these limits need a successful broker sync before submitting orders.
+5. See "Not Implemented" above.
 
 ## Test Coverage
 
 Total library coverage (all packages except `cmd/` and `internal/fakegw`,
 measured across packages by `scripts/coverage.sh`): **95.1%**. CI fails below 90%.
+
+On Go 1.26.3 (darwin/arm64), the full suite passed five repetitions under the
+race detector with shuffled test order. The 29 added scenarios across 16 test
+functions also passed 25 repetitions. All six protocol fuzz targets passed
+10 seconds each. The integration-tagged suite was compiled. The paper-account
+trading test remains pending.
 
 | Package | Coverage |
 |---------|----------|
@@ -158,11 +187,11 @@ measured across packages by `scripts/coverage.sh`): **95.1%**. CI fails below 90
 | internal/throttle | 100% |
 | market | 100% |
 | order | 100% |
-| risk | 98.1% |
-| protocol | 96.5% |
-| journal | 95.2% |
+| risk | 97.9% |
+| protocol | 97.5% |
+| journal | 96.1% |
 | mcpserver | 96.8% |
-| ibgo (root) | 92.0% |
+| ibgo (root) | 92.5% |
 | internal/fakegw (test infrastructure) | 73.2% own tests; exercised further by the E2E tests |
 | cmd/ibguard | blocking of every order message type, fail-closed handling of unknown or binary message ids and the API version cap are tested |
 

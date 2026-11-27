@@ -146,6 +146,7 @@ func New() *IB {
 	}
 	ib.client.OnMessage = ib.handleMessage
 	ib.client.OnDisconnect = func(err error) {
+		ib.state.MarkPositionsUnconfirmed()
 		ib.state.Requests.DrainAll(ErrDisconnected)
 		ib.DisconnectedEvent.Emit(struct{}{})
 	}
@@ -717,21 +718,14 @@ func (ib *IB) handlePosition(r *protocol.FieldReader) {
 		AvgCost:  avgCost,
 	}
 
-	ib.state.Mu.Lock()
-	if _, ok := ib.state.Positions[acct]; !ok {
-		ib.state.Positions[acct] = make(map[int64]*account.Position)
-	}
-	if pos == 0 {
-		delete(ib.state.Positions[acct], c.ConID)
-	} else {
-		ib.state.Positions[acct][c.ConID] = p
-	}
-	ib.state.Mu.Unlock()
-
+	ib.state.UpdatePosition(p)
 	ib.PositionEvent.Emit(p)
 }
 
 func (ib *IB) handlePositionEnd(r *protocol.FieldReader) {
+	for _, p := range ib.state.FinishPositions() {
+		ib.PositionEvent.Emit(&p)
+	}
 	if key := ib.positionsReq.active(); key != 0 {
 		ib.state.EndReq(key, nil, nil)
 	}
@@ -784,6 +778,8 @@ func (ib *IB) handleAccountSummaryEnd(r *protocol.FieldReader) {
 
 func (ib *IB) handleOrderStatus(r *protocol.FieldReader) {
 	orderID := r.ReadInt()
+	// A master client can receive another client's status before openOrder.
+	ib.client.UpdateReqID(orderID + 1)
 	status := r.ReadString()
 	filled := r.ReadFloat()
 	remaining := r.ReadFloat()
@@ -1470,7 +1466,8 @@ func (ib *IB) ReqHistoricalData(ctx context.Context, con *contract.Contract, end
 
 // PlaceOrder submits a new order, or modifies a live one when ord.OrderID
 // belongs to an existing trade of this client. It returns the Trade that
-// tracks the order lifecycle.
+// tracks the order lifecycle. An order identifying another client's trade
+// returns ErrOrderIdentity before transmission.
 //
 // Before anything is sent, the installed risk manager (SetRiskManager) must
 // accept the order and the installed journal (SetJournal) must durably record
@@ -1487,25 +1484,77 @@ func (ib *IB) PlaceOrder(con *contract.Contract, ord *order.Order) (*order.Trade
 	return ib.placeOrderLocked(con, ord, true)
 }
 
+// tradeForWrite checks the identity before sending a message that addresses
+// an order by local orderId alone. ClientID zero is both a real TWS client
+// and the default on an order constructed by the caller.
+func (ib *IB) tradeForWrite(clientID int64, ord *order.Order) (*order.Trade, error) {
+	if ord.ClientID != 0 && ord.ClientID != clientID {
+		return nil, fmt.Errorf("%w: order %d belongs to client %d", ErrOrderIdentity, ord.OrderID, ord.ClientID)
+	}
+	if ord.OrderID == 0 {
+		if ord.PermID != 0 {
+			return nil, ErrOrderIdentity // a broker order without a bound API order ID
+		}
+		return nil, nil
+	}
+	ib.state.Mu.RLock()
+	defer ib.state.Mu.RUnlock()
+	key := state.OrderKey{ClientID: clientID, OrderID: ord.OrderID}
+	if ord.OrderID < 0 {
+		key = orderKeyFromIDs(clientID, ord.OrderID, ord.PermID)
+	}
+	trade := ib.state.Trades[key]
+	if trade != nil && trade.Order == ord && trade.Order.ClientID == clientID {
+		return trade, nil
+	}
+	if ord.ClientID != clientID {
+		if zero := ib.state.Trades[state.OrderKey{OrderID: ord.OrderID}]; zero != nil && zero.Order == ord {
+			return nil, ErrOrderIdentity
+		}
+	}
+	if permID := ord.PermID; permID != 0 {
+		if known := ib.state.PermID2Trade[permID]; known != nil {
+			if known.Order.ClientID != clientID || known.Order.OrderID != ord.OrderID || (trade != nil && trade != known) {
+				return nil, ErrOrderIdentity
+			}
+			return known, nil
+		}
+		var localPermID int64
+		if trade != nil {
+			localPermID = trade.PermID()
+		}
+		if localPermID != permID && (localPermID != 0 || ord.ClientID != clientID) {
+			return nil, ErrOrderIdentity
+		}
+	}
+	return trade, nil
+}
+
+// assignOrderID reserves a caller-supplied ID before any acknowledgement.
+func (ib *IB) assignOrderID(ord *order.Order) {
+	if ord.OrderID == 0 {
+		ord.OrderID = ib.client.GetReqID()
+	} else {
+		ib.client.UpdateReqID(ord.OrderID + 1)
+	}
+}
+
 // placeOrderLocked implements PlaceOrder; placeMu must be held.
 func (ib *IB) placeOrderLocked(con *contract.Contract, ord *order.Order, runRisk bool) (*order.Trade, error) {
 	if !ib.client.IsConnected() {
 		return nil, ErrNotConnected
 	}
 	clientID := ib.ClientID()
-	if ord.OrderID == 0 {
-		ord.OrderID = ib.client.GetReqID()
+	existing, err := ib.tradeForWrite(clientID, ord)
+	if err != nil {
+		return nil, err
 	}
-	key := orderKeyFromIDs(clientID, ord.OrderID, ord.PermID)
-
-	ib.state.Mu.RLock()
-	existing := ib.state.Trades[key]
-	ib.state.Mu.RUnlock()
 	isModify := existing != nil
 	if isModify && existing.IsDone() {
 		return existing, ErrOrderDone
 	}
-	if !isModify {
+	ib.assignOrderID(ord)
+	if ord.ClientID != clientID {
 		ord.ClientID = clientID
 	}
 
@@ -1537,6 +1586,7 @@ func (ib *IB) placeOrderLocked(con *contract.Contract, ord *order.Order, runRisk
 		// recognised as "Modified" even if it arrives immediately.
 		trade.AppendLog(order.TradeLogEntry{Time: now, Status: trade.Status(), Message: "Modify"})
 	} else {
+		key := orderKeyFromOrder(ord)
 		trade = &order.Trade{
 			Contract: con,
 			Order:    ord,
@@ -1558,7 +1608,7 @@ func (ib *IB) placeOrderLocked(con *contract.Contract, ord *order.Order, runRisk
 			trade.AppendLog(order.TradeLogEntry{Time: time.Now(), Status: trade.Status(), Message: "Modify failed: " + err.Error()})
 		} else {
 			ib.state.Mu.Lock()
-			delete(ib.state.Trades, key)
+			delete(ib.state.Trades, orderKeyFromOrder(ord))
 			ib.state.Mu.Unlock()
 		}
 		ib.journalError(trade, 0, "send failed: "+err.Error())
@@ -1763,20 +1813,15 @@ func encodeCondition(cond order.OrderCondition) []interface{} {
 // CancelOrder requests cancellation of an order and returns the Trade it
 // belongs to (nil if unknown). The trade moves to PendingCancel (or straight
 // to Cancelled for an untransmitted/inactive order) until TWS confirms.
+// Supplying another client's order returns ErrOrderIdentity.
 func (ib *IB) CancelOrder(ord *order.Order) (*order.Trade, error) {
 	if ord == nil || ord.OrderID <= 0 {
 		return nil, errors.New("ibgo: CancelOrder needs an order with an orderId")
 	}
-	clientID := ord.ClientID
-	if clientID == 0 {
-		clientID = ib.ClientID()
+	trade, err := ib.tradeForWrite(ib.ClientID(), ord)
+	if err != nil {
+		return nil, err
 	}
-	ib.state.Mu.RLock()
-	trade := ib.state.Trades[orderKeyFromIDs(clientID, ord.OrderID, ord.PermID)]
-	if trade == nil && ord.PermID != 0 {
-		trade = ib.state.PermID2Trade[ord.PermID]
-	}
-	ib.state.Mu.RUnlock()
 
 	if trade != nil {
 		if j := ib.orderJournal(); j != nil {
@@ -1958,10 +2003,14 @@ func (ib *IB) handleCommissionReport(r *protocol.FieldReader) {
 	fill, ok := ib.state.Fills[cr.ExecID]
 	var trade *order.Trade
 	if ok {
-		fill.CommissionReport = cr
 		trade = ib.state.PermID2Trade[fill.Execution.PermID]
 		if trade == nil {
 			trade = ib.state.Trades[orderKeyForExec(fill.Execution)]
+		}
+		if trade != nil {
+			trade.SetFillCommission(fill, cr)
+		} else {
+			fill.CommissionReport = cr
 		}
 	}
 	ib.state.Mu.Unlock()

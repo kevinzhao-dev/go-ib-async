@@ -141,12 +141,18 @@ func (t *Trade) OrderSnapshot() Order {
 	return *t.Order
 }
 
-// FillsSnapshot returns a copy of the fill list.
+// FillsSnapshot returns the fills with the commission reports available now.
+// Later reports are visible in subsequent snapshots.
 func (t *Trade) FillsSnapshot() []*Fill {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	out := make([]*Fill, len(t.Fills))
-	copy(out, t.Fills)
+	for i, fill := range t.Fills {
+		if fill != nil {
+			snapshot := *fill
+			out[i] = &snapshot
+		}
+	}
 	return out
 }
 
@@ -291,6 +297,13 @@ func (t *Trade) AddFill(f *Fill, now time.Time) {
 		Status:  t.statusLocked(),
 		Message: "Fill " + formatQty(f.Execution.Shares) + "@" + formatQty(f.Execution.Price),
 	})
+}
+
+// SetFillCommission attaches a report to a fill under the snapshot lock.
+func (t *Trade) SetFillCommission(f *Fill, report *CommissionReport) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	f.CommissionReport = report
 }
 
 // UpdateFromOpenOrder copies the fields TWS may change on a live order.
