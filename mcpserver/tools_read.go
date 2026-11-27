@@ -243,11 +243,14 @@ func viewLimits(l risk.Limits) *limitsView {
 }
 
 type statusResult struct {
-	Connected      bool            `json:"connected"`
-	ServerVersion  int             `json:"server_version,omitempty"`
-	ClientID       int64           `json:"client_id,omitempty"`
-	Accounts       []accountStatus `json:"accounts"`
-	MarketDataType string          `json:"market_data_type"`
+	Connected bool `json:"connected"`
+	// ConnectionError is why the last connection attempt failed, while
+	// not connected.
+	ConnectionError string          `json:"connection_error,omitempty"`
+	ServerVersion   int             `json:"server_version,omitempty"`
+	ClientID        int64           `json:"client_id,omitempty"`
+	Accounts        []accountStatus `json:"accounts"`
+	MarketDataType  string          `json:"market_data_type"`
 	// WhatIf tells whether preview_order asks TWS for margin and commission.
 	WhatIf  bool          `json:"what_if"`
 	Trading tradingStatus `json:"trading"`
@@ -259,6 +262,9 @@ func (s *Server) getStatus(_ context.Context, _ noArgs) (any, error) {
 		MarketDataType: marketDataTypes[s.cfg.MarketDataType],
 		WhatIf:         !s.cfg.DisableWhatIf,
 		Accounts:       []accountStatus{},
+	}
+	if !res.Connected {
+		res.ConnectionError = s.connectionProblem()
 	}
 	if res.Connected {
 		res.ServerVersion = s.b.ServerVersion()

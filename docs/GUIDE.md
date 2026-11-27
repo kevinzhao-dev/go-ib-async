@@ -158,6 +158,14 @@ subscription. Subscriptions made on the new connection (e.g. from a
 chosen before the reconnect and share the contract's existing `Ticker`; one
 whose re-send fails is retried after the next reconnect.
 
+`IsConnected` is true only once TWS has accepted the client id and sent the
+next order id and the managed accounts. `LastConnectError` tells why the
+last attempt failed; `errors.Is(err, ibgo.ErrClientIDInUse)` detects TWS
+error 326, another API client connected with the same client id. A client
+that places no orders can set `cfg.ClientIDFallbacks` to try the following
+ids instead (`ClientID` reports the one in use); one that places orders
+should not, because TWS binds orders to the client id that placed them.
+
 When the account updates download of the new connection completes, positions
 closed while disconnected leave `Portfolio()`. `SyncOrders` then refreshes
 open orders, fetches executions (missed fills are added to their trades),

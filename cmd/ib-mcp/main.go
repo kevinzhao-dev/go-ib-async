@@ -37,12 +37,14 @@ import (
 var version = "dev"
 
 type config struct {
-	host           string
-	port           int
-	clientID       int
-	marketDataType int
-	requestTimeout time.Duration
-	whatIf         bool
+	host     string
+	port     int
+	clientID int
+	// clientIDFallbacks applies only with trading disabled.
+	clientIDFallbacks int
+	marketDataType    int
+	requestTimeout    time.Duration
+	whatIf            bool
 
 	trading           bool
 	allowLive         bool
@@ -60,6 +62,7 @@ func parseFlags(args []string, getenv func(string) string, stderr io.Writer) (*c
 	fs.StringVar(&c.host, "host", envStr(getenv, "IB_HOST", "127.0.0.1"), "TWS/Gateway host (env IB_HOST)")
 	fs.IntVar(&c.port, "port", envInt(getenv, "IB_PORT", 4002), "TWS/Gateway port: 4002 Gateway paper, 4001 Gateway live, 7497 TWS paper, 7496 TWS live (env IB_PORT)")
 	fs.IntVar(&c.clientID, "client-id", envInt(getenv, "IB_CLIENT_ID", 17), "API client id; orders placed by the agent belong to it (env IB_CLIENT_ID)")
+	fs.IntVar(&c.clientIDFallbacks, "client-id-fallbacks", 9, "without -enable-trading: when another API client (e.g. an ib-mcp of another agent session) holds the client id, try up to this many following ids; with -enable-trading the client id is fixed, because orders belong to it")
 	fs.IntVar(&c.marketDataType, "market-data-type", 1, "1 live, 2 frozen, 3 delayed, 4 delayed-frozen (3: delayed data where there is no live subscription)")
 	fs.DurationVar(&c.requestTimeout, "request-timeout", 30*time.Second, "timeout of each tool call")
 	fs.BoolVar(&c.whatIf, "what-if", true, "let preview_order send what-if orders for margin and commission estimates (TWS evaluates them, nothing executes); -what-if=false sends no order messages without -enable-trading")
@@ -105,6 +108,12 @@ func parseFlags(args []string, getenv func(string) string, stderr io.Writer) (*c
 		// API (TWS may resubmit them), and they would count as this
 		// server's own orders.
 		return nil, errors.New("-client-id 0 is not supported: TWS binds manual TWS orders to client 0; use another id")
+	}
+	if c.clientIDFallbacks < 0 || c.clientIDFallbacks > 100 {
+		return nil, fmt.Errorf("-client-id-fallbacks must be 0-100, got %d", c.clientIDFallbacks)
+	}
+	if !c.trading && c.clientID < 0 && c.clientID+c.clientIDFallbacks >= 0 {
+		return nil, fmt.Errorf("-client-id %d with -client-id-fallbacks %d would try client id 0, which TWS binds manual TWS orders to", c.clientID, c.clientIDFallbacks)
 	}
 	for _, f := range []struct {
 		name string
@@ -218,8 +227,14 @@ func run(ctx context.Context, cfg *config, in io.Reader, out io.Writer) error {
 		// that place_order stays refused until a sync succeeded on the
 		// current connection (the library would only log a failure).
 		rc.SyncOrders = false
+		// Read-only, the client id does not matter: let several servers
+		// (one per agent session) share TWS. Orders belong to the client
+		// id that placed them, so with trading it stays fixed.
+		if !cfg.trading {
+			rc.ClientIDFallbacks = cfg.clientIDFallbacks
+		}
 		err := ib.ConnectWithReconnect(ctx, cfg.host, cfg.port, cfg.clientID, rc, func() {
-			log.Printf("connected to %s:%d (server version %d, accounts %v)", cfg.host, cfg.port, ib.ServerVersion(), ib.ManagedAccounts())
+			log.Printf("connected to %s:%d as client %d (server version %d, accounts %v)", cfg.host, cfg.port, ib.ClientID(), ib.ServerVersion(), ib.ManagedAccounts())
 			gen := gate.start()
 			if cfg.marketDataType != 1 {
 				if err := ib.ReqMarketDataType(cfg.marketDataType); err != nil {

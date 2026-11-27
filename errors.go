@@ -3,9 +3,19 @@ package ibgo
 import (
 	"errors"
 	"strings"
+
+	"github.com/kevinzhao-dev/go-ib-async/protocol"
 )
 
+// HandshakeError is the reason TWS/Gateway gave for refusing a connection
+// during the API handshake. Connect returns it wrapped; use errors.As.
+type HandshakeError = protocol.HandshakeError
+
 var (
+	// ErrClientIDInUse is matched (errors.Is) by connection errors caused by
+	// TWS refusing the client id because another API client uses it (326).
+	ErrClientIDInUse = protocol.ErrClientIDInUse
+
 	// ErrNotConnected indicates no active connection to TWS/Gateway.
 	ErrNotConnected = errors.New("ibgo: not connected")
 

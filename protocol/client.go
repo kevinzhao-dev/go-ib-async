@@ -29,6 +29,32 @@ const (
 // connected or a connection attempt is in progress.
 var ErrAlreadyConnected = errors.New("ibgo: already connected")
 
+// ErrClientIDInUse is matched (errors.Is) by the error Connect returns when
+// TWS/Gateway refuses the client id because another API client is connected
+// with it (error 326).
+var ErrClientIDInUse = errors.New("ibgo: client id already in use")
+
+// codeClientIDInUse is the error TWS sends before closing a connection whose
+// client id is taken.
+const codeClientIDInUse = 326
+
+// HandshakeError is an error TWS/Gateway sent before closing the connection
+// during the API handshake, i.e. the reason it refused the connection.
+type HandshakeError struct {
+	ClientID int
+	Code     int
+	Message  string
+}
+
+func (e *HandshakeError) Error() string {
+	return fmt.Sprintf("ibgo: TWS/Gateway refused client id %d: error %d: %s", e.ClientID, e.Code, e.Message)
+}
+
+// Is lets errors.Is(err, ErrClientIDInUse) detect error 326.
+func (e *HandshakeError) Is(target error) bool {
+	return target == ErrClientIDInUse && e.Code == codeClientIDInUse
+}
+
 // Client manages the IB TWS connection, handshake, message sending and reading.
 type Client struct {
 	Conn     *Connection
@@ -47,7 +73,9 @@ type Client struct {
 	accounts      []string
 	hasReqID      bool
 	apiReady      bool
-	startTime     time.Time
+	// handshakeErr is the last error TWS sent before the API became ready.
+	handshakeErr *HandshakeError
+	startTime    time.Time
 
 	// handler receives decoded messages
 	handler Handler
@@ -123,6 +151,7 @@ func (c *Client) Connect(ctx context.Context, host string, port, clientID int) e
 	c.ClientID = clientID
 	c.hasReqID = false
 	c.apiReady = false
+	c.handshakeErr = nil
 	c.accounts = nil
 	c.startTime = time.Now()
 	c.mu.Unlock()
@@ -177,6 +206,13 @@ func (c *Client) Connect(ctx context.Context, host string, port, clientID int) e
 		return nil
 	case <-done:
 		c.Disconnect()
+		// readLoop records the error before it exits and closes done.
+		c.mu.Lock()
+		herr := c.handshakeErr
+		c.mu.Unlock()
+		if herr != nil {
+			return fmt.Errorf("connection closed during handshake: %w", herr)
+		}
 		return fmt.Errorf("connection closed during handshake")
 	case <-ctx.Done():
 		c.Disconnect()
@@ -343,6 +379,8 @@ func (c *Client) readLoop() {
 				c.hasReqID = true
 			} else if msgID == InMsgManagedAccounts {
 				c.accounts = splitAccounts(fields[2])
+			} else if msgID == InMsgErrMsg {
+				c.recordHandshakeError(fields)
 			}
 			becameReady := c.hasReqID && len(c.accounts) > 0
 			if becameReady {
@@ -388,6 +426,22 @@ func (c *Client) readLoop() {
 			}
 		}
 	}
+}
+
+// recordHandshakeError keeps an error TWS sent before the API became ready,
+// so that Connect can report why TWS closed the connection (e.g. 326, client
+// id already in use). Fields: msgId, version, reqId, code, message, ...
+// Errors tied to a request and info codes (2100-2199, data farm status) are
+// not reasons for a refusal. Called with c.mu held.
+func (c *Client) recordHandshakeError(fields []string) {
+	if len(fields) < 5 || fields[2] != "-1" {
+		return
+	}
+	code, err := strconv.Atoi(fields[3])
+	if err != nil || (code >= 2100 && code < 2200) {
+		return
+	}
+	c.handshakeErr = &HandshakeError{ClientID: c.ClientID, Code: code, Message: fields[4]}
 }
 
 func splitAccounts(s string) []string {
