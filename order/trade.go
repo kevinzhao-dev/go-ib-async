@@ -303,6 +303,9 @@ func (t *Trade) UpdateFromOpenOrder(o *Order) {
 	t.Order.AuxPrice = o.AuxPrice
 	t.Order.OrderType = o.OrderType
 	t.Order.OrderRef = o.OrderRef
+	if o.TIF != "" {
+		t.Order.TIF = o.TIF
+	}
 }
 
 // SetPermID records the permanent id assigned by TWS.

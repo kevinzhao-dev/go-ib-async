@@ -108,30 +108,45 @@ instructions.
 1. **Read-only by default.** Without `-enable-trading` the trade tools do
    not exist and `preview_order` never issues a preview id.
 2. **Paper accounts only** unless `-allow-live`. Paper account ids start with
-   `DU`/`DF`; anything else counts as live. Checked at preview and again at
-   placement.
+   `DU`/`DF`; anything else counts as live. Checked at preview, again at
+   placement, and for every cancel (orders of live accounts are skipped and
+   reported).
 3. **Trading needs limits and a journal.** `-enable-trading` refuses to start
-   without `-journal`, `-max-order-qty` and `-max-order-notional`. Other
-   limits have conservative defaults: `-allowed-sec-types STK`,
+   without `-journal`, `-max-order-qty` and `-max-order-notional` (finite and
+   positive). Other limits have conservative defaults: `-allowed-sec-types STK`,
    `-max-open-orders 10`, `-max-orders-per-minute 10`,
    `-price-collar-pct 5`, `-duplicate-window 30s`. The `risk` package
    enforces them inside `PlaceOrder` and fails closed (no reference price for
-   a market order means it is rejected).
-4. **Order type allowlist.** LMT, STP and STP LMT; MKT only with
+   a market order means it is rejected). A bracket counts all three legs
+   against `-max-open-orders`. `mcpserver.New` and `place_order` verify that
+   the client really consults this risk manager and a journal.
+4. **Current reference prices.** `place_order` refreshes the quote when the
+   one cached by `preview_order` is older than half of its 60-second
+   lifetime, and refuses a limit order when the price collar is on but no
+   reference price is available. `preview_order` warns about every leg of a
+   bracket that the notional limit or the collar would reject.
+5. **Synchronised state.** After each (re)connect, `place_order` is refused
+   until open orders, executions and positions have been synchronised, so the
+   position and open-order limits never see stale state. A failed sync is
+   retried every 5 seconds; `get_status` reports `trading.not_ready` meanwhile.
+6. **Order type allowlist.** LMT, STP and STP LMT; MKT only with
    `-allow-market-orders`.
-5. **Two-step orders.** Previews are single-use, expire (default 2 minutes)
+7. **Two-step orders.** Previews are single-use, expire (default 2 minutes)
    and are bound to the exact contract, side, quantity, prices, account and
    time in force.
-6. **Write-ahead journal.** Every submit is fsync'd to the JSONL journal
+8. **Write-ahead journal.** Every submit is fsync'd to the JSONL journal
    before it is sent; a journal failure blocks the order.
-7. **Scope.** Agents can modify or cancel only orders of the server's API
+9. **Scope.** Agents can modify or cancel only orders of the server's API
    client id (`-client-id`, default 17), never other clients' or manual TWS
-   orders, and never use global cancel. Orders are tagged
-   `orderRef=ib-mcp` so they are recognisable in TWS.
-8. **One-way kill switch.** `halt_trading` (and the daily loss limit) stop
-   all new orders and modifications; there is no resume tool. Limits cannot
-   be changed through MCP.
-9. **Explicit instructions.** The server's MCP `instructions` tell the agent
+   orders, and never use global cancel. Client id 0 is refused, because TWS
+   binds manual orders to it. Orders are tagged `orderRef=ib-mcp` so they are
+   recognisable in TWS.
+10. **One-way kill switch.** `halt_trading` (and the daily loss limit) stop
+   all new orders and modifications; there is no resume tool. With
+   `cancel_open_orders` it waits for submissions already past the risk check
+   and cancels them too, including bracket legs that stay working after a
+   partial fill. Limits cannot be changed through MCP.
+11. **Explicit instructions.** The server's MCP `instructions` tell the agent
    to preview first, get explicit user confirmation, treat risk rejections as
    final (no splitting or resizing), and halt when in doubt. Tool results
    (including text from IB such as contract names and error messages) are
@@ -147,16 +162,26 @@ to stderr; stdout carries the protocol.
 Embedding instead of the binary:
 
 ```go
+var srv *mcpserver.Server
 rm := risk.New(limits, ib, risk.WithPriceSource(func(c *contract.Contract) (float64, bool) {
 	return srv.ReferencePrice(c) // quotes the server has seen
 }))
 ib.SetRiskManager(rm)
 ib.SetJournal(j)
 srv, err := mcpserver.New(ib, mcpserver.Config{
-	Trading: mcpserver.TradingConfig{Enabled: true, Risk: rm},
+	Trading: mcpserver.TradingConfig{
+		Enabled: true,
+		Risk:    rm,
+		// Refuse orders until SyncOrders succeeded on this connection.
+		Ready: func() error { return syncErr() },
+	},
 })
 err = srv.Serve(ctx, os.Stdin, os.Stdout)
 ```
+
+`New` refuses to enable trading unless `ib` has exactly this risk manager
+and a journal installed. `cmd/ib-mcp/main.go` shows a complete `Ready`
+implementation (`syncGate`).
 
 ## Design notes
 
@@ -165,8 +190,9 @@ err = srv.Serve(ctx, os.Stdin, os.Stdout)
   message per line) is implemented in `mcpserver/protocol.go`: `initialize`
   with version negotiation (2025-06-18, 2025-03-26, 2024-11-05), `ping`,
   `tools/list`, `tools/call`, and `notifications/cancelled`. Requests are
-  handled concurrently. Moving to the official Go SDK later only touches
-  that file.
+  handled concurrently, and JSON-RPC batches (part of 2025-03-26) are
+  accepted and answered with one array. Moving to the official Go SDK later
+  only touches that file.
 - **Schemas from struct tags.** Tool arguments are Go structs; `json`,
   `desc`, `enum` and `required` tags generate the input schema and drive
   validation, so the two cannot drift. Unknown fields are rejected, and enums
@@ -189,7 +215,10 @@ err = srv.Serve(ctx, os.Stdin, os.Stdout)
 - What-if is not available for modifications, and a bracket's what-if only
   covers the entry.
 - The price collar and market-order notional use the last quote the server
-  saw (at most 60s old); with delayed data that quote can be 15 minutes old.
+  saw (at most 60s old, refreshed by `place_order` after 30s); with delayed
+  data that quote can be 15 minutes old. The collar also applies to a
+  bracket's take-profit, so with the default 5% a take-profit further than
+  5% from the market is rejected (and `preview_order` says so).
 - Order types beyond LMT/MKT/STP/STP LMT (trailing, algos, conditions,
   combos) are not exposed.
 - Elicitation (asking the user for confirmation from the server side) is not

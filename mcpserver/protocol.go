@@ -134,7 +134,7 @@ type session struct {
 	inflight map[string]context.CancelFunc
 }
 
-func (ss *session) write(resp rpcResponse) {
+func encodeResponse(resp rpcResponse) []byte {
 	resp.JSONRPC = "2.0"
 	if resp.ID == nil {
 		resp.ID = json.RawMessage("null")
@@ -143,6 +143,22 @@ func (ss *session) write(resp rpcResponse) {
 	if err != nil {
 		b, _ = json.Marshal(rpcResponse{JSONRPC: "2.0", ID: resp.ID, Error: &rpcError{codeInternalError, "cannot encode response: " + err.Error()}})
 	}
+	return b
+}
+
+func (ss *session) write(resp rpcResponse) {
+	ss.writeLine(encodeResponse(resp))
+}
+
+func (ss *session) writeBatch(resps []rpcResponse) {
+	parts := make([][]byte, len(resps))
+	for i, r := range resps {
+		parts[i] = encodeResponse(r)
+	}
+	ss.writeLine(append(append([]byte{'['}, bytes.Join(parts, []byte{','})...), ']'))
+}
+
+func (ss *session) writeLine(b []byte) {
 	ss.writeMu.Lock()
 	defer ss.writeMu.Unlock()
 	if _, err := ss.w.Write(append(b, '\n')); err != nil {
@@ -157,7 +173,7 @@ func (ss *session) writeError(id json.RawMessage, code int, msg string) {
 func (ss *session) handleLine(ctx context.Context, line []byte) {
 	line = bytes.TrimSpace(line)
 	if len(line) > 0 && line[0] == '[' {
-		ss.writeError(nil, codeInvalidRequest, "JSON-RPC batches are not supported")
+		ss.handleBatch(ctx, line)
 		return
 	}
 	var msg rpcMessage
@@ -165,13 +181,73 @@ func (ss *session) handleLine(ctx context.Context, line []byte) {
 		ss.writeError(nil, codeParseError, "parse error: "+err.Error())
 		return
 	}
+	ss.handleMessage(ctx, msg, func(r *rpcResponse) {
+		if r != nil {
+			ss.write(*r)
+		}
+	})
+}
+
+// handleBatch handles a JSON-RPC batch (required by MCP 2025-03-26): its
+// requests run concurrently and their responses are written together as one
+// array once all of them are done. A batch of notifications gets no reply.
+func (ss *session) handleBatch(ctx context.Context, line []byte) {
+	var raws []json.RawMessage
+	if err := json.Unmarshal(line, &raws); err != nil {
+		ss.writeError(nil, codeParseError, "parse error: "+err.Error())
+		return
+	}
+	if len(raws) == 0 {
+		ss.writeError(nil, codeInvalidRequest, "empty batch")
+		return
+	}
+	var (
+		mu      sync.Mutex
+		resps   []rpcResponse
+		pending sync.WaitGroup
+	)
+	add := func(r *rpcResponse) {
+		if r != nil {
+			mu.Lock()
+			resps = append(resps, *r)
+			mu.Unlock()
+		}
+	}
+	for _, raw := range raws {
+		var msg rpcMessage
+		if err := json.Unmarshal(raw, &msg); err != nil {
+			add(&rpcResponse{Error: &rpcError{codeInvalidRequest, "invalid request: " + err.Error()}})
+			continue
+		}
+		pending.Add(1)
+		if !ss.handleMessage(ctx, msg, func(r *rpcResponse) { add(r); pending.Done() }) {
+			pending.Done()
+		}
+	}
+	ss.wg.Add(1)
+	go func() {
+		defer ss.wg.Done()
+		pending.Wait()
+		mu.Lock()
+		defer mu.Unlock()
+		if len(resps) > 0 {
+			ss.writeBatch(resps)
+		}
+	}()
+}
+
+// handleMessage handles one message. A request runs concurrently and done
+// is called once with its response, or with nil when the client cancelled
+// it; handleMessage then returns true. Notifications and responses are
+// handled at once, done is not called, and it returns false.
+func (ss *session) handleMessage(ctx context.Context, msg rpcMessage, done func(*rpcResponse)) bool {
 	if msg.Method == "" {
 		// A response to a server-initiated request; this server sends none.
-		return
+		return false
 	}
 	if len(msg.ID) == 0 || string(msg.ID) == "null" {
 		ss.handleNotification(msg)
-		return
+		return false
 	}
 
 	key := string(msg.ID)
@@ -190,15 +266,16 @@ func (ss *session) handleLine(ctx context.Context, line []byte) {
 			cancel()
 		}()
 		result, rerr := ss.dispatch(reqCtx, msg)
-		if reqCtx.Err() != nil && ctx.Err() == nil {
-			return // cancelled by the client: no response
+		switch {
+		case reqCtx.Err() != nil && ctx.Err() == nil:
+			done(nil) // cancelled by the client: no response
+		case rerr != nil:
+			done(&rpcResponse{ID: msg.ID, Error: rerr})
+		default:
+			done(&rpcResponse{ID: msg.ID, Result: result})
 		}
-		if rerr != nil {
-			ss.write(rpcResponse{ID: msg.ID, Error: rerr})
-			return
-		}
-		ss.write(rpcResponse{ID: msg.ID, Result: result})
 	}()
+	return true
 }
 
 func (ss *session) handleNotification(msg rpcMessage) {

@@ -113,7 +113,7 @@ Other:
 ## Test Coverage
 
 Total library coverage (all packages except `cmd/` and `internal/fakegw`,
-measured across packages by `scripts/coverage.sh`): **96.2%**. CI fails below 90%.
+measured across packages by `scripts/coverage.sh`): **96.3%**. CI fails below 90%.
 
 | Package | Coverage |
 |---------|----------|
@@ -127,8 +127,8 @@ measured across packages by `scripts/coverage.sh`): **96.2%**. CI fails below 90
 | risk | 98.1% |
 | protocol | 96.5% |
 | journal | 95.2% |
-| mcpserver | 96.6% |
-| ibgo (root) | 93.5% |
+| mcpserver | 96.8% |
+| ibgo (root) | 93.6% |
 | internal/fakegw (test infrastructure) | 73.2% own tests; exercised further by the E2E tests |
 
 Found while adding tests (fixed): `reqHeadTimestamp` sent `whatToShow`/`useRTH`

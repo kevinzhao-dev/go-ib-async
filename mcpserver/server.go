@@ -50,10 +50,15 @@ type Broker interface {
 	ReqExecutions(ctx context.Context, filter order.ExecutionFilter) ([]order.Fill, error)
 	Trades() []*order.Trade
 	OpenTrades() []*order.Trade
+	TradeFills(t *order.Trade) []order.Fill
 	WhatIfOrder(ctx context.Context, con *contract.Contract, ord *order.Order) (*order.OrderState, error)
 	PlaceOrder(con *contract.Contract, ord *order.Order) (*order.Trade, error)
 	PlaceBracketOrder(con *contract.Contract, b *order.BracketOrder) ([]*order.Trade, error)
 	CancelOrder(ord *order.Order) (*order.Trade, error)
+	// RiskManager and Journal report the hooks PlaceOrder consults; trading
+	// is refused unless they are TradingConfig.Risk and a journal.
+	RiskManager() ibgo.PreTradeChecker
+	Journal() ibgo.OrderJournal
 }
 
 var _ Broker = (*ibgo.IB)(nil)
@@ -96,7 +101,15 @@ type TradingConfig struct {
 	// Risk is the risk manager installed on the client with
 	// SetRiskManager. The server reports its limits and halt state and
 	// uses it for halt_trading; the checks themselves run in PlaceOrder.
+	// The client must also have an order journal (SetJournal); New and
+	// place_order refuse to trade otherwise.
 	Risk *risk.Manager
+	// Ready reports whether the client's orders and positions are
+	// synchronised with the broker for the current connection (for example
+	// after SyncOrders succeeded). place_order refuses to send while it
+	// returns an error, so risk checks never run against stale state. Nil
+	// means always ready.
+	Ready func() error
 }
 
 // Server is an MCP server for one IB client.
@@ -108,6 +121,12 @@ type Server struct {
 	toolByName map[string]*tool
 
 	previews *previewStore
+
+	// placeMu is held (shared) while place_order submits, and exclusively
+	// by halt_trading while it collects the orders to cancel, so an order
+	// that passed the risk check before the halt is registered (and
+	// cancelled) rather than missed.
+	placeMu sync.RWMutex
 
 	quoteMu sync.Mutex
 	quotes  map[int64]quoteEntry
@@ -168,8 +187,8 @@ func New(b Broker, cfg Config) (*Server, error) {
 		if tc.Risk == nil {
 			return nil, errors.New("mcpserver: trading needs a risk manager (TradingConfig.Risk)")
 		}
-		if l := tc.Risk.Limits(); l.MaxOrderQuantity <= 0 || l.MaxOrderNotional <= 0 {
-			return nil, errors.New("mcpserver: trading needs risk limits MaxOrderQuantity and MaxOrderNotional")
+		if l := tc.Risk.Limits(); !finitePositive(l.MaxOrderQuantity) || !finitePositive(l.MaxOrderNotional) {
+			return nil, errors.New("mcpserver: trading needs finite positive risk limits MaxOrderQuantity and MaxOrderNotional")
 		}
 	}
 
@@ -181,22 +200,58 @@ func New(b Broker, cfg Config) (*Server, error) {
 		quotes:     map[int64]quoteEntry{},
 		details:    map[int64]contract.ContractDetails{},
 	}
+	if tc.Enabled {
+		if err := s.checkHooks(); err != nil {
+			return nil, fmt.Errorf("mcpserver: %w", err)
+		}
+	}
 	s.registerTools()
 	return s, nil
 }
+
+// checkHooks verifies that the client's PlaceOrder consults this server's
+// risk manager and a write-ahead journal.
+func (s *Server) checkHooks() error {
+	if rc := s.b.RiskManager(); rc == nil || rc != ibgo.PreTradeChecker(s.cfg.Trading.Risk) {
+		return errors.New("trading needs TradingConfig.Risk installed on the client (SetRiskManager)")
+	}
+	if s.b.Journal() == nil {
+		return errors.New("trading needs an order journal installed on the client (SetJournal)")
+	}
+	return nil
+}
+
+// tradingReady reports why orders cannot be sent yet (TradingConfig.Ready).
+func (s *Server) tradingReady() error {
+	if s.cfg.Trading.Ready == nil {
+		return nil
+	}
+	if err := s.cfg.Trading.Ready(); err != nil {
+		return fmt.Errorf("broker state is not synchronised yet (%v); nothing was sent, try again shortly", err)
+	}
+	return nil
+}
+
+func finitePositive(v float64) bool { return v > 0 && !math.IsInf(v, 1) }
 
 // ReferencePrice returns the last quoted price of con seen by the server
 // (midpoint, else last, else close) if it is younger than QuoteMaxAge. Pass
 // it to the risk manager with risk.WithPriceSource so market-order notional
 // and price-collar checks have a reference.
 func (s *Server) ReferencePrice(con *contract.Contract) (float64, bool) {
+	return s.referenceWithin(con, s.cfg.QuoteMaxAge)
+}
+
+// referenceWithin returns the last quoted price of con if it is younger
+// than maxAge.
+func (s *Server) referenceWithin(con *contract.Contract, maxAge time.Duration) (float64, bool) {
 	if con == nil || con.ConID == 0 {
 		return 0, false
 	}
 	s.quoteMu.Lock()
 	defer s.quoteMu.Unlock()
 	q, ok := s.quotes[con.ConID]
-	if !ok || time.Since(q.at) > s.cfg.QuoteMaxAge {
+	if !ok || time.Since(q.at) > maxAge {
 		return 0, false
 	}
 	return q.price, true
@@ -323,7 +378,7 @@ func (s *Server) registerTools() {
 		destructive, s.cancelAllOrders)
 	addTool(s, "halt_trading", "Halt trading",
 		"Kill switch: reject all new orders and modifications until a human restarts the server. Open orders stay working unless cancel_open_orders is true. Use it whenever something looks wrong. Agents cannot resume trading.",
-		toolAnnotations{IdempotentHint: true, OpenWorldHint: true}, s.haltTrading)
+		toolAnnotations{DestructiveHint: true, IdempotentHint: true, OpenWorldHint: true}, s.haltTrading)
 }
 
 func (s *Server) instructions() string {
@@ -354,6 +409,17 @@ func (s *Server) requireConnected() error {
 		return errors.New("not connected to TWS/IB Gateway (the server keeps retrying; check get_status)")
 	}
 	return nil
+}
+
+// ownClientID returns the API client id whose orders the trading tools may
+// place, modify and cancel. Client id 0 is refused: TWS binds manual TWS
+// orders to it, so its orders would include orders placed by hand.
+func (s *Server) ownClientID() (int64, error) {
+	id := s.b.ClientID()
+	if id == 0 {
+		return 0, errors.New("the trading tools are disabled for API client id 0, to which TWS binds manual TWS orders; run the server with another client id")
+	}
+	return id, nil
 }
 
 // isPaperAccount reports whether an IB account id is a paper trading

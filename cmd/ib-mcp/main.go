@@ -18,10 +18,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -96,6 +98,21 @@ func parseFlags(args []string, getenv func(string) string, stderr io.Writer) (*c
 	if c.marketDataType < 1 || c.marketDataType > 4 {
 		return nil, fmt.Errorf("-market-data-type must be 1-4, got %d", c.marketDataType)
 	}
+	if c.clientID == 0 {
+		// Syncing open orders as client 0 binds manual TWS orders to the
+		// API (TWS may resubmit them), and they would count as this
+		// server's own orders.
+		return nil, errors.New("-client-id 0 is not supported: TWS binds manual TWS orders to client 0; use another id")
+	}
+	for _, f := range []struct {
+		name string
+		v    float64
+	}{{"-max-order-qty", l.MaxOrderQuantity}, {"-max-order-notional", l.MaxOrderNotional}, {"-max-position", l.MaxPositionQuantity},
+		{"-price-collar-pct", l.PriceCollarPct}, {"-max-daily-loss", l.MaxDailyLoss}} {
+		if math.IsNaN(f.v) || math.IsInf(f.v, 0) || f.v < 0 {
+			return nil, fmt.Errorf("%s must be a finite number >= 0, got %g", f.name, f.v)
+		}
+	}
 	if c.trading {
 		var missing []string
 		if c.journalPath == "" {
@@ -143,6 +160,9 @@ func run(ctx context.Context, cfg *config, in io.Reader, out io.Writer) error {
 		log.Printf("IB %s", e.Error())
 	})
 
+	gate := &syncGate{}
+	ib.DisconnectedEvent.Subscribe(func(struct{}) { gate.reset() })
+
 	sc := mcpserver.Config{
 		Version:        version,
 		RequestTimeout: cfg.requestTimeout,
@@ -172,6 +192,7 @@ func run(ctx context.Context, cfg *config, in io.Reader, out io.Writer) error {
 			OrderTypes: types,
 			PreviewTTL: cfg.previewTTL,
 			Risk:       rm,
+			Ready:      gate.check,
 		}
 		mode := "paper accounts only"
 		if cfg.allowLive {
@@ -186,16 +207,27 @@ func run(ctx context.Context, cfg *config, in io.Reader, out io.Writer) error {
 	}
 
 	connDone := make(chan struct{})
+	var syncs sync.WaitGroup
 	go func() {
 		defer close(connDone)
 		rc := ibgo.DefaultReconnectConfig()
+		// Orders and positions are synchronised in onConnect instead, so
+		// that place_order stays refused until a sync succeeded on the
+		// current connection (the library would only log a failure).
+		rc.SyncOrders = false
 		err := ib.ConnectWithReconnect(ctx, cfg.host, cfg.port, cfg.clientID, rc, func() {
 			log.Printf("connected to %s:%d (server version %d, accounts %v)", cfg.host, cfg.port, ib.ServerVersion(), ib.ManagedAccounts())
+			gen := gate.start()
 			if cfg.marketDataType != 1 {
 				if err := ib.ReqMarketDataType(cfg.marketDataType); err != nil {
 					log.Printf("market data type: %v", err)
 				}
 			}
+			syncs.Add(1)
+			go func() {
+				defer syncs.Done()
+				syncLoop(ctx, ib, gate, gen, syncRetryDelay)
+			}()
 		})
 		if err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("connection loop ended: %v", err)
@@ -207,7 +239,86 @@ func run(ctx context.Context, cfg *config, in io.Reader, out io.Writer) error {
 	cancel()
 	<-connDone
 	ib.Disconnect()
+	syncs.Wait()
 	return err
+}
+
+const (
+	syncTimeout    = 30 * time.Second
+	syncRetryDelay = 5 * time.Second
+)
+
+// syncGate records whether the client's orders and positions have been
+// synchronised with TWS on the current connection. place_order is refused
+// until then, so the risk manager never checks an order against positions
+// or open orders from before a (re)connect.
+type syncGate struct {
+	mu    sync.Mutex
+	gen   int // connection generation; reset and start advance it
+	ready bool
+	err   error
+}
+
+// start begins a new connection and returns its generation.
+func (g *syncGate) start() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.gen++
+	g.ready, g.err = false, nil
+	return g.gen
+}
+
+// reset marks the state unsynchronised after a disconnect.
+func (g *syncGate) reset() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.gen++
+	g.ready, g.err = false, nil
+}
+
+// done records the outcome of a sync started in generation gen. It reports
+// false when the connection has changed since, and the result is dropped.
+func (g *syncGate) done(gen int, err error) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if gen != g.gen {
+		return false
+	}
+	g.ready, g.err = err == nil, err
+	return true
+}
+
+// check is mcpserver's TradingConfig.Ready.
+func (g *syncGate) check() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	switch {
+	case g.ready:
+		return nil
+	case g.err != nil:
+		return fmt.Errorf("order and position sync failed (%v), retrying", g.err)
+	}
+	return errors.New("order and position sync with TWS is in progress")
+}
+
+// syncLoop synchronises orders, executions and positions for connection
+// generation gen, retrying every retry until it succeeds, the connection
+// changes or ctx ends.
+func syncLoop(ctx context.Context, ib *ibgo.IB, g *syncGate, gen int, retry time.Duration) {
+	for {
+		sctx, cancel := context.WithTimeout(ctx, syncTimeout)
+		_, err := ib.SyncOrders(sctx, ibgo.SyncOptions{})
+		cancel()
+		if !g.done(gen, err) || err == nil || ctx.Err() != nil {
+			return
+		}
+		log.Printf("order sync failed: %v; retrying in %v", err, retry)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(retry):
+		}
+	}
 }
 
 func splitList(s string) []string {

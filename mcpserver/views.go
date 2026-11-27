@@ -219,7 +219,8 @@ type logView struct {
 	ErrorCode int    `json:"error_code,omitempty"`
 }
 
-func viewTrade(t *order.Trade, myClientID int64, detail bool) orderView {
+// viewTrade summarises t; withDetail adds its fills and event log.
+func viewTrade(t *order.Trade, myClientID int64) orderView {
 	o := t.OrderSnapshot()
 	st := t.StatusSnapshot()
 	v := orderView{
@@ -227,7 +228,7 @@ func viewTrade(t *order.Trade, myClientID int64, detail bool) orderView {
 		ClientID:   o.ClientID,
 		PermID:     o.PermID,
 		ParentID:   o.ParentID,
-		Own:        o.ClientID == myClientID && o.OrderID > 0,
+		Own:        o.ClientID == myClientID && o.OrderID > 0 && myClientID != 0,
 		Account:    o.Account,
 		Contract:   viewContract(t.Contract),
 		Action:     o.Action,
@@ -266,13 +267,18 @@ func viewTrade(t *order.Trade, myClientID int64, detail bool) orderView {
 			break
 		}
 	}
-	if detail {
-		for _, f := range t.FillsSnapshot() {
-			v.Fills = append(v.Fills, viewFill(*f))
-		}
-		for _, e := range logs {
-			v.Log = append(v.Log, logView{Time: timeString(e.Time), Status: e.Status, Message: e.Message, ErrorCode: e.ErrorCode})
-		}
+	return v
+}
+
+// withDetail adds the fills and the event log of t to v. fills must be
+// copies taken under the client's lock (Broker.TradeFills): the reader sets
+// a fill's commission report while it runs.
+func withDetail(v orderView, t *order.Trade, fills []order.Fill) orderView {
+	for _, f := range fills {
+		v.Fills = append(v.Fills, viewFill(f))
+	}
+	for _, e := range t.LogSnapshot() {
+		v.Log = append(v.Log, logView{Time: timeString(e.Time), Status: e.Status, Message: e.Message, ErrorCode: e.ErrorCode})
 	}
 	return v
 }

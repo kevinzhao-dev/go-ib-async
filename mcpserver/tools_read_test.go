@@ -344,12 +344,15 @@ func TestOrderViewFields(t *testing.T) {
 	stp.OrderID, stp.ClientID = 3, 1
 	tr := order.NewTrade(&contract.Contract{ConID: 1}, stp)
 	tr.SetStatus(order.StatusCancelled, time.Now(), "Error 201: rejected", 201)
-	v := viewTrade(tr, 2, true)
+	v := withDetail(viewTrade(tr, 2), tr, nil)
 	if v.Own || *v.LimitPrice != 99 || *v.StopPrice != 100 || v.LastError != "Error 201: rejected" || v.Remaining != 0 || len(v.Log) != 1 {
 		t.Fatalf("view = %+v", v)
 	}
+	if viewTrade(tr, 1).Own != true || viewTrade(order.NewTrade(nil, &order.Order{OrderID: 3}), 0).Own {
+		t.Fatal("own: same client id and order id > 0, never for client id 0")
+	}
 	mkt := order.MarketOrder("BUY", 1)
-	if v := viewTrade(order.NewTrade(nil, mkt), 0, false); v.LimitPrice != nil || v.StopPrice != nil || v.Contract != nil {
+	if v := viewTrade(order.NewTrade(nil, mkt), 0); v.LimitPrice != nil || v.StopPrice != nil || v.Contract != nil {
 		t.Fatalf("market view = %+v", v)
 	}
 	if viewWhatIf(nil) != nil || viewContract(nil) != nil {

@@ -86,6 +86,15 @@ func TestSetStatusApplyFinalAndAccessors(t *testing.T) {
 	if o := tr.Order; o.PermID != 100 || o.TotalQuantity != 50 || o.LmtPrice != 11 || o.AuxPrice != 1 || o.OrderType != "STP LMT" || o.OrderRef != "r" || o.Action != "BUY" {
 		t.Fatalf("open order update = %+v", o)
 	}
+	tif := tr.Order.TIF
+	tr.UpdateFromOpenOrder(&Order{PermID: 100, TotalQuantity: 50, TIF: "GTC"})
+	if tr.Order.TIF != "GTC" {
+		t.Fatalf("an acknowledged TIF change must be kept, got %q (was %q)", tr.Order.TIF, tif)
+	}
+	tr.UpdateFromOpenOrder(&Order{PermID: 100, TotalQuantity: 50})
+	if tr.Order.TIF != "GTC" {
+		t.Fatal("an open order without TIF must not clear it")
+	}
 }
 
 func TestStateClassification(t *testing.T) {

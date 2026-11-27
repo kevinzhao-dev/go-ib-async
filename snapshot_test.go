@@ -3,6 +3,7 @@ package ibgo
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -100,5 +101,50 @@ func TestReqMarketDataType(t *testing.T) {
 	waitFor(t, "reqMarketDataType", func() bool { return srv.Received(59) == 1 })
 	if req := srv.LastRequest(59); len(req) != 3 || req[2] != "3" {
 		t.Fatalf("reqMarketDataType = %q", req)
+	}
+}
+
+// CancelMktData must cancel the stream, never a pending snapshot of the same
+// *Contract.
+func TestCancelMktDataSkipsPendingSnapshot(t *testing.T) {
+	srv := startFake(t)
+	var mu sync.Mutex
+	var reqIDs []string
+	srv.Handle(1, func(req []string) [][]byte { // neither request completes
+		mu.Lock()
+		reqIDs = append(reqIDs, req[2])
+		mu.Unlock()
+		return nil
+	})
+	ib := connectFake(t, srv)
+	con := aaplE2E()
+	if _, err := ib.ReqMktData(con, "", false, false); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	snap := make(chan error, 1)
+	go func() {
+		_, err := ib.ReqTickerSnapshot(ctx, con)
+		snap <- err
+	}()
+	waitFor(t, "both requests", func() bool { return srv.Received(1) == 2 })
+
+	ib.CancelMktData(con)
+	waitFor(t, "cancelMktData", func() bool { return srv.Received(2) == 1 })
+	mu.Lock()
+	stream := reqIDs[0]
+	mu.Unlock()
+	if req := srv.LastRequest(2); req[len(req)-1] != stream {
+		t.Fatalf("cancelMktData %q, want the stream's request %s", req, stream)
+	}
+	select {
+	case err := <-snap:
+		t.Fatalf("snapshot ended by the stream's cancel: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	cancel()
+	if err := <-snap; !errors.Is(err, context.Canceled) {
+		t.Fatalf("snapshot err = %v", err)
 	}
 }

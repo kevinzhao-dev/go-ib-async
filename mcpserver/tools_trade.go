@@ -26,7 +26,14 @@ const (
 	kindModify  = "modify"
 
 	maxPreviews = 50
+
+	// quoteTimeout bounds the market data snapshot taken by preview_order
+	// and place_order (TWS completes a snapshot after at most ~11s).
+	quoteTimeout = 12 * time.Second
 )
+
+// bracketRoles names the legs of a bracket plan, in order.
+var bracketRoles = []string{"entry", "take_profit", "stop_loss"}
 
 // plan is a validated order waiting for place_order.
 type plan struct {
@@ -169,7 +176,7 @@ func (s *Server) previewOrder(ctx context.Context, a previewArgs) (any, error) {
 	}
 	roles := []string{"order"}
 	if p.kind == kindBracket {
-		roles = []string{"entry", "take_profit", "stop_loss"}
+		roles = bracketRoles
 	}
 	for i, o := range p.orders {
 		res.Orders = append(res.Orders, viewPreviewOrder(roles[i], o))
@@ -177,7 +184,7 @@ func (s *Server) previewOrder(ctx context.Context, a previewArgs) (any, error) {
 
 	// Market context, best effort: also feeds the risk manager's reference
 	// price (market-order notional, price collar).
-	qctx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	qctx, cancel := context.WithTimeout(ctx, quoteTimeout)
 	q, qerr := s.quote(qctx, p.con)
 	cancel()
 	if qerr != nil {
@@ -193,7 +200,7 @@ func (s *Server) previewOrder(ctx context.Context, a previewArgs) (any, error) {
 	if n, ok := s.notional(p.con, &entry); ok {
 		res.EstimatedNotional = &n
 	}
-	res.Warnings = append(res.Warnings, s.policyWarnings(p, res.EstimatedNotional)...)
+	res.Warnings = append(res.Warnings, s.policyWarnings(p)...)
 
 	if p.kind == kindModify {
 		res.Warnings = append(res.Warnings, "what-if is not available for modifications")
@@ -333,6 +340,9 @@ func (s *Server) decorate(o *order.Order, a previewArgs, acct string) {
 func (s *Server) planModify(a previewArgs) (*plan, error) {
 	if a.TakeProfitPrice != 0 || a.StopLossPrice != 0 {
 		return nil, errors.New("take_profit_price/stop_loss_price cannot be used with modify_order_id; modify each leg separately")
+	}
+	if _, err := s.ownClientID(); err != nil {
+		return nil, err
 	}
 	t, err := s.findTrade(a.ModifyOrderID, 0, 0)
 	if err != nil {
@@ -498,27 +508,54 @@ func (s *Server) notional(con *contract.Contract, o *order.Order) (float64, bool
 }
 
 // policyWarnings flags what the risk manager will reject, so the agent
-// learns it before asking the user. The risk manager stays the authority.
-func (s *Server) policyWarnings(p *plan, notional *float64) []string {
+// learns it before asking the user. The risk manager stays the authority; it
+// checks every leg of a bracket, and so does this.
+func (s *Server) policyWarnings(p *plan) []string {
 	tc := s.cfg.Trading
 	if !tc.Enabled {
 		return nil
 	}
 	var w []string
+	if tc.Ready != nil {
+		if err := tc.Ready(); err != nil {
+			w = append(w, fmt.Sprintf("broker state is not synchronised yet (%v); place_order will be refused until it is", err))
+		}
+	}
 	if halted, why := tc.Risk.Halted(); halted {
 		w = append(w, "trading is halted ("+why+"); place_order will be rejected")
 	}
 	l := tc.Risk.Limits()
-	o := p.orders[0]
-	if l.MaxOrderQuantity > 0 && o.TotalQuantity > l.MaxOrderQuantity {
-		w = append(w, fmt.Sprintf("quantity %g exceeds max_order_quantity %g; place_order will be rejected", o.TotalQuantity, l.MaxOrderQuantity))
+	if q := p.orders[0].TotalQuantity; l.MaxOrderQuantity > 0 && q > l.MaxOrderQuantity {
+		w = append(w, fmt.Sprintf("quantity %g exceeds max_order_quantity %g; place_order will be rejected", q, l.MaxOrderQuantity))
 	}
-	if l.MaxOrderNotional > 0 {
-		if notional == nil {
-			w = append(w, "notional cannot be estimated (no price); place_order will be rejected by the notional limit")
-		} else if *notional > l.MaxOrderNotional {
-			w = append(w, fmt.Sprintf("estimated notional %.2f exceeds max_order_notional %.2f; place_order will be rejected", *notional, l.MaxOrderNotional))
+	ref, haveRef := s.ReferencePrice(p.con)
+	collarUnchecked := false
+	for i := range p.orders {
+		o := &p.orders[i]
+		leg := ""
+		if p.kind == kindBracket {
+			leg = bracketRoles[i] + " leg: "
 		}
+		if l.MaxOrderNotional > 0 {
+			n, ok := s.notional(p.con, o)
+			switch {
+			case !ok:
+				w = append(w, leg+"notional cannot be estimated (no price); place_order will be rejected by the notional limit")
+			case n > l.MaxOrderNotional:
+				w = append(w, fmt.Sprintf("%sestimated notional %.2f exceeds max_order_notional %.2f; place_order will be rejected", leg, n, l.MaxOrderNotional))
+			}
+		}
+		if l.PriceCollarPct > 0 && hasLimitPrice(o) {
+			if !haveRef {
+				collarUnchecked = true
+			} else if dev := math.Abs(o.LmtPrice-ref) / ref * 100; dev > l.PriceCollarPct {
+				w = append(w, fmt.Sprintf("%slimit %s is %.2f%% from the reference price %s, more than price_collar_pct %g; place_order will be rejected",
+					leg, fmtPrice(o.LmtPrice), dev, fmtPrice(ref), l.PriceCollarPct))
+			}
+		}
+	}
+	if collarUnchecked {
+		w = append(w, "no reference price, so the price collar cannot check the limit price; place_order will be refused unless a quote is available then")
 	}
 	if len(l.AllowedSecTypes) > 0 && !contains(l.AllowedSecTypes, p.con.SecType) {
 		w = append(w, fmt.Sprintf("sec_type %s is not in allowed_sec_types; place_order will be rejected", p.con.SecType))
@@ -528,6 +565,11 @@ func (s *Server) policyWarnings(p *plan, notional *float64) []string {
 		w = append(w, fmt.Sprintf("symbol %s is not allowed by the risk limits; place_order will be rejected", sym))
 	}
 	return w
+}
+
+// hasLimitPrice reports whether the risk manager's price collar applies to o.
+func hasLimitPrice(o *order.Order) bool {
+	return o.LmtPrice != ibgo.UnsetDouble && o.LmtPrice > 0 && !math.IsInf(o.LmtPrice, 0)
 }
 
 func upperAll(list []string) []string {
@@ -575,6 +617,10 @@ type placeResult struct {
 }
 
 func (s *Server) placeOrder(ctx context.Context, a placeArgs) (any, error) {
+	// Checked before the preview is used up, so the agent can retry it.
+	if err := s.tradingReady(); err != nil {
+		return nil, err
+	}
 	p, err := s.previews.take(a.PreviewID)
 	if err != nil {
 		return nil, err
@@ -585,24 +631,24 @@ func (s *Server) placeOrder(ctx context.Context, a placeArgs) (any, error) {
 	if !s.cfg.Trading.AllowLive && !isPaperAccount(p.account) {
 		return nil, fmt.Errorf("account %s is not a paper account and live trading is disabled", p.account)
 	}
+	if _, err := s.ownClientID(); err != nil {
+		return nil, err
+	}
+	if err := s.refreshReference(ctx, p); err != nil {
+		return nil, err
+	}
 
 	legs := make([]*order.Order, len(p.orders))
 	for i := range p.orders {
 		o := p.orders[i]
 		legs[i] = &o
 	}
-	var trades []*order.Trade
-	switch p.kind {
-	case kindBracket:
-		trades, err = s.b.PlaceBracketOrder(p.con, &order.BracketOrder{Parent: legs[0], TakeProfit: legs[1], StopLoss: legs[2]})
-	default:
-		var t *order.Trade
-		t, err = s.b.PlaceOrder(p.con, legs[0])
-		if t != nil {
-			trades = []*order.Trade{t}
-		}
-	}
+	trades, err := s.submit(p, legs)
 	if err != nil {
+		var ns errNotSent
+		if errors.As(err, &ns) {
+			return nil, ns.error
+		}
 		if v, ok := risk.IsViolation(err); ok {
 			return nil, fmt.Errorf("rejected by risk check %q: %s. Nothing was sent; report this to the user and do not work around it", v.Rule, v.Message)
 		}
@@ -620,7 +666,7 @@ func (s *Server) placeOrder(ctx context.Context, a placeArgs) (any, error) {
 	me := s.b.ClientID()
 	res := placeResult{Summary: p.summary, Orders: []orderView{}}
 	for _, t := range trades {
-		res.Orders = append(res.Orders, viewTrade(t, me, false))
+		res.Orders = append(res.Orders, viewTrade(t, me))
 	}
 	if !acked {
 		res.Note = "not yet acknowledged by the broker; check get_order"
@@ -632,6 +678,65 @@ func (s *Server) placeOrder(ctx context.Context, a placeArgs) (any, error) {
 		}
 	}
 	return res, nil
+}
+
+// errNotSent marks submit failures that happened before anything reached
+// the client's PlaceOrder.
+type errNotSent struct{ error }
+
+// submit sends the plan's orders. It holds placeMu shared, so halt_trading
+// (which takes it exclusively after halting) sees every order that passed the
+// risk check before the halt. The hooks and readiness are checked again here,
+// right before sending.
+func (s *Server) submit(p *plan, legs []*order.Order) ([]*order.Trade, error) {
+	s.placeMu.RLock()
+	defer s.placeMu.RUnlock()
+	if err := s.checkHooks(); err != nil {
+		return nil, errNotSent{fmt.Errorf("order not sent: %w", err)}
+	}
+	if err := s.tradingReady(); err != nil {
+		return nil, errNotSent{fmt.Errorf("%w (the preview was used up)", err)}
+	}
+	if p.kind == kindBracket {
+		return s.b.PlaceBracketOrder(p.con, &order.BracketOrder{Parent: legs[0], TakeProfit: legs[1], StopLoss: legs[2]})
+	}
+	t, err := s.b.PlaceOrder(p.con, legs[0])
+	if t == nil {
+		return nil, err
+	}
+	return []*order.Trade{t}, err
+}
+
+// refreshReference makes sure the risk manager has a current reference
+// price for the plan's contract. A preview can be placed for PreviewTTL,
+// which may outlast the quote preview_order cached (QuoteMaxAge), and the
+// risk manager skips the price collar when it has no reference. The quote is
+// refreshed once it is older than half of QuoteMaxAge. With the collar
+// enabled, an order whose limit price cannot be checked is refused.
+func (s *Server) refreshReference(ctx context.Context, p *plan) error {
+	if _, ok := s.referenceWithin(p.con, s.cfg.QuoteMaxAge/2); ok {
+		return nil
+	}
+	qctx, cancel := context.WithTimeout(ctx, quoteTimeout)
+	_, qerr := s.quote(qctx, p.con)
+	cancel()
+	if _, ok := s.ReferencePrice(p.con); ok {
+		return nil
+	}
+	collared := false
+	for i := range p.orders {
+		collared = collared || hasLimitPrice(&p.orders[i])
+	}
+	if s.cfg.Trading.Risk.Limits().PriceCollarPct <= 0 || !collared {
+		// Market orders without a reference fail the notional check.
+		return nil
+	}
+	why := "the quote returned no prices"
+	if qerr != nil {
+		why = qerr.Error()
+	}
+	return fmt.Errorf("no current reference price for %s (%s), so the price collar cannot check the limit price. Nothing was sent and the preview was used up; preview the order again once quotes are available",
+		describeSpec(p.con), why)
 }
 
 func waitDuration(secs, def, max int) time.Duration {
@@ -699,11 +804,17 @@ type cancelArgs struct {
 
 type cancelResult struct {
 	Orders []orderView `json:"orders"`
-	Note   string      `json:"note,omitempty"`
+	// Skipped are orders of live accounts left alone because live trading
+	// is disabled.
+	Skipped []orderView `json:"skipped,omitempty"`
+	Note    string      `json:"note,omitempty"`
 }
 
 func (s *Server) cancelOrder(ctx context.Context, a cancelArgs) (any, error) {
 	if err := s.requireConnected(); err != nil {
+		return nil, err
+	}
+	if _, err := s.ownClientID(); err != nil {
 		return nil, err
 	}
 	t, err := s.findTrade(a.OrderID, 0, 0)
@@ -713,7 +824,15 @@ func (s *Server) cancelOrder(ctx context.Context, a cancelArgs) (any, error) {
 	if t.IsDone() {
 		return nil, fmt.Errorf("order %d is already %s", a.OrderID, t.Status())
 	}
+	if acct := t.OrderSnapshot().Account; !s.cancelAllowed(acct) {
+		return nil, fmt.Errorf("order %d is for account %s, which is not a paper account, and live trading is disabled on this server; it cannot be cancelled here", a.OrderID, acct)
+	}
 	return s.cancelTrades(ctx, []*order.Trade{t}, waitDuration(a.WaitSeconds, 3, 15))
+}
+
+// cancelAllowed applies the paper-only policy to cancellations too.
+func (s *Server) cancelAllowed(account string) bool {
+	return s.cfg.Trading.AllowLive || isPaperAccount(account)
 }
 
 type cancelAllArgs struct {
@@ -724,66 +843,88 @@ func (s *Server) cancelAllOrders(ctx context.Context, a cancelAllArgs) (any, err
 	if err := s.requireConnected(); err != nil {
 		return nil, err
 	}
-	return s.cancelTrades(ctx, s.ownOpenTrades(), waitDuration(a.WaitSeconds, 3, 15))
+	own, err := s.ownOpenTrades()
+	if err != nil {
+		return nil, err
+	}
+	return s.cancelTrades(ctx, own, waitDuration(a.WaitSeconds, 3, 15))
 }
 
-// ownOpenTrades returns the open orders of this client, without bracket
-// children whose parent is open too (cancelling the parent cancels them).
-func (s *Server) ownOpenTrades() []*order.Trade {
-	me := s.b.ClientID()
+// ownOpenTrades returns the open orders of this client. Children of a
+// bracket parent that is open and has no fills are left out: cancelling the
+// parent cancels them. After a partial fill IB keeps the children working
+// for the filled quantity, so they are included.
+func (s *Server) ownOpenTrades() ([]*order.Trade, error) {
+	me, err := s.ownClientID()
+	if err != nil {
+		return nil, err
+	}
 	var own []*order.Trade
-	ids := map[int64]bool{}
+	unfilledParent := map[int64]bool{}
 	for _, t := range s.b.OpenTrades() {
 		o := t.OrderSnapshot()
 		if o.ClientID == me && o.OrderID > 0 && !t.IsDone() {
 			own = append(own, t)
-			ids[o.OrderID] = true
+			unfilledParent[o.OrderID] = t.FilledQty() == 0 && t.StatusSnapshot().Filled == 0
 		}
 	}
 	out := own[:0]
 	for _, t := range own {
-		if p := t.OrderSnapshot().ParentID; p != 0 && ids[p] {
+		if p := t.OrderSnapshot().ParentID; p != 0 && unfilledParent[p] {
 			continue
 		}
 		out = append(out, t)
 	}
-	return out
+	return out, nil
 }
 
+// cancelTrades cancels trades, skipping those the paper-only policy
+// protects, and waits up to wait for the confirmations.
 func (s *Server) cancelTrades(ctx context.Context, trades []*order.Trade, wait time.Duration) (cancelResult, error) {
+	me := s.b.ClientID()
+	res := cancelResult{Orders: []orderView{}}
 	var errs []string
+	var sent []*order.Trade
 	for _, t := range trades {
 		o := t.OrderSnapshot()
+		if !s.cancelAllowed(o.Account) {
+			res.Skipped = append(res.Skipped, viewTrade(t, me))
+			continue
+		}
 		ref := &order.Order{OrderID: o.OrderID, ClientID: o.ClientID, PermID: t.PermID()}
 		if _, err := s.b.CancelOrder(ref); err != nil {
 			errs = append(errs, fmt.Sprintf("order %d: %v", o.OrderID, err))
 		}
+		sent = append(sent, t)
 	}
 	poll(ctx, wait, func() bool {
-		for _, t := range trades {
+		for _, t := range sent {
 			if !t.IsDone() {
 				return false
 			}
 		}
 		return true
 	})
-	me := s.b.ClientID()
-	res := cancelResult{Orders: []orderView{}}
 	pending := 0
-	for _, t := range trades {
-		res.Orders = append(res.Orders, viewTrade(t, me, false))
+	for _, t := range sent {
+		res.Orders = append(res.Orders, viewTrade(t, me))
 		if !t.IsDone() {
 			pending++
 		}
 	}
+	var notes []string
 	switch {
 	case len(errs) > 0:
-		res.Note = "some cancels failed: " + strings.Join(errs, "; ")
+		notes = append(notes, "some cancels failed: "+strings.Join(errs, "; "))
 	case len(trades) == 0:
-		res.Note = "no open orders of this client"
+		notes = append(notes, "no open orders of this client")
 	case pending > 0:
-		res.Note = fmt.Sprintf("%d cancel(s) not yet confirmed; check get_order", pending)
+		notes = append(notes, fmt.Sprintf("%d cancel(s) not yet confirmed; check get_order", pending))
 	}
+	if n := len(res.Skipped); n > 0 {
+		notes = append(notes, fmt.Sprintf("%d order(s) of live accounts were not cancelled: live trading is disabled on this server", n))
+	}
+	res.Note = strings.Join(notes, "; ")
 	return res, nil
 }
 
@@ -807,7 +948,16 @@ func (s *Server) haltTrading(ctx context.Context, a haltArgs) (any, error) {
 		if err := s.requireConnected(); err != nil {
 			return nil, fmt.Errorf("trading is halted, but open orders could not be cancelled: %w", err)
 		}
-		c, _ := s.cancelTrades(ctx, s.ownOpenTrades(), 3*time.Second)
+		// Wait for submissions that passed the risk check before the halt,
+		// so their orders are registered and cancelled below. Later ones
+		// are rejected by the halt.
+		s.placeMu.Lock()
+		own, err := s.ownOpenTrades()
+		s.placeMu.Unlock()
+		if err != nil {
+			return nil, fmt.Errorf("trading is halted, but open orders could not be cancelled: %w", err)
+		}
+		c, _ := s.cancelTrades(ctx, own, 3*time.Second)
 		res.Cancelled = &c
 	}
 	return res, nil

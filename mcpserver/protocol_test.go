@@ -159,7 +159,8 @@ func TestProtocolErrors(t *testing.T) {
 		{`{"jsonrpc":"2.0","id":3,"method":"resources/list"}`, 3.0, codeMethodNotFound},
 		{`{"jsonrpc":"2.0","id":4,"method":"initialize","params":"x"}`, 4.0, codeInvalidParams},
 		{`{not json`, nil, codeParseError},
-		{`[{"jsonrpc":"2.0","id":5,"method":"ping"}]`, nil, codeInvalidRequest},
+		{`[]`, nil, codeInvalidRequest},
+		{`[{"jsonrpc":"2.0","id":5,"method":"ping"}`, nil, codeParseError},
 	}
 	for _, tc := range cases {
 		c.send(tc.req)
@@ -173,6 +174,37 @@ func TestProtocolErrors(t *testing.T) {
 	c.send(`{"jsonrpc":"2.0","method":"notifications/whatever"}`)
 	c.send(`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":12345}}`)
 	c.send("   ")
+	c.quiet(50 * time.Millisecond)
+}
+
+// TestProtocolBatch: MCP 2025-03-26 requires accepting JSON-RPC batches.
+func TestProtocolBatch(t *testing.T) {
+	c := startRPC(t, offlineServer(t))
+	c.send(`[{"jsonrpc":"2.0","id":1,"method":"ping"},{"jsonrpc":"2.0","method":"notifications/initialized"},` +
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"nope"}},7]`)
+	var got []map[string]any
+	select {
+	case line := <-c.lines:
+		if err := json.Unmarshal([]byte(line), &got); err != nil {
+			t.Fatalf("batch response %q: %v", line, err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no batch response")
+	}
+	byID := map[any]map[string]any{}
+	for _, r := range got {
+		if r["jsonrpc"] != "2.0" {
+			t.Fatalf("response without jsonrpc 2.0: %v", r)
+		}
+		byID[r["id"]] = r
+	}
+	if len(got) != 3 || byID[1.0]["result"] == nil || get(t, byID[2.0], "error", "code") != float64(codeInvalidParams) ||
+		get(t, byID[nil], "error", "code") != float64(codeInvalidRequest) {
+		t.Fatalf("batch responses = %v", got)
+	}
+
+	// Only notifications: no reply at all.
+	c.send(`[{"jsonrpc":"2.0","method":"notifications/initialized"}]`)
 	c.quiet(50 * time.Millisecond)
 }
 

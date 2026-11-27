@@ -1616,13 +1616,15 @@ func (ib *IB) ReqMktData(con *contract.Contract, genericTickList string, snapsho
 
 // CancelMktData unsubscribes from streaming market data. The ticker is found
 // by contract pointer first (works for unqualified contracts), then by key.
+// Pending ReqTickerSnapshot requests are never matched; they end on their own
+// or when their context ends.
 func (ib *IB) CancelMktData(con *contract.Contract) {
 	key := con.Key()
 	cancelID := int64(-1)
 
 	ib.state.Mu.Lock()
 	for reqID, t := range ib.state.ReqID2Ticker {
-		if t.Contract == con {
+		if t.Contract == con && !ib.snapshots.isOwned(reqID) {
 			cancelID = reqID
 			break
 		}

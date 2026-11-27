@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	ibgo "github.com/kevinzhao-dev/go-ib-async"
 	"github.com/kevinzhao-dev/go-ib-async/internal/fakegw"
 )
 
@@ -52,6 +54,10 @@ func TestParseFlagsTrading(t *testing.T) {
 		{[]string{"-market-data-type", "9"}, "must be 1-4"},
 		{[]string{"extra"}, "unexpected arguments"},
 		{[]string{"-nope"}, "not defined"},
+		{[]string{"-client-id", "0"}, "-client-id 0 is not supported"},
+		{[]string{"-enable-trading", "-journal", "j", "-max-order-qty", "NaN", "-max-order-notional", "1"}, "-max-order-qty must be a finite number"},
+		{[]string{"-enable-trading", "-journal", "j", "-max-order-qty", "1", "-max-order-notional", "+Inf"}, "-max-order-notional must be a finite number"},
+		{[]string{"-max-position", "-1"}, "-max-position must be a finite number >= 0"},
 	} {
 		if _, err := parseFlags(tc.args, noEnv, io.Discard); err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Fatalf("%v: err = %v, want %q", tc.args, err, tc.want)
@@ -123,7 +129,8 @@ func TestRunEndToEnd(t *testing.T) {
 
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		if st := call("get_status", "{}"); st["connected"] == true && st["market_data_type"] == "delayed" {
+		st := call("get_status", "{}")
+		if tr, _ := st["trading"].(map[string]any); st["connected"] == true && st["market_data_type"] == "delayed" && tr["not_ready"] == nil {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -171,5 +178,59 @@ func TestRunEndToEnd(t *testing.T) {
 	b, _ := os.ReadFile(jpath)
 	if strings.Count(string(b), `"type":"submit"`) != 1 {
 		t.Fatalf("journal = %s", b)
+	}
+}
+
+func TestSyncGate(t *testing.T) {
+	g := &syncGate{}
+	gen := g.start()
+	if err := g.check(); err == nil || !strings.Contains(err.Error(), "in progress") {
+		t.Fatalf("before sync: %v", err)
+	}
+	if !g.done(gen, errors.New("timeout")) {
+		t.Fatal("current generation")
+	}
+	if err := g.check(); err == nil || !strings.Contains(err.Error(), "sync failed (timeout), retrying") {
+		t.Fatalf("after a failed sync: %v", err)
+	}
+	if !g.done(gen, nil) || g.check() != nil {
+		t.Fatal("a successful sync makes placement ready")
+	}
+	g.reset() // disconnected
+	if g.check() == nil || g.done(gen, nil) || g.check() == nil {
+		t.Fatal("a sync of an earlier connection must not make the new one ready")
+	}
+}
+
+func TestSyncLoopRetriesUntilSynced(t *testing.T) {
+	gw, err := fakegw.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gw.Close()
+	ib := ibgo.New()
+	g := &syncGate{}
+	gen := g.start()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { syncLoop(ctx, ib, g, gen, 20*time.Millisecond); close(done) }()
+	time.Sleep(50 * time.Millisecond) // not connected: the first attempts fail
+	if err := g.check(); err == nil || !strings.Contains(err.Error(), "failed") {
+		t.Fatalf("while disconnected: %v", err)
+	}
+	cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer ccancel()
+	if err := ib.Connect(cctx, "127.0.0.1", gw.Port(), 5); err != nil {
+		t.Fatal(err)
+	}
+	defer ib.Disconnect()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sync loop did not finish after connecting")
+	}
+	if err := g.check(); err != nil {
+		t.Fatalf("after sync: %v", err)
 	}
 }

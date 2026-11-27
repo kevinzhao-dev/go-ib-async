@@ -81,7 +81,10 @@ func (c contractSpec) toContract() (*contract.Contract, error) {
 
 // resolve returns the details of the single contract matching spec.
 func (s *Server) resolve(ctx context.Context, spec contractSpec) (contract.ContractDetails, error) {
-	if spec.ConID != 0 {
+	// The cache answers con_id-only lookups. Any other field (an explicit
+	// exchange, for instance) goes to TWS, so it is not silently replaced
+	// by the cached contract's.
+	if spec.ConID != 0 && spec == (contractSpec{ConID: spec.ConID}) {
 		s.detailsMu.Lock()
 		d, ok := s.details[spec.ConID]
 		s.detailsMu.Unlock()
@@ -169,6 +172,7 @@ type tradingStatus struct {
 	Limits         *limitsView `json:"limits,omitempty"`
 	PreviewTTLSecs float64     `json:"preview_ttl_seconds,omitempty"`
 	Blocked        string      `json:"blocked,omitempty"`
+	NotReady       string      `json:"not_ready,omitempty"`
 }
 
 type limitsView struct {
@@ -247,6 +251,11 @@ func (s *Server) getStatus(_ context.Context, _ noArgs) (any, error) {
 					res.Trading.Blocked = fmt.Sprintf("account %s is not a paper account and live trading is disabled", a.ID)
 					break
 				}
+			}
+		}
+		if res.Connected && tc.Ready != nil {
+			if err := tc.Ready(); err != nil {
+				res.Trading.NotReady = "orders cannot be sent until the broker state is synchronised: " + err.Error()
 			}
 		}
 	}
@@ -560,7 +569,7 @@ func (s *Server) listOrders(_ context.Context, a listOrdersArgs) (any, error) {
 	me := s.b.ClientID()
 	res := ordersResult{Orders: []orderView{}}
 	for _, t := range trades {
-		res.Orders = append(res.Orders, viewTrade(t, me, false))
+		res.Orders = append(res.Orders, viewTrade(t, me))
 	}
 	sort.Slice(res.Orders, func(i, j int) bool {
 		if res.Orders[i].ClientID != res.Orders[j].ClientID {
@@ -585,7 +594,7 @@ func (s *Server) getOrder(_ context.Context, a getOrderArgs) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return viewTrade(t, s.b.ClientID(), true), nil
+	return withDetail(viewTrade(t, s.b.ClientID()), t, s.b.TradeFills(t)), nil
 }
 
 func (s *Server) findTrade(orderID, clientID, permID int64) (*order.Trade, error) {
