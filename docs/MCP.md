@@ -121,12 +121,14 @@ instructions.
    `-price-collar-pct 5`, `-duplicate-window 30s`. The `risk` package
    enforces them inside `PlaceOrder` and fails closed (no reference price for
    a market order means it is rejected). A bracket counts all three legs
-   against `-max-open-orders`. The open-order and position limits count this
-   API client's orders (`mcpserver.RiskState`): TWS sends no updates for other
-   clients' and manual orders, so the session's copies of those go stale.
-   Positions are the account's, whoever traded them. `mcpserver.New` and
-   `place_order` verify that the client really consults this risk manager
-   and a journal.
+   against `-max-open-orders`. `list_orders` and `get_order` read other
+   clients' and manual TWS orders as a detached snapshot
+   (`IB.OpenOrdersSnapshot`), so reading them never adds them to the orders
+   the risk limits count or to the journal: TWS sends no updates for them,
+   and tracked copies would go stale. The limits count the orders the client
+   tracks: its own, plus other clients' orders whose updates TWS sends it
+   (as it does when `-client-id` is the Master API client ID). `mcpserver.New` and `place_order` verify that the client really
+   consults this risk manager and a journal.
 4. **Current reference prices.** `place_order` refreshes the quote when the
    one cached by `preview_order` is older than half of its 60-second
    lifetime, and refuses a limit order when the price collar is on but no
@@ -172,7 +174,7 @@ Embedding instead of the binary:
 
 ```go
 var srv *mcpserver.Server
-rm := risk.New(limits, mcpserver.RiskState(ib), risk.WithPriceSource(func(c *contract.Contract) (float64, bool) {
+rm := risk.New(limits, ib, risk.WithPriceSource(func(c *contract.Contract) (float64, bool) {
 	return srv.ReferencePrice(c) // quotes the server has seen
 }))
 ib.SetRiskManager(rm)
@@ -209,7 +211,8 @@ implementation (`syncGate`).
 - **Results** are JSON objects, sent as text content and as
   `structuredContent`, with snake_case keys and unset IB values (NaN,
   `UNSET_DOUBLE`, -1 prices, volumes and bar counts, sizes without their
-  price) omitted. Daily and longer bars are dates (`YYYY-MM-DD`); contract
+  price) omitted. Daily and longer bars carry IB's session date
+  (`YYYY-MM-DD`; for an overnight futures session, the day it closes); contract
   matches are sorted by expiry. Failures are tool errors
   (`isError: true`) that the model can read and act on; protocol errors are
   only for malformed requests.

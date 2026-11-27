@@ -27,16 +27,28 @@ import (
 // TWS rejects reqOpenOrders when the API is in read-only mode; the error
 // then matches ErrReadOnlyAPI (ReqAllOpenOrders still works).
 func (ib *IB) ReqOpenOrders(ctx context.Context) ([]*order.Trade, error) {
-	return ib.reqOpenOrders(ctx, true, ib.client.ReqOpenOrders)
+	return ib.reqOpenOrders(ctx, true, false, ib.client.ReqOpenOrders)
 }
 
 // ReqAllOpenOrders requests the open orders of all API clients and TWS.
 func (ib *IB) ReqAllOpenOrders(ctx context.Context) ([]*order.Trade, error) {
-	return ib.reqOpenOrders(ctx, false, ib.client.ReqAllOpenOrders)
+	return ib.reqOpenOrders(ctx, false, false, ib.client.ReqAllOpenOrders)
 }
 
-func (ib *IB) reqOpenOrders(ctx context.Context, roRejected bool, send func() error) ([]*order.Trade, error) {
-	v, err := ib.runSingle(ctx, ib.openOrdersReq, roRejected, send)
+// OpenOrdersSnapshot returns the open orders of all API clients and TWS
+// (reqAllOpenOrders) without making the client track other clients' orders.
+// This client's orders, and orders it already tracks (as the Master API
+// client does), are its live trades. Other orders come back as detached
+// trades: they are not added to Trades or OpenTrades, fire no events and are
+// not journaled, because TWS sends this client no updates for them and a
+// tracked copy would go stale. Risk checks and the journal therefore see the
+// same orders as before the call.
+func (ib *IB) OpenOrdersSnapshot(ctx context.Context) ([]*order.Trade, error) {
+	return ib.reqOpenOrders(ctx, false, true, ib.client.ReqAllOpenOrders)
+}
+
+func (ib *IB) reqOpenOrders(ctx context.Context, roRejected, detach bool, send func() error) ([]*order.Trade, error) {
+	v, err := ib.runSingleDetach(ctx, ib.openOrdersReq, roRejected, detach, send)
 	if err != nil {
 		return nil, err
 	}

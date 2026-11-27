@@ -157,8 +157,10 @@ func viewQuote(t *market.Ticker) quoteView {
 }
 
 type barView struct {
-	// Time is the start of the bar: a date (YYYY-MM-DD) for daily and
-	// longer bars, which TWS reports without a time of day, else RFC 3339.
+	// Time is the start of an intraday bar (RFC 3339). Daily and longer
+	// bars carry the date IB labels them with (YYYY-MM-DD): the session's
+	// trade date, which for a session opening the evening before (futures)
+	// is the day it closes, not the day it starts.
 	Time     string   `json:"t"`
 	Open     float64  `json:"o"`
 	High     float64  `json:"h"`
@@ -225,8 +227,12 @@ type orderView struct {
 	AvgFillPrice *float64      `json:"avg_fill_price,omitempty"`
 	WhyHeld      string        `json:"why_held,omitempty"`
 	LastError    string        `json:"last_error,omitempty"`
-	Fills        []fillView    `json:"fills,omitempty"`
-	Log          []logView     `json:"log,omitempty"`
+	// Stale marks a status that may be out of date (get_order of another
+	// client's order that TWS no longer reports, or could not be asked).
+	Stale bool       `json:"stale,omitempty"`
+	Note  string     `json:"note,omitempty"`
+	Fills []fillView `json:"fills,omitempty"`
+	Log   []logView  `json:"log,omitempty"`
 }
 
 type logView struct {

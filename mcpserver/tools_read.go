@@ -617,27 +617,12 @@ type ordersResult struct {
 
 func (s *Server) listOrders(ctx context.Context, a listOrdersArgs) (any, error) {
 	me := s.b.ClientID()
-	own := func(t *order.Trade) bool {
-		o := t.OrderSnapshot()
-		return me != 0 && o.ClientID == me && o.OrderID > 0
-	}
 	res := ordersResult{Orders: []orderView{}}
-
-	// TWS tells this client about its own orders as they change, but about
-	// other clients' and manual TWS orders only when asked (and sends no
-	// updates for them afterwards). Ask every time, and leave out other
-	// clients' orders that TWS no longer reports as open: what the session
-	// knows about them is stale.
-	others := map[*order.Trade]bool{}
-	if err := s.requireConnected(); err != nil {
-		res.Note = "not connected: only this client's orders known to the session are listed"
-	} else if open, err := s.b.ReqAllOpenOrders(ctx); err != nil {
-		res.Note = fmt.Sprintf("could not fetch the open orders of other API clients and TWS (%v); only this client's orders are listed", err)
-	} else {
-		for _, t := range open {
-			if !own(t) && !t.IsDone() {
-				others[t] = true
-			}
+	seen := map[orderKey]bool{}
+	add := func(t *order.Trade) {
+		if k := keyOf(t); !seen[k] {
+			seen[k] = true
+			res.Orders = append(res.Orders, viewTrade(t, me))
 		}
 	}
 
@@ -646,11 +631,18 @@ func (s *Server) listOrders(ctx context.Context, a listOrdersArgs) (any, error) 
 		trades = s.b.Trades()
 	}
 	for _, t := range trades {
-		if !own(t) && !others[t] && !(a.Scope == "all" && t.IsDone()) {
-			continue
+		// This client's orders are tracked live, and a final status does
+		// not change; other working orders come from the snapshot below.
+		if isOwn(t, me) || (a.Scope == "all" && t.IsDone()) {
+			add(t)
 		}
-		res.Orders = append(res.Orders, viewTrade(t, me))
 	}
+	foreign, note := s.foreignOpenOrders(ctx, me)
+	for _, t := range foreign {
+		add(t)
+	}
+	res.Note = note
+
 	sort.Slice(res.Orders, func(i, j int) bool {
 		if res.Orders[i].ClientID != res.Orders[j].ClientID {
 			return res.Orders[i].ClientID < res.Orders[j].ClientID
@@ -663,20 +655,118 @@ func (s *Server) listOrders(ctx context.Context, a listOrdersArgs) (any, error) 
 	return res, nil
 }
 
+// foreignOpenOrders returns the working orders of other API clients and of
+// TWS as TWS reports them now, or a note why they could not be fetched. TWS
+// reports them only when asked and sends no updates for them, so they are
+// read as a detached snapshot (Broker.OpenOrdersSnapshot): they never enter
+// the client's tracked orders, journal or risk checks.
+func (s *Server) foreignOpenOrders(ctx context.Context, me int64) ([]*order.Trade, string) {
+	if err := s.requireConnected(); err != nil {
+		return nil, "not connected: other API clients' and TWS orders are not listed"
+	}
+	snap, err := s.b.OpenOrdersSnapshot(ctx)
+	if err != nil {
+		return nil, fmt.Sprintf("could not fetch the open orders of other API clients and TWS (%v); only this client's orders are listed", err)
+	}
+	var out []*order.Trade
+	for _, t := range snap {
+		if !isOwn(t, me) && !t.IsDone() {
+			out = append(out, t)
+		}
+	}
+	return out, ""
+}
+
+// isOwn reports whether t is an order of API client me, which TWS keeps the
+// client updated about. Client id 0 owns nothing (manual TWS orders).
+func isOwn(t *order.Trade, me int64) bool {
+	o := t.OrderSnapshot()
+	return me != 0 && o.ClientID == me && o.OrderID > 0
+}
+
+// orderKey identifies an order as TWS does: client and order id for API
+// orders, perm id for manual TWS orders.
+type orderKey struct{ clientID, orderID, permID int64 }
+
+func keyOf(t *order.Trade) orderKey {
+	o := t.OrderSnapshot()
+	if o.OrderID > 0 {
+		return orderKey{clientID: o.ClientID, orderID: o.OrderID}
+	}
+	perm := o.PermID
+	if perm == 0 {
+		perm = t.PermID()
+	}
+	return orderKey{permID: perm}
+}
+
 type getOrderArgs struct {
 	OrderID  int64 `json:"order_id,omitempty" desc:"Order id (of this API client unless client_id is given)."`
 	ClientID int64 `json:"client_id,omitempty" desc:"API client id that placed the order (default: this client)."`
 	PermID   int64 `json:"perm_id,omitempty" desc:"Permanent order id; identifies orders of any client."`
 }
 
-func (s *Server) getOrder(_ context.Context, a getOrderArgs) (any, error) {
-	t, err := s.findTrade(a.OrderID, a.ClientID, a.PermID)
-	if err != nil {
-		return nil, err
+func (s *Server) getOrder(ctx context.Context, a getOrderArgs) (any, error) {
+	if a.OrderID <= 0 && a.PermID <= 0 {
+		return nil, errors.New("give order_id or perm_id")
 	}
-	return withDetail(viewTrade(t, s.b.ClientID()), t, s.b.TradeFills(t)), nil
+	me := s.b.ClientID()
+	clientID := a.ClientID
+	if clientID == 0 {
+		clientID = me
+	}
+	match := func(t *order.Trade) bool {
+		o := t.OrderSnapshot()
+		if a.PermID > 0 {
+			return o.PermID == a.PermID || t.PermID() == a.PermID
+		}
+		return o.OrderID == a.OrderID && o.ClientID == clientID
+	}
+	detail := func(t *order.Trade) orderView {
+		return withDetail(viewTrade(t, me), t, s.b.TradeFills(t))
+	}
+
+	var local *order.Trade
+	for _, t := range s.b.Trades() {
+		if match(t) {
+			local = t
+			break
+		}
+	}
+	if local != nil && (isOwn(local, me) || local.IsDone()) {
+		return detail(local), nil
+	}
+	// Another client's working order, or one this session has not seen:
+	// what the session knows of those can be stale, so ask TWS.
+	foreign, note := s.foreignOpenOrders(ctx, me)
+	for _, t := range foreign {
+		if match(t) {
+			return detail(t), nil
+		}
+	}
+	if local == nil {
+		what := fmt.Sprintf("no order %d of client %d", a.OrderID, clientID)
+		if a.PermID > 0 {
+			what = fmt.Sprintf("no order with perm_id %d", a.PermID)
+		}
+		if note != "" {
+			return nil, fmt.Errorf("%s in this session, and %s", what, note)
+		}
+		return nil, fmt.Errorf("%s in this session or open at TWS (see list_orders; fills are in get_executions)", what)
+	}
+	v := detail(local)
+	v.Stale = true
+	if note != "" {
+		v.Note = "this is the last status the session saw; the current one could not be checked: " + note
+	} else {
+		v.Note = "TWS no longer reports this order as open, so it was filled or cancelled after the session last saw it (TWS sends no updates for other clients' orders); the status is the last one seen, fills are in get_executions"
+	}
+	return v, nil
 }
 
+// findTrade finds an order of this session by order id (of clientID,
+// default this client) or perm id. The trading tools use it for this
+// client's orders, which the session tracks live.
 func (s *Server) findTrade(orderID, clientID, permID int64) (*order.Trade, error) {
 	if orderID <= 0 && permID <= 0 {
 		return nil, errors.New("give order_id or perm_id")

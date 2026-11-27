@@ -85,7 +85,7 @@ func newHarness(t *testing.T, o harnessOpts) *harness {
 		if limits.MaxOrderQuantity == 0 {
 			limits = defaultLimits()
 		}
-		h.rm = risk.New(limits, RiskState(ib), risk.WithPriceSource(func(c *contract.Contract) (float64, bool) {
+		h.rm = risk.New(limits, ib, risk.WithPriceSource(func(c *contract.Contract) (float64, bool) {
 			return h.srv.ReferencePrice(c)
 		}))
 		ib.SetRiskManager(h.rm)

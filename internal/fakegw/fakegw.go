@@ -256,6 +256,24 @@ func (s *Server) SetOrderStatus(permID int64, status string) {
 	}
 }
 
+// NotifyOrder sends the openOrder and orderStatus of an order unprompted, as
+// TWS does for every client's orders when the connection is the Master API
+// client.
+func (s *Server) NotifyOrder(permID int64) {
+	s.mu.Lock()
+	o := s.orders[permID]
+	var msgs [][]byte
+	if o != nil {
+		cp := *o
+		msgs = [][]byte{encodeOpenOrder(&cp, false, nil), encodeOrderStatus(&cp)}
+	}
+	s.mu.Unlock()
+	s.sendAll(msgs)
+}
+
+// Send sends raw messages (built with Msg) to the connected client.
+func (s *Server) Send(msgs ...[]byte) { s.sendAll(msgs) }
+
 // SetPosition seeds a position.
 func (s *Server) SetPosition(c Contract, qty, avgCost float64) {
 	s.mu.Lock()

@@ -180,9 +180,8 @@ func run(ctx context.Context, cfg *config, in io.Reader, out io.Writer) error {
 		defer j.Close()
 		ib.SetJournal(j)
 		// The reference price for market-order notional and the price
-		// collar comes from the quotes the server has seen; the open-order
-		// and position limits count this client's orders (RiskState).
-		rm := risk.New(cfg.limits, mcpserver.RiskState(ib), risk.WithPriceSource(func(c *contract.Contract) (float64, bool) {
+		// collar comes from the quotes the server has seen.
+		rm := risk.New(cfg.limits, ib, risk.WithPriceSource(func(c *contract.Contract) (float64, bool) {
 			return srv.ReferencePrice(c)
 		}))
 		ib.SetRiskManager(rm)

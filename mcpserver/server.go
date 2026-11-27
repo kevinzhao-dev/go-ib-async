@@ -48,7 +48,9 @@ type Broker interface {
 	ReqPositions(ctx context.Context) ([]account.Position, error)
 	ReqAccountSummary(ctx context.Context, groupName, tags string) ([]account.AccountValue, error)
 	ReqExecutions(ctx context.Context, filter order.ExecutionFilter) ([]order.Fill, error)
-	ReqAllOpenOrders(ctx context.Context) ([]*order.Trade, error)
+	// OpenOrdersSnapshot returns every client's open orders without making
+	// the client track other clients' orders (see ibgo.IB.OpenOrdersSnapshot).
+	OpenOrdersSnapshot(ctx context.Context) ([]*order.Trade, error)
 	Trades() []*order.Trade
 	OpenTrades() []*order.Trade
 	TradeFills(t *order.Trade) []order.Fill
@@ -248,35 +250,6 @@ func (s *Server) ReferencePrice(con *contract.Contract) (float64, bool) {
 	return s.referenceWithin(con, s.cfg.QuoteMaxAge)
 }
 
-// RiskState adapts the client for risk.New: positions as the client reports
-// them, and the open orders of this API client only. The client also learns
-// about other clients' and manual TWS orders (list_orders asks TWS for them)
-// but receives no updates for them, so they would go stale in the risk
-// manager's open-order and position limits. The agent's limits therefore
-// cover its own orders, as when TWS only reports those.
-//
-//	rm := risk.New(limits, mcpserver.RiskState(ib), risk.WithPriceSource(...))
-func RiskState(c RiskStateSource) risk.StateSource { return ownOrdersState{c} }
-
-// RiskStateSource is the part of *ibgo.IB RiskState needs.
-type RiskStateSource interface {
-	risk.StateSource
-	ClientID() int64
-}
-
-type ownOrdersState struct{ RiskStateSource }
-
-func (s ownOrdersState) OpenTrades() []*order.Trade {
-	me := s.ClientID()
-	var out []*order.Trade
-	for _, t := range s.RiskStateSource.OpenTrades() {
-		if o := t.OrderSnapshot(); o.ClientID == me && o.OrderID > 0 {
-			out = append(out, t)
-		}
-	}
-	return out
-}
-
 // referenceWithin returns the last quoted price of con if it is younger
 // than maxAge.
 func (s *Server) referenceWithin(con *contract.Contract, maxAge time.Duration) (float64, bool) {
@@ -375,7 +348,7 @@ func (s *Server) registerTools() {
 		"One-off market data snapshot (bid, ask, last, sizes, open/high/low/close, volume) for one contract. market_data_type tells whether the data is live or delayed. Takes up to ~11s when some fields are unavailable.",
 		readOnly, s.getQuote)
 	addTool(s, "get_historical_bars", "Get historical bars",
-		"Historical OHLCV bars for one contract. duration is '<n> <S|D|W|M|Y>' (e.g. '5 D', '1 Y'); IB limits how many bars one request may return for small bar sizes. Each bar's t is its start: a date (YYYY-MM-DD) for daily and longer bars, else an RFC 3339 time.",
+		"Historical OHLCV bars for one contract. duration is '<n> <S|D|W|M|Y>' (e.g. '5 D', '1 Y'); IB limits how many bars one request may return for small bar sizes. Each bar's t: for intraday bars its start time (RFC 3339); for daily and longer bars the date IB labels it with (YYYY-MM-DD), the session's trade date, so a futures session that opens the evening before carries the day it closes.",
 		readOnly, s.getHistoricalBars)
 	addTool(s, "get_option_chain", "Get option chain",
 		"Option expirations and strikes for an underlying, per exchange and trading class. Use the result to build option contracts (sec_type OPT, expiry, strike, right).",
@@ -387,10 +360,10 @@ func (s *Server) registerTools() {
 		"Account values such as NetLiquidation, TotalCashValue, BuyingPower, AvailableFunds, margin requirements.",
 		readOnly, s.getAccountSummary)
 	addTool(s, "list_orders", "List orders",
-		"Open orders of every API client and manual TWS orders (asked from TWS on each call), or with scope=all also the filled and cancelled orders this session has seen. own=true marks orders of this API client, which are the only ones the trading tools can modify or cancel.",
+		"Open orders of every API client and manual TWS orders (other clients' orders are asked from TWS on each call), or with scope=all also the filled and cancelled orders this session has seen. own=true marks orders of this API client, which are the only ones the trading tools can modify or cancel.",
 		readOnly, s.listOrders)
 	addTool(s, "get_order", "Get order",
-		"Full state of one order: status, fills with commissions, and its event log (including rejection reasons).",
+		"Full state of one order: status, fills with commissions, and its event log (including rejection reasons). Orders of other clients are checked with TWS; stale=true means the status is the last one seen and may be out of date (note says why).",
 		readOnly, s.getOrder)
 	addTool(s, "get_executions", "Get executions",
 		"Today's executions (fills) with commission and realized P&L, optionally filtered.",

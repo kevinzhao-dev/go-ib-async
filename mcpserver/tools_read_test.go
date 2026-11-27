@@ -1,6 +1,7 @@
 package mcpserver
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/kevinzhao-dev/go-ib-async/account"
 	"github.com/kevinzhao-dev/go-ib-async/contract"
 	"github.com/kevinzhao-dev/go-ib-async/internal/fakegw"
+	"github.com/kevinzhao-dev/go-ib-async/journal"
 	"github.com/kevinzhao-dev/go-ib-async/market"
 	"github.com/kevinzhao-dev/go-ib-async/order"
 )
@@ -435,7 +437,7 @@ func TestListOrdersIncludesOtherClients(t *testing.T) {
 	limits.MaxOpenOrders = 2
 	h := newHarness(t, harnessOpts{trading: true, limits: limits})
 	msft := fakegw.Contract{ConID: msftConID, Symbol: "MSFT", SecType: "STK", Exchange: "SMART", Currency: "USD"}
-	h.gw.AddOrder(fakegw.Order{Contract: msft, Action: "SELL", Qty: 3, OrderType: "STP", AuxPrice: 380, TIF: "GTC", Account: "DU123456"})
+	manual := h.gw.AddOrder(fakegw.Order{Contract: msft, Action: "SELL", Qty: 3, OrderType: "STP", AuxPrice: 380, TIF: "GTC", Account: "DU123456"})
 	other := h.gw.AddOrder(fakegw.Order{ClientID: 3, OrderID: 12, Contract: msft, Action: "BUY", Qty: 1, OrderType: "LMT", LmtPrice: 390, TIF: "DAY", Account: "DU123456"})
 	con := &contract.Contract{ConID: aaplConID, Symbol: "AAPL", SecType: "STK", Exchange: "SMART", Currency: "USD"}
 	mine, err := h.ib.PlaceOrder(con, order.LimitOrder("BUY", 2, 150))
@@ -468,8 +470,29 @@ func TestListOrdersIncludesOtherClients(t *testing.T) {
 		}
 	}
 
-	// The risk limits count this client's orders only: the foreign orders the
-	// session now knows of do not use up max_open_orders (2).
+	// get_order asks TWS about another client's order: the current one is
+	// found, one that is no longer open is not reported as still working.
+	if o := h.ok("get_order", map[string]any{"perm_id": manual}); o["status"] != "Submitted" || o["own"] != false || o["stale"] != nil {
+		t.Fatalf("manual order = %v", o)
+	}
+	h.fail("get_order", map[string]any{"perm_id": other}, "no order with perm_id")
+	h.fail("get_order", map[string]any{"order_id": 12, "client_id": 3}, "no order 12 of client 3 in this session or open at TWS")
+
+	// The snapshot never enters the client's tracked orders or journal:
+	// the foreign orders do not use up max_open_orders (2), and replaying
+	// the journal against the client's trades finds no discrepancy.
+	recs, err := journal.Load(h.jpath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range recs {
+		if r.ClientID != testClientID {
+			t.Fatalf("journal record of another client's order: %+v", r)
+		}
+	}
+	if d := journal.Reconcile(journal.Replay(recs), h.ib.Trades(), testClientID); len(d) != 0 {
+		t.Fatalf("discrepancies = %+v", d)
+	}
 	if _, err := h.ib.PlaceOrder(con, order.LimitOrder("BUY", 3, 150)); err != nil {
 		t.Fatalf("second own order: %v", err)
 	}
@@ -486,6 +509,79 @@ func TestListOrdersIncludesOtherClients(t *testing.T) {
 	if note, _ := off.ok("list_orders", nil)["note"].(string); !strings.Contains(note, "not connected") {
 		t.Fatalf("offline note = %q", note)
 	}
+}
+
+// A Master API client is sent updates for every client's orders, so it
+// tracks them, and the risk limits keep counting them; orders only seen in
+// a list_orders snapshot are not counted. A tracked order that TWS stops
+// reporting is shown as stale by get_order.
+func TestTrackedForeignOrders(t *testing.T) {
+	limits := defaultLimits()
+	limits.MaxPositionQuantity = 10
+	h := newHarness(t, harnessOpts{trading: true, limits: limits})
+	aapl := fakegw.Contract{ConID: aaplConID, Symbol: "AAPL", SecType: "STK", Exchange: "SMART", Currency: "USD"}
+	foreign := h.gw.AddOrder(fakegw.Order{ClientID: 3, OrderID: 12, Contract: aapl, Action: "BUY", Qty: 8, OrderType: "LMT", LmtPrice: 140, TIF: "DAY", Account: "DU123456"})
+	con := &contract.Contract{ConID: aaplConID, Symbol: "AAPL", SecType: "STK", Exchange: "SMART", Currency: "USD"}
+
+	h.ok("list_orders", nil) // snapshot only: not tracked, not counted
+	tr, err := h.ib.PlaceOrder(con, order.LimitOrder("BUY", 5, 150))
+	if err != nil {
+		t.Fatalf("BUY 5 with an untracked foreign BUY 8: %v", err)
+	}
+	if _, err := h.ib.CancelOrder(tr.Order); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "cancelled", tr.IsDone)
+
+	h.gw.NotifyOrder(foreign) // as TWS does for the Master API client
+	waitFor(t, "tracked", func() bool { return len(h.ib.OpenTrades()) == 1 })
+	if _, err := h.ib.PlaceOrder(con, order.LimitOrder("BUY", 5, 151)); err == nil || !strings.Contains(err.Error(), "position") {
+		t.Fatalf("BUY 5 with a tracked foreign BUY 8 at max_position 10: %v", err)
+	}
+	if res := h.ok("list_orders", nil); len(res["orders"].([]any)) != 1 {
+		t.Fatalf("tracked order listed once: %v", res)
+	}
+
+	h.gw.SetOrderStatus(foreign, "Cancelled") // and no update reaches the client
+	o := h.ok("get_order", map[string]any{"perm_id": foreign})
+	if o["stale"] != true || o["status"] != "Submitted" || !strings.Contains(o["note"].(string), "no longer reports") {
+		t.Fatalf("stale order = %v", o)
+	}
+	if res := h.ok("list_orders", nil); len(res["orders"].([]any)) != 0 {
+		t.Fatalf("stale order listed: %v", res)
+	}
+}
+
+// list_orders renders other clients' orders from the snapshot itself, so a
+// Broker whose snapshot returns copies instead of the tracked trades works.
+func TestListOrdersWithCopyingBroker(t *testing.T) {
+	h := newHarness(t, harnessOpts{broker: func(ib *ibgo.IB) Broker { return copyingBroker{ib} }})
+	msft := fakegw.Contract{ConID: msftConID, Symbol: "MSFT", SecType: "STK", Exchange: "SMART", Currency: "USD"}
+	perm := h.gw.AddOrder(fakegw.Order{Contract: msft, Action: "SELL", Qty: 3, OrderType: "LMT", LmtPrice: 410, TIF: "GTC", Account: "DU123456"})
+	res := h.ok("list_orders", nil)
+	if os := res["orders"].([]any); len(os) != 1 || get(t, os[0], "perm_id") != float64(perm) {
+		t.Fatalf("orders = %v", res)
+	}
+	if o := h.ok("get_order", map[string]any{"perm_id": perm}); o["limit_price"] != 410.0 {
+		t.Fatalf("order = %v", o)
+	}
+}
+
+type copyingBroker struct{ *ibgo.IB }
+
+func (b copyingBroker) OpenOrdersSnapshot(ctx context.Context) ([]*order.Trade, error) {
+	snap, err := b.IB.OpenOrdersSnapshot(ctx)
+	out := make([]*order.Trade, len(snap))
+	for i, t := range snap {
+		o, st := t.OrderSnapshot(), t.StatusSnapshot()
+		c := order.NewTrade(t.Contract, &o)
+		c.SetStatus(st.Status, time.Now(), "", 0)
+		if c.PermID() == 0 {
+			c.SetPermID(o.PermID)
+		}
+		out[i] = c
+	}
+	return out, err
 }
 
 func TestOrderViewFields(t *testing.T) {
