@@ -181,6 +181,15 @@ func TestRequestEncoding(t *testing.T) {
 			join(s("88", "23"), conFields, s("0", "1", "1 week"))},
 		{"cancelHistogramData", 178, func(c *Client) error { return c.CancelHistogramData(23) }, s("89", "23")},
 		{"reqUserInfo", 178, func(c *Client) error { return c.ReqUserInfo(24) }, s("104", "24")},
+		{"reqMktDepth", 178, func(c *Client) error { return c.ReqMktDepth(25, testContract(), 5, true, nil) },
+			join(s("10", "5", "25"), conFields, s("5", "1", ""))},
+		{"cancelMktDepth", 178, func(c *Client) error { return c.CancelMktDepth(25, true) }, s("11", "1", "25", "1")},
+		{"reqTickByTickData", 178, func(c *Client) error { return c.ReqTickByTickData(26, testContract(), "BidAsk", 0, false) },
+			join(s("97", "26"), conFields, s("BidAsk", "0", "0"))},
+		{"cancelTickByTickData", 178, func(c *Client) error { return c.CancelTickByTickData(26) }, s("98", "26")},
+		{"reqHistoricalTicks", 178, func(c *Client) error {
+			return c.ReqHistoricalTicks(27, testContract(), "", "20261125 15:59:00 US/Eastern", 100, "TRADES", true, false, nil)
+		}, join(s("96", "27"), conFields, s("0", "", "20261125 15:59:00 US/Eastern", "100", "TRADES", "1", "0", ""))},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

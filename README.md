@@ -2,8 +2,11 @@
 
 Go client for the Interactive Brokers TWS/Gateway API. Port of the Python [ib_async](https://github.com/ib-api-reloaded/ib_async) library.
 
-> **Status: Core subset. Not production-ready. Not full parity with ib_async.**
-> See [STATUS.md](STATUS.md) for the complete parity matrix including what's implemented, partial, and missing.
+> **Status:** market data, account, contract and historical APIs are verified
+> against a live IB Gateway (read-only, server version 178). Order placement
+> is tested end to end against a fake gateway only; run the paper-account
+> trading test before trading live. Not full parity with ib_async: see
+> [STATUS.md](STATUS.md).
 
 ## Quick Start
 
@@ -22,28 +25,22 @@ import (
 
 func main() {
     ib := ibgo.New()
-    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
     defer cancel()
 
-    // Connect to IB Gateway (paper: 4002, live: 4001)
+    // Connect to IB Gateway (paper: 4002, live: 4001; TWS: 7497/7496)
     if err := ib.Connect(ctx, "127.0.0.1", 4002, 1); err != nil {
         log.Fatal(err)
     }
     defer ib.Disconnect()
 
-    // Request contract details
-    details, err := ib.ReqContractDetails(ctx, contract.Stock("AAPL", "SMART", "USD"))
-    if err != nil {
+    // Fill in conId etc. (errors.Is: ErrContractNotFound, ErrAmbiguousContract)
+    aapl := contract.Stock("AAPL", "SMART", "USD")
+    if err := ib.QualifyContracts(ctx, aapl); err != nil {
         log.Fatal(err)
     }
-    if len(details) == 0 {
-        log.Fatal("no contract details returned")
-    }
-    fmt.Printf("AAPL conId=%d\n", details[0].Contract.ConID)
 
-    // Request historical data
-    bars, err := ib.ReqHistoricalData(ctx, details[0].Contract,
-        "", "5 D", "1 day", "TRADES", true, 1)
+    bars, err := ib.ReqHistoricalData(ctx, aapl, "", "5 D", "1 day", "TRADES", true, 1)
     if err != nil {
         log.Fatal(err)
     }
@@ -52,16 +49,42 @@ func main() {
             b.Date.Format("2006-01-02"), b.Open, b.High, b.Low, b.Close)
     }
 
-    // Market data snapshot (idiomatic: use event, not sleep)
-    ticker, err := ib.ReqMktData(details[0].Contract, "", true, false)
+    // Free delayed data when the account has no live subscription.
+    ib.ReqMarketDataType(ibgo.MarketDataDelayed)
+    tickers, err := ib.ReqTickers(ctx, aapl) // waits for the snapshot
     if err != nil {
-        log.Fatal(err)
+        log.Print(err) // e.g. missing permissions; tickers are still returned
     }
-    ch := ticker.UpdateEvent.Once()
-    <-ch // wait for first tick update
-    fmt.Printf("bid=%.2f ask=%.2f last=%.2f\n", ticker.Bid, ticker.Ask, ticker.Last)
+    t := tickers[0].Snapshot() // consistent copy, safe from any goroutine
+    fmt.Printf("bid=%v ask=%v last=%v close=%v\n", t.Bid, t.Ask, t.Last, t.Close)
 }
 ```
+
+## Market data
+
+```go
+ticker, _ := ib.ReqMktData(con, "233", false, false)      // streaming quotes
+ib.ReqTickByTickData(con, ibgo.TickByTickBidAsk, 0, false) // same Ticker
+ib.ReqMktDepth(con, 10, false)                              // ticker.DomBids / DomAsks
+ticker.UpdateEvent.Subscribe(func(t *market.Ticker) {
+    // runs on the reader goroutine: fields can be read directly here
+    fmt.Println(t.Bid, t.Ask, len(t.TickByTicks))
+})
+// From other goroutines use ticker.Snapshot() (or RLock/RUnlock).
+
+rt, _ := ib.ReqRealTimeBars(con, 5, "TRADES", false)
+bars, _ := ib.ReqHistoricalDataStream(ctx, con, "1 D", "1 min", "TRADES", false, 1)
+bars.UpdateEvent.Subscribe(func(b *market.BarDataList) { /* b.NewBar */ })
+
+ib.ReqAccountUpdates(ctx, "")   // AccountValues(), Portfolio(), PortfolioEvent
+ib.ReqPnL("", "")               // PnL(), PnLEvent
+ib.ReqPnLSingle("", "", conID)  // PnLSingles(), PnLSingleEvent
+```
+
+Options: `ticker.ModelGreeks` / `BidGreeks` / `AskGreeks` / `LastGreeks`
+(`nil` fields mean "not computed"). Other lookups: `ReqSecDefOptParams`,
+`ReqMatchingSymbols`, `ReqMarketRule`, `ReqHeadTimeStamp`,
+`ReqHistoricalTicks`, `ReqCurrentTime`.
 
 ## Trading
 
@@ -112,12 +135,14 @@ not the struct fields: trades are updated on the reader goroutine.
 ```go
 cfg := ibgo.DefaultReconnectConfig() // heartbeat + SyncOrders after each connect
 go ib.ConnectWithReconnect(ctx, "127.0.0.1", 4002, 1, cfg, func() {
-    // re-subscribe market data here
+    // called after every (re)connect
 })
 ```
 
 An automatic reconnect keeps orders, fills and positions, so `*order.Trade`
-objects held by the application stay valid. `SyncOrders` then refreshes open
+objects held by the application stay valid, and re-requests every streaming
+subscription (market data, tick-by-tick, depth, bars, PnL, account updates)
+and the market data type, so `Ticker` and bar list objects keep updating. `SyncOrders` then refreshes open
 orders, fetches executions (missed fills are added to their trades),
 finalises orders that completed while disconnected and refreshes positions.
 After a process restart use `SyncOrders(ctx, SyncOptions{IncludeCompleted: true})`
@@ -128,16 +153,17 @@ compare the journal with what the broker reports.
 
 | Feature | Status |
 |---------|--------|
-| Connect / Disconnect / handshake | Verified live |
-| Contract Details, Historical Data, Market Data (snapshot) | Verified live |
-| Positions, Account Summary, Option Chains | Verified live (positions decoder fixed since) |
+| Connect / Disconnect / handshake, reconnect + heartbeat | Verified live (incl. dropped connection and subscription restore) |
+| Contract details, `QualifyContracts`, symbol search, market rules, option chains | Verified live |
+| Historical bars (incl. keep-up-to-date), historical ticks, head timestamp | Verified live |
+| Market data: snapshots (`ReqTickers`), streaming, delayed data, greeks, tick-by-tick, depth, real-time bars | Verified live |
+| Positions, account summary, account updates / portfolio, PnL, PnL single | Verified live |
+| Read-only order queries (`ReqAllOpenOrders`, `ReqExecutions`, `SyncOrders`) | Verified live (read-only API mode) |
+| Read-only API mode detection (`ErrReadOnlyAPI`) | Verified live |
 | Place / Modify / Cancel order, partial fills, commissions | E2E-tested against fake gateway |
-| Open order sync (`ReqOpenOrders`, `ReqAllOpenOrders`, `ReqExecutions`, `ReqCompletedOrders`, `SyncOrders`) | E2E-tested against fake gateway |
-| Bracket orders, OCA helper, WhatIf | E2E-tested against fake gateway |
-| Reconnect with heartbeat + post-connect sync | E2E-tested against fake gateway |
+| Bracket orders, OCA helper, WhatIf, completed orders | E2E-tested against fake gateway |
 | Pre-trade risk manager (`risk`) | Unit + E2E tested |
 | Persistent order journal (`journal`) | Unit + E2E tested |
-| Real-Time Bars | Implemented, not verified |
 
 "E2E-tested against fake gateway" means the real client (protocol, decoders,
 state, events) runs against `internal/fakegw`, an in-process TWS fake that
@@ -149,6 +175,26 @@ IB_E2E_TRADING=1 go test -tags=integration -v -run TestIntegrationTrading .
 ```
 
 See [STATUS.md](STATUS.md) for full details.
+
+### Testing against a live account safely
+
+`cmd/ibguard` is a proxy that blocks every order message (place, cancel,
+global cancel, exercise, ...) at the socket level, and `cmd/smoketest` runs
+~45 read-only checks with sanity checks on the decoded values:
+
+```bash
+go run ./cmd/ibguard -upstream 127.0.0.1:4001 -listen 127.0.0.1:4011 &
+go run ./cmd/smoketest -port 4011 -guard-pid $(pgrep -x ibguard)
+```
+
+`-guard-pid` enables the reconnect check (the guard drops the connection on
+SIGUSR1). Pass the guard's own pid, which it logs at startup; under `go run`,
+`$!` is the `go` command, which does not forward the signal.
+
+Keep "Read-Only API" enabled in TWS/Gateway while developing against a live
+account: orders, `ReqOpenOrders` and `ReqCompletedOrders` are then rejected
+(the errors match `ErrReadOnlyAPI`; `SyncOrders` falls back to
+`ReqAllOpenOrders`).
 
 ## Architecture
 
@@ -167,10 +213,11 @@ ibgo (root)          IB facade - Connect, public API, message dispatch
 ```
 
 **Concurrency model:** Single reader goroutine processes all inbound messages
-and runs event callbacks. Request-response matching via per-request buffered
-channels. State maps are guarded by a `sync.RWMutex`; `Trade` has its own lock
-and accessor methods. Order placement is serialised so risk checks cannot be
-raced.
+and runs event callbacks (keep callbacks short; hand work to your own
+goroutines). Request-response matching via per-request buffered channels.
+State maps are guarded by a `sync.RWMutex`; `Trade`, `Ticker`, `BarDataList`
+and `RealTimeBarList` have their own locks (`Snapshot()` for reads from other
+goroutines). Order placement is serialised so risk checks cannot be raced.
 
 ## Development
 
@@ -183,7 +230,7 @@ make test-shuffle     # race detector + random test order
 make cover-check      # coverage.out/.txt/.html, fails below COVERAGE_MIN (default 90%)
 make fuzz-all         # every fuzz target, FUZZTIME each (default 10s)
 make test-live        # integration tests (needs Gateway running)
-make smoke            # live smoke test (needs Gateway)
+make smoke            # read-only live smoke test (needs Gateway; see above)
 make bench            # benchmarks
 ```
 
@@ -211,10 +258,9 @@ GitHub Actions (`.github/workflows/ci.yml`) runs on pushes and PRs to `main`:
 
 ## Known Limitations
 
-- **Not production-ready for live trading.** The trading paths are tested against a fake gateway, not yet against a live account.
-- **Ticker and bar-list fields are not locked.** They are written on the reader goroutine; read them inside `UpdateEvent`/`PendingTickersEvent` callbacks, or accept racy reads.
-- **Market data subscriptions are not restored** after a reconnect; re-subscribe in the `onConnect` callback.
-- **Partial message coverage.** Many advanced request types (tick-by-tick, scanners, news, PnL subscriptions, ...) are not implemented yet; see STATUS.md.
+- **Order paths not yet verified against a live (paper) account.** Run the paper trading test above before trading live.
+- **Partial message coverage.** Scanners, news, fundamental data, histograms, FA and WSH requests are not implemented yet; see STATUS.md.
+- Errors not tied to a request (e.g. data farm status) only reach `ErrorEvent`; streaming subscriptions that fail (e.g. no permissions) stay registered until cancelled.
 
 ## Requirements
 

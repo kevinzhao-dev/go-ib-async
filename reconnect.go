@@ -49,8 +49,11 @@ func DefaultReconnectConfig() ReconnectConfig {
 // MaxRetries consecutive attempts fail (returns the last error).
 //
 // Unlike Disconnect, an automatic reconnect keeps orders, fills and positions
-// so Trade objects held by the application stay valid; market data
-// subscriptions are dropped and must be re-requested in onConnect.
+// so Trade objects held by the application stay valid. Streaming
+// subscriptions (ReqMktData, ReqTickByTickData, ReqMktDepth,
+// ReqRealTimeBars, ReqHistoricalDataStream, ReqPnL, ReqPnLSingle,
+// ReqAccountUpdates) and the market data type are re-requested
+// automatically, so the Ticker / bar list objects keep updating.
 // onConnect is called after each successful (re)connection (and sync).
 func (ib *IB) ConnectWithReconnect(ctx context.Context, host string, port, clientID int, cfg ReconnectConfig, onConnect func()) error {
 	connectTimeout := cfg.ConnectTimeout
@@ -107,6 +110,8 @@ func (ib *IB) ConnectWithReconnect(ctx context.Context, host string, port, clien
 			}
 			cancelSync()
 		}
+
+		ib.restoreSubscriptions()
 
 		if onConnect != nil {
 			onConnect()

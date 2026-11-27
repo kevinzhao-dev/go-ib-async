@@ -641,6 +641,28 @@ func (c *Client) CancelHistogramData(reqID int64) error {
 	return c.Send(MsgCancelHistogramData, reqID)
 }
 
+func (c *Client) ReqMktDepth(reqID int64, con *contract.Contract, numRows int, isSmartDepth bool, mktDepthOptions []contract.TagValue) error {
+	return c.Send(MsgReqMktDepth, 5, reqID, con, numRows, isSmartDepth, mktDepthOptions)
+}
+
+func (c *Client) CancelMktDepth(reqID int64, isSmartDepth bool) error {
+	return c.Send(MsgCancelMktDepth, 1, reqID, isSmartDepth)
+}
+
+// ReqTickByTickData: tickType is "Last", "AllLast", "BidAsk" or "MidPoint".
+func (c *Client) ReqTickByTickData(reqID int64, con *contract.Contract, tickType string, numberOfTicks int, ignoreSize bool) error {
+	return c.Send(MsgReqTickByTickData, reqID, con, tickType, numberOfTicks, ignoreSize)
+}
+
+func (c *Client) CancelTickByTickData(reqID int64) error {
+	return c.Send(MsgCancelTickByTickData, reqID)
+}
+
+// ReqHistoricalTicks: whatToShow is "TRADES", "BID_ASK" or "MIDPOINT".
+func (c *Client) ReqHistoricalTicks(reqID int64, con *contract.Contract, startDateTime, endDateTime string, numberOfTicks int, whatToShow string, useRTH, ignoreSize bool, miscOptions []contract.TagValue) error {
+	return c.Send(MsgReqHistoricalTicks, reqID, con, con.IncludeExpired, startDateTime, endDateTime, numberOfTicks, whatToShow, useRTH, ignoreSize, miscOptions)
+}
+
 func (c *Client) ReqUserInfo(reqID int64) error {
 	return c.Send(MsgReqUserInfo, reqID)
 }

@@ -2,7 +2,10 @@
 package market
 
 import (
+	"maps"
 	"math"
+	"slices"
+	"sync"
 	"time"
 
 	"github.com/kevinzhao-dev/go-ib-async/contract"
@@ -12,7 +15,55 @@ import (
 var nan = math.NaN()
 
 // Ticker holds current market data for a contract.
+//
+// The client updates a Ticker on its reader goroutine, under the ticker's
+// lock. Inside UpdateEvent / PendingTickersEvent callbacks (which run on
+// that goroutine) the fields can be read directly. From any other goroutine
+// use Snapshot, or hold RLock while reading several fields.
 type Ticker struct {
+	TickerData
+
+	mu sync.RWMutex
+
+	// UpdateEvent fires (on the reader goroutine) after each network batch
+	// that changed the ticker.
+	UpdateEvent event.Event[*Ticker]
+}
+
+// Lock acquires the write lock. It is used by the client while applying
+// updates; applications only need RLock/RUnlock or Snapshot.
+func (t *Ticker) Lock() { t.mu.Lock() }
+
+// Unlock releases the write lock.
+func (t *Ticker) Unlock() { t.mu.Unlock() }
+
+// RLock acquires the read lock: hold it while reading several fields from a
+// goroutine other than the client's reader goroutine.
+func (t *Ticker) RLock() { t.mu.RLock() }
+
+// RUnlock releases the read lock.
+func (t *Ticker) RUnlock() { t.mu.RUnlock() }
+
+// Snapshot returns a consistent copy of the ticker data that is safe to use
+// from any goroutine. Slices and maps are copied; pointer fields (greeks,
+// EFP, dividends) are replaced, never mutated, by the client so they are
+// shared.
+func (t *Ticker) Snapshot() TickerData {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	d := t.TickerData
+	d.Ticks = slices.Clone(d.Ticks)
+	d.TickByTicks = slices.Clone(d.TickByTicks)
+	d.DomBids = slices.Clone(d.DomBids)
+	d.DomAsks = slices.Clone(d.DomAsks)
+	d.DomTicks = slices.Clone(d.DomTicks)
+	d.FundamentalRatios = maps.Clone(d.FundamentalRatios)
+	return d
+}
+
+// TickerData is the market data of a Ticker (see Ticker.Snapshot).
+// Numeric fields are NaN until the first value arrives.
+type TickerData struct {
 	Contract       *contract.Contract
 	Time           time.Time
 	Timestamp      float64
@@ -169,17 +220,14 @@ type Ticker struct {
 	DomAsks     []DOMLevel
 	DomTicks    []MktDepthData
 
-	// Metadata
+	// Metadata (tickReqParams)
 	BboExchange         string
 	SnapshotPermissions int
-
-	// Event
-	UpdateEvent event.Event[*Ticker]
 }
 
 // NewTicker creates a Ticker with NaN defaults for all numeric fields.
 func NewTicker(c *contract.Contract) *Ticker {
-	return &Ticker{
+	return &Ticker{TickerData: TickerData{
 		Contract:       c,
 		MarketDataType: 1,
 		MinTick:        nan, Bid: nan, BidSize: nan, Ask: nan, AskSize: nan,
@@ -204,7 +252,7 @@ func NewTicker(c *contract.Contract) *Ticker {
 		EtfNavLast: nan, EtfFrozenNavLast: nan, EtfNavHigh: nan, EtfNavLow: nan,
 		EstimatedIpoMidpoint: nan, FinalIpoLast: nan,
 		AuctionVolume: nan, AuctionPrice: nan, AuctionImbalance: nan, RegulatoryImbalance: nan,
-	}
+	}}
 }
 
 // IsUnset returns true if the value is NaN.
@@ -213,13 +261,13 @@ func IsUnset(value float64) bool {
 }
 
 // HasBidAsk returns true if bid and ask are valid.
-func (t *Ticker) HasBidAsk() bool {
+func (t TickerData) HasBidAsk() bool {
 	return t.Bid != -1 && !IsUnset(t.Bid) && t.BidSize > 0 &&
 		t.Ask != -1 && !IsUnset(t.Ask) && t.AskSize > 0
 }
 
 // Midpoint returns the average of bid and ask, or NaN if not available.
-func (t *Ticker) Midpoint() float64 {
+func (t TickerData) Midpoint() float64 {
 	if t.HasBidAsk() {
 		return (t.Bid + t.Ask) * 0.5
 	}
@@ -227,7 +275,7 @@ func (t *Ticker) Midpoint() float64 {
 }
 
 // MarketPrice returns the best available price.
-func (t *Ticker) MarketPrice() float64 {
+func (t TickerData) MarketPrice() float64 {
 	if t.HasBidAsk() {
 		if t.Bid <= t.Last && t.Last <= t.Ask {
 			return t.Last

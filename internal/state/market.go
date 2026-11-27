@@ -32,9 +32,11 @@ func (m *MarketState) reset() {
 // Called at the start of each network packet (tcpDataArrived).
 func (m *MarketState) ClearPendingTickers() {
 	for ticker := range m.PendingTickers {
+		ticker.Lock()
 		ticker.Ticks = nil
 		ticker.TickByTicks = nil
 		ticker.DomTicks = nil
+		ticker.Unlock()
 	}
 	m.PendingTickers = make(map[*market.Ticker]bool)
 }
