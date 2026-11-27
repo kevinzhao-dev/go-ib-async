@@ -18,17 +18,25 @@ import (
 // ReqOpenOrders requests the open orders of this API client (with client id
 // 0 also manual TWS orders) and returns their trades. Existing Trade objects
 // are updated in place; orders not yet known are added to the state.
+//
+// With client id 0 TWS also binds the manual orders to the API, which can
+// cancel and resubmit a working order (losing its queue priority). Use
+// ReqAllOpenOrders to only read them. cmd/ibguard blocks reqOpenOrders from
+// client id 0.
+//
+// TWS rejects reqOpenOrders when the API is in read-only mode; the error
+// then matches ErrReadOnlyAPI (ReqAllOpenOrders still works).
 func (ib *IB) ReqOpenOrders(ctx context.Context) ([]*order.Trade, error) {
-	return ib.reqOpenOrders(ctx, ib.client.ReqOpenOrders)
+	return ib.reqOpenOrders(ctx, true, ib.client.ReqOpenOrders)
 }
 
 // ReqAllOpenOrders requests the open orders of all API clients and TWS.
 func (ib *IB) ReqAllOpenOrders(ctx context.Context) ([]*order.Trade, error) {
-	return ib.reqOpenOrders(ctx, ib.client.ReqAllOpenOrders)
+	return ib.reqOpenOrders(ctx, false, ib.client.ReqAllOpenOrders)
 }
 
-func (ib *IB) reqOpenOrders(ctx context.Context, send func() error) ([]*order.Trade, error) {
-	v, err := ib.runSingle(ctx, ib.openOrdersReq, send)
+func (ib *IB) reqOpenOrders(ctx context.Context, roRejected bool, send func() error) ([]*order.Trade, error) {
+	v, err := ib.runSingle(ctx, ib.openOrdersReq, roRejected, send)
 	if err != nil {
 		return nil, err
 	}
@@ -109,7 +117,9 @@ func (ib *IB) TradeFills(t *order.Trade) []order.Fill {
 // SyncOptions controls SyncOrders.
 type SyncOptions struct {
 	// AllClients uses reqAllOpenOrders (orders of every API client and TWS)
-	// instead of reqOpenOrders (this client's orders only).
+	// instead of reqOpenOrders (this client's orders only). With client id
+	// 0 SyncOrders never sends reqOpenOrders, which would bind manual TWS
+	// orders: it filters reqAllOpenOrders to client 0 instead.
 	AllClients bool
 	// ExecFilter restricts the executions request (zero value: all of today's).
 	ExecFilter order.ExecutionFilter
@@ -136,6 +146,11 @@ type SyncReport struct {
 	Unresolved []*order.Trade
 	// Positions is the refreshed position list (unless SkipPositions).
 	Positions []account.Position
+	// ReadOnly is set when TWS/Gateway is in read-only API mode. Open
+	// orders then come from reqAllOpenOrders (filtered to this client
+	// unless AllClients) and completed orders are unavailable, so stale
+	// trades end up in Unresolved.
+	ReadOnly bool
 }
 
 // SyncOrders reconciles local order state with the broker. It is meant to be
@@ -148,12 +163,32 @@ type SyncReport struct {
 func (ib *IB) SyncOrders(ctx context.Context, opts SyncOptions) (*SyncReport, error) {
 	report := &SyncReport{}
 
+	myClient := ib.ClientID()
+	// This client's orders out of reqAllOpenOrders.
+	ownOpenOrders := func() ([]*order.Trade, error) {
+		all, err := ib.ReqAllOpenOrders(ctx)
+		var own []*order.Trade
+		for _, t := range all {
+			if t.Order.ClientID == myClient {
+				own = append(own, t)
+			}
+		}
+		return own, err
+	}
 	var open []*order.Trade
 	var err error
-	if opts.AllClients {
+	switch {
+	case opts.AllClients:
 		open, err = ib.ReqAllOpenOrders(ctx)
-	} else {
+	case myClient == 0:
+		// reqOpenOrders from client 0 binds manual TWS orders: read only.
+		open, err = ownOpenOrders()
+	default:
 		open, err = ib.ReqOpenOrders(ctx)
+		if errors.Is(err, ErrReadOnlyAPI) {
+			report.ReadOnly = true
+			open, err = ownOpenOrders()
+		}
 	}
 	if err != nil {
 		return nil, fmt.Errorf("sync open orders: %w", err)
@@ -164,7 +199,6 @@ func (ib *IB) SyncOrders(ctx context.Context, opts SyncOptions) (*SyncReport, er
 		openSet[t] = true
 	}
 
-	myClient := ib.ClientID()
 	var stale []*order.Trade
 	for _, t := range ib.state.GetTrades() {
 		if t.IsDone() || openSet[t] {
@@ -181,6 +215,10 @@ func (ib *IB) SyncOrders(ctx context.Context, opts SyncOptions) (*SyncReport, er
 	var completed []*order.Trade
 	if len(stale) > 0 || opts.IncludeCompleted {
 		completed, err = ib.ReqCompletedOrders(ctx, false)
+		if errors.Is(err, ErrReadOnlyAPI) {
+			report.ReadOnly = true
+			completed, err = nil, nil
+		}
 		if err != nil {
 			return report, fmt.Errorf("sync completed orders: %w", err)
 		}

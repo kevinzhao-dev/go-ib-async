@@ -1,5 +1,11 @@
-# Binaries
-smoketest
+# Binaries (go build ./cmd/<name> from the repo root or inside cmd/<name>);
+# anchored so the cmd/<name> source directories are not ignored
+/smoketest
+/ibguard
+/mdcheck
+/cmd/*/smoketest
+/cmd/*/ibguard
+/cmd/*/mdcheck
 *.exe
 *.exe~
 *.dll

@@ -232,7 +232,7 @@ func TestConcurrentReqPositionsSerialized(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	_, err := ib.runSingle(ctx, sr, func() error {
+	_, err := ib.runSingle(ctx, sr, false, func() error {
 		t.Fatal("second request must not be sent while the first is in flight")
 		return nil
 	})
@@ -249,7 +249,7 @@ func TestConcurrentReqPositionsSerialized(t *testing.T) {
 	var sentKey int64
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel2()
-	_, _ = ib.runSingle(ctx2, sr, func() error {
+	_, _ = ib.runSingle(ctx2, sr, false, func() error {
 		sentKey = sr.active()
 		return errors.New("not connected")
 	})

@@ -2,7 +2,7 @@ package ibgo
 
 import (
 	"errors"
-	"fmt"
+	"strings"
 )
 
 var (
@@ -23,15 +23,28 @@ var (
 
 	// ErrUseWhatIfOrder is returned by PlaceOrder for orders with WhatIf set.
 	ErrUseWhatIfOrder = errors.New("ibgo: order has WhatIf set; use WhatIfOrder")
+
+	// ErrReadOnlyAPI is matched (errors.Is) by errors caused by the
+	// "Read-Only API" setting of TWS/Gateway. In that mode TWS rejects
+	// orders, reqOpenOrders and reqCompletedOrders; reqAllOpenOrders,
+	// executions, positions, account and market data keep working.
+	ErrReadOnlyAPI = errors.New("ibgo: TWS/Gateway API is in read-only mode")
 )
 
-// RequestError represents an error returned by the IB API.
-type RequestError struct {
-	ReqID   int64
-	Code    int
-	Message string
+// RequestError is the error returned by a failed request. It is the same
+// type that ErrorEvent delivers, so errors.As(err, &*IBError) works for both.
+type RequestError = IBError
+
+// IsReadOnly reports whether the error was caused by the Read-Only API
+// setting of TWS/Gateway.
+func (e *IBError) IsReadOnly() bool {
+	return e.Code == 321 && strings.Contains(strings.ToLower(e.Message), "read-only")
 }
 
-func (e *RequestError) Error() string {
-	return fmt.Sprintf("ibgo: API error %d (reqId %d): %s", e.Code, e.ReqID, e.Message)
+// Unwrap lets errors.Is(err, ErrReadOnlyAPI) detect read-only rejections.
+func (e *IBError) Unwrap() error {
+	if e.IsReadOnly() {
+		return ErrReadOnlyAPI
+	}
+	return nil
 }

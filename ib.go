@@ -51,6 +51,40 @@ type IB struct {
 	risk    PreTradeChecker
 	journal OrderJournal
 
+	// Streaming subscriptions by request id (see subscriptions.go).
+	subsMu sync.Mutex
+	subs   map[int64]*subscription
+	// subOpMu serialises cancelling a subscription with re-sending it
+	// after a reconnect.
+	subOpMu sync.Mutex
+	// connEpoch counts successful connections; a subscription is live on
+	// the connection whose epoch it was sent on.
+	connEpoch atomic.Int64
+	// mdType is the last market data type requested (0 = never).
+	mdType atomic.Int64
+	// depthFresh holds depth requests whose book is emptied before their
+	// first update (see depthStarted).
+	depthMu    sync.Mutex
+	depthFresh map[int64]bool
+
+	// acctMu guards the account updates subscription (nil = none) and
+	// serialises the requests that change it (subscribe, cancel, restore)
+	// so they reach TWS in the order their effect is recorded.
+	acctMu      sync.Mutex
+	acctUpdates *string
+	acctReq     *singleReq
+	timeReq     *singleReq
+	// acctDL is the running account download (see beginAcctDownload).
+	dlMu   sync.Mutex
+	acctDL *acctDownload
+
+	pnlMu     sync.Mutex
+	pnl       map[pnlKey]*account.PnL
+	pnlSingle map[pnlKey]*account.PnLSingle
+
+	ruleMu      sync.Mutex
+	ruleWaiters map[int][]int64
+
 	// Events
 	ConnectedEvent    event.Event[struct{}]
 	DisconnectedEvent event.Event[struct{}]
@@ -72,7 +106,9 @@ type IB struct {
 	// Account events
 	PositionEvent     event.Event[*account.Position]
 	AccountValueEvent event.Event[*account.AccountValue]
+	PortfolioEvent    event.Event[*account.PortfolioItem]
 	PnLEvent          event.Event[*account.PnL]
+	PnLSingleEvent    event.Event[*account.PnLSingle]
 }
 
 // IBError wraps an IB API error with request context.
@@ -100,6 +136,13 @@ func New() *IB {
 		positionsReq:  newSingleReq(),
 		completedReq:  newSingleReq(),
 		openOrdersReq: newSingleReq(),
+		subs:          map[int64]*subscription{},
+		depthFresh:    map[int64]bool{},
+		acctReq:       newSingleReq(),
+		timeReq:       newSingleReq(),
+		pnl:           map[pnlKey]*account.PnL{},
+		pnlSingle:     map[pnlKey]*account.PnLSingle{},
+		ruleWaiters:   map[int][]int64{},
 	}
 	ib.client.OnMessage = ib.handleMessage
 	ib.client.OnDisconnect = func(err error) {
@@ -117,8 +160,10 @@ func New() *IB {
 		if len(pending) > 0 {
 			t, ts := ib.state.GetLastTime()
 			for _, ticker := range pending {
+				ticker.Lock()
 				ticker.Time = t
 				ticker.Timestamp = ts
+				ticker.Unlock()
 				ticker.UpdateEvent.Emit(ticker)
 			}
 			ib.PendingTickersEvent.Emit(pending)
@@ -137,6 +182,15 @@ func (ib *IB) Connect(ctx context.Context, host string, port, clientID int) erro
 	if err != nil {
 		return err
 	}
+	// Before ConnectedEvent: subscriptions made from its handlers belong to
+	// this connection and are not re-sent by restoreSubscriptions, and they
+	// get the market data type chosen before the reconnect.
+	ib.connEpoch.Add(1)
+	if t := ib.mdType.Load(); t != 0 {
+		if err := ib.client.ReqMarketDataType(int(t)); err != nil {
+			log.Printf("ibgo: restore market data type: %v", err)
+		}
+	}
 	ib.ConnectedEvent.Emit(struct{}{})
 	return nil
 }
@@ -145,6 +199,8 @@ func (ib *IB) Connect(ctx context.Context, host string, port, clientID int) erro
 func (ib *IB) Disconnect() {
 	ib.client.Disconnect()
 	ib.state.Reset()
+	ib.clearSubs()
+	ib.mdType.Store(0)
 }
 
 // IsConnected returns true if connected to TWS/Gateway.
@@ -231,7 +287,7 @@ func (ib *IB) ReqContractDetails(ctx context.Context, con *contract.Contract) ([
 // Serialized: IB sends one positionEnd for all outstanding position requests,
 // so concurrent callers wait for each other.
 func (ib *IB) ReqPositions(ctx context.Context) ([]account.Position, error) {
-	if _, err := ib.runSingle(ctx, ib.positionsReq, ib.client.ReqPositions); err != nil {
+	if _, err := ib.runSingle(ctx, ib.positionsReq, false, ib.client.ReqPositions); err != nil {
 		return nil, err
 	}
 	return ib.state.GetPositions(), nil
@@ -361,6 +417,36 @@ func (ib *IB) handleMessage(msgID int, r *protocol.FieldReader) {
 		ib.handleTickSnapshotEnd(r)
 	case protocol.InMsgMarketDataType:
 		ib.handleMarketDataType(r)
+	case protocol.InMsgTickOptionComp:
+		ib.handleTickOptionComputation(r)
+	case protocol.InMsgTickEFP:
+		ib.handleTickEFP(r)
+	case protocol.InMsgTickReqParams:
+		ib.handleTickReqParams(r)
+	case protocol.InMsgTickByTick:
+		ib.handleTickByTick(r)
+	case protocol.InMsgUpdateMktDepth:
+		ib.handleMktDepth(r)
+	case protocol.InMsgUpdateMktDepthL2:
+		ib.handleMktDepthL2(r)
+	case protocol.InMsgHeadTimestamp:
+		ib.handleHeadTimestamp(r)
+	case protocol.InMsgHistoricalTicks:
+		ib.handleHistoricalTicks(r)
+	case protocol.InMsgHistoricalTicksBidAsk:
+		ib.handleHistoricalTicksBidAsk(r)
+	case protocol.InMsgHistoricalTicksLast:
+		ib.handleHistoricalTicksLast(r)
+	case protocol.InMsgPnL:
+		ib.handlePnL(r)
+	case protocol.InMsgPnLSingle:
+		ib.handlePnLSingle(r)
+	case protocol.InMsgSymbolSamples:
+		ib.handleSymbolSamples(r)
+	case protocol.InMsgMarketRule:
+		ib.handleMarketRule(r)
+	case protocol.InMsgUpdateAccountTime:
+		// account update timestamp: not tracked
 	default:
 		// Unhandled message types are silently ignored for now
 	}
@@ -369,8 +455,11 @@ func (ib *IB) handleMessage(msgID int, r *protocol.FieldReader) {
 // warningCodes are error codes TWS uses for warnings: the request or the
 // order is still alive (mirrors ib_async).
 var warningCodes = map[int]bool{
-	105: true, 110: true, 165: true, 321: true, 329: true,
+	105: true, 110: true, 165: true, 317: true, 321: true, 329: true,
 	399: true, 404: true, 434: true, 492: true, 10167: true,
+	// "Part of requested market data is not subscribed / requires an
+	// additional subscription": the rest of the data keeps streaming.
+	10090: true, 10091: true,
 }
 
 func isWarningCode(code int) bool {
@@ -387,10 +476,24 @@ func (ib *IB) handleError(r *protocol.FieldReader) {
 		advanced = r.ReadString()
 	}
 
+	// 2101: another API client is subscribed to a different account, so
+	// the pending ReqAccountUpdates was refused.
+	if code == 2101 {
+		if key := ib.acctReq.active(); key != 0 {
+			ibErr := &IBError{ReqID: reqID, Code: code, Message: msg, AdvancedOrderReject: advanced}
+			ib.ErrorEvent.Emit(ibErr)
+			ib.state.EndReq(key, nil, ibErr)
+			return
+		}
+	}
 	// Info codes (2100-2199: data farm status etc.) are logged only.
 	if code >= 2100 && code < 2200 {
 		log.Printf("ibgo: info %d: %s", code, msg)
 		return
+	}
+	// 317: TWS reset the market depth book; it re-sends it from scratch.
+	if code == 317 {
+		ib.resetDepth(reqID)
 	}
 
 	isRequest := reqID >= 0 && ib.state.Requests.Has(reqID)
@@ -411,6 +514,24 @@ func (ib *IB) handleError(r *protocol.FieldReader) {
 	if code == 110 && trade != nil && trade.Status() == order.StatusPendingSubmit {
 		isWarning = false // invalid price for a new order must cancel it
 	}
+	// 321 "Error validating request": a pending request or a new order was
+	// rejected outright and nothing more will arrive for it (ib_async treats
+	// it as a warning, which leaves such requests hanging forever).
+	if code == 321 && (isRequest || (trade != nil && trade.Status() == order.StatusPendingSubmit)) {
+		isWarning = false
+	}
+	// Requests answered without a request id (reqOpenOrders,
+	// reqCompletedOrders) are rejected with reqId -1 in read-only mode.
+	var roFailed []int64
+	if reqID < 0 && code == 321 {
+		probe := &IBError{Code: code, Message: msg}
+		if probe.IsReadOnly() {
+			roFailed = ib.readOnlyRejectedSingles()
+			if len(roFailed) > 0 {
+				isWarning = false
+			}
+		}
+	}
 
 	ibErr := &IBError{
 		ReqID:               reqID,
@@ -428,6 +549,10 @@ func (ib *IB) handleError(r *protocol.FieldReader) {
 		logMsg = fmt.Sprintf("Warning %d: %s", code, msg)
 	}
 
+	for _, key := range roFailed {
+		ib.state.EndReq(key, nil, ibErr)
+	}
+
 	switch {
 	case isWarning:
 		// The order is still live at the broker: record the warning but
@@ -439,7 +564,8 @@ func (ib *IB) handleError(r *protocol.FieldReader) {
 			trade.StatusEvent.Emit(trade)
 		}
 	case isRequest:
-		ib.state.EndReq(reqID, nil, &RequestError{ReqID: reqID, Code: code, Message: msg})
+		ib.state.EndReq(reqID, nil, ibErr)
+		ib.releaseFailedSnapshot(reqID)
 	case trade != nil:
 		if advanced != "" {
 			trade.SetAdvancedError(advanced)
@@ -618,10 +744,6 @@ func (ib *IB) handleUpdateAccountValue(r *protocol.FieldReader) {
 	ib.state.Mu.Unlock()
 
 	ib.AccountValueEvent.Emit(av)
-}
-
-func (ib *IB) handleAccountDownloadEnd(r *protocol.FieldReader) {
-	// Account download complete
 }
 
 func (ib *IB) handleAccountSummary(r *protocol.FieldReader) {
@@ -1084,205 +1206,6 @@ func (ib *IB) readConditionFields(cond order.OrderCondition, r *protocol.FieldRe
 	}
 }
 
-func (ib *IB) handleTickPrice(r *protocol.FieldReader) {
-	r.Skip(1) // version
-	reqID := r.ReadInt()
-	tickType := int(r.ReadInt())
-	price := r.ReadFloat()
-	size := r.ReadFloat()
-	_ = r.ReadString() // tickAttrib (ignored for now)
-
-	ib.state.Mu.RLock()
-	ticker, ok := ib.state.ReqID2Ticker[reqID]
-	ib.state.Mu.RUnlock()
-
-	if !ok {
-		return
-	}
-
-	// Bid/Ask/Last are handled specially (tick types 1,2,4 + delayed 66,67,68)
-	switch tickType {
-	case 1, 66: // BID
-		ticker.PrevBid = ticker.Bid
-		ticker.PrevBidSize = ticker.BidSize
-		ticker.Bid = price
-		ticker.BidSize = size
-	case 2, 67: // ASK
-		ticker.PrevAsk = ticker.Ask
-		ticker.PrevAskSize = ticker.AskSize
-		ticker.Ask = price
-		ticker.AskSize = size
-	case 4, 68: // LAST
-		ticker.PrevLast = ticker.Last
-		ticker.PrevLastSize = ticker.LastSize
-		ticker.Last = price
-		ticker.LastSize = size
-	default:
-		if fieldName, ok := state.PriceTickMap[tickType]; ok {
-			setTickerFloat(ticker, fieldName, price)
-		}
-	}
-
-	ib.state.MarkTickerPending(ticker)
-}
-
-func (ib *IB) handleTickSize(r *protocol.FieldReader) {
-	r.Skip(1) // version
-	reqID := r.ReadInt()
-	tickType := int(r.ReadInt())
-	size := r.ReadFloat()
-
-	ib.state.Mu.RLock()
-	ticker, ok := ib.state.ReqID2Ticker[reqID]
-	ib.state.Mu.RUnlock()
-
-	if !ok {
-		return
-	}
-
-	// Bid/Ask/Last size are tick types 0,3,5 (and delayed 69,70,71)
-	switch tickType {
-	case 0, 69: // BID_SIZE
-		ticker.PrevBidSize = ticker.BidSize
-		ticker.BidSize = size
-	case 3, 70: // ASK_SIZE
-		ticker.PrevAskSize = ticker.AskSize
-		ticker.AskSize = size
-	case 5, 71: // LAST_SIZE
-		ticker.PrevLastSize = ticker.LastSize
-		ticker.LastSize = size
-	default:
-		if fieldName, ok := state.SizeTickMap[tickType]; ok {
-			setTickerFloat(ticker, fieldName, size)
-		}
-	}
-
-	ib.state.MarkTickerPending(ticker)
-}
-
-func (ib *IB) handleTickGeneric(r *protocol.FieldReader) {
-	r.Skip(1) // version
-	reqID := r.ReadInt()
-	tickType := int(r.ReadInt())
-	value := r.ReadFloat()
-
-	ib.state.Mu.RLock()
-	ticker, ok := ib.state.ReqID2Ticker[reqID]
-	ib.state.Mu.RUnlock()
-
-	if !ok {
-		return
-	}
-
-	if fieldName, ok := state.GenericTickMap[tickType]; ok {
-		setTickerFloat(ticker, fieldName, value)
-	}
-
-	ib.state.MarkTickerPending(ticker)
-}
-
-func (ib *IB) handleTickString(r *protocol.FieldReader) {
-	r.Skip(1) // version
-	reqID := r.ReadInt()
-	tickType := int(r.ReadInt())
-	value := r.ReadString()
-
-	ib.state.Mu.RLock()
-	ticker, ok := ib.state.ReqID2Ticker[reqID]
-	ib.state.Mu.RUnlock()
-
-	if !ok {
-		return
-	}
-
-	switch {
-	case tickType == 45 || tickType == 88:
-		// Timestamp ticks (lastTimestamp, delayedLastTimestamp)
-		ib.processTimestampTick(ticker, tickType, value)
-	case tickType == 48 || tickType == 77:
-		// RT Volume / RT Trade Volume
-		ib.processRtVolumeTick(ticker, tickType, value)
-	case tickType == 59:
-		// Dividends: "past12,next12,nextDate,nextAmount"
-		ib.processDividendTick(ticker, value)
-	case tickType == 47:
-		// Fundamental ratios: "key=value;key=value;..."
-		ib.processFundamentalRatios(ticker, value)
-	default:
-		if fieldName, ok := state.StringTickMap[tickType]; ok {
-			setTickerString(ticker, fieldName, value)
-		}
-	}
-
-	ib.state.MarkTickerPending(ticker)
-}
-
-func (ib *IB) processTimestampTick(ticker *market.Ticker, tickType int, value string) {
-	if value == "" || value == "0" {
-		return
-	}
-	ts, err := strconv.ParseInt(value, 10, 64)
-	if err != nil || ts == 0 {
-		return
-	}
-	t := time.Unix(ts, 0)
-
-	switch tickType {
-	case 45:
-		ticker.LastTimestamp = t
-	case 88:
-		ticker.DelayedLastTimestamp = t
-	}
-}
-
-func (ib *IB) processRtVolumeTick(ticker *market.Ticker, tickType int, value string) {
-	// Format: price;size;ms_since_epoch;total_volume;VWAP;single_trade
-	parts := strings.Split(value, ";")
-	if len(parts) < 6 {
-		return
-	}
-
-	priceStr, sizeStr, rtTimeStr, volumeStr, vwapStr := parts[0], parts[1], parts[2], parts[3], parts[4]
-
-	if volumeStr != "" {
-		if v, err := strconv.ParseFloat(volumeStr, 64); err == nil {
-			switch tickType {
-			case 48:
-				ticker.RTVolume = v
-			case 77:
-				ticker.RTTradeVolume = v
-			}
-		}
-	}
-
-	if vwapStr != "" {
-		if v, err := strconv.ParseFloat(vwapStr, 64); err == nil {
-			ticker.VWAP = v
-		}
-	}
-
-	if rtTimeStr != "" {
-		if ms, err := strconv.ParseInt(rtTimeStr, 10, 64); err == nil {
-			ticker.RTTime = time.UnixMilli(ms)
-		}
-	}
-
-	if priceStr != "" {
-		price, err1 := strconv.ParseFloat(priceStr, 64)
-		size, err2 := strconv.ParseFloat(sizeStr, 64)
-		if err1 == nil && err2 == nil {
-			ticker.PrevLast = ticker.Last
-			ticker.PrevLastSize = ticker.LastSize
-			ticker.Last = price
-			ticker.LastSize = size
-
-			ticker.Ticks = append(ticker.Ticks, market.TickData{
-				Time: ib.now(), TickType: tickType, Price: price, Size: size,
-			})
-		}
-	}
-}
-
 func (ib *IB) processDividendTick(ticker *market.Ticker, value string) {
 	// Format: "past12,next12,nextDate,nextAmount"
 	parts := strings.Split(value, ",")
@@ -1483,77 +1406,6 @@ func setTickerString(t *market.Ticker, field, value string) {
 
 // --- Historical Data ---
 
-func (ib *IB) handleHistoricalData(r *protocol.FieldReader) {
-	reqID := r.ReadInt() // no version field for historicalData
-	_ = r.ReadString()   // startDateStr
-	_ = r.ReadString()   // endDateStr
-	numBars := int(r.ReadInt())
-
-	bars := make([]market.BarData, 0, numBars)
-	for range numBars {
-		bar := market.BarData{
-			Date:     parseBarDate(r.ReadString()),
-			Open:     r.ReadFloat(),
-			High:     r.ReadFloat(),
-			Low:      r.ReadFloat(),
-			Close:    r.ReadFloat(),
-			Volume:   r.ReadFloat(),
-			Average:  r.ReadFloat(),
-			BarCount: int(r.ReadInt()),
-		}
-		bars = append(bars, bar)
-	}
-
-	ib.state.EndReq(reqID, bars, nil)
-}
-
-func (ib *IB) handleHistoricalDataUpdate(r *protocol.FieldReader) {
-	reqID := r.ReadInt() // no version field
-
-	bar := market.BarData{
-		BarCount: int(r.ReadInt()),
-		Date:     parseBarDate(r.ReadString()),
-		Open:     r.ReadFloat(),
-		Close:    r.ReadFloat(),
-		High:     r.ReadFloat(),
-		Low:      r.ReadFloat(),
-		Average:  r.ReadFloat(),
-		Volume:   r.ReadFloat(),
-	}
-
-	ib.state.Mu.RLock()
-	sub, ok := ib.state.ReqID2Subscriber[reqID]
-	ib.state.Mu.RUnlock()
-
-	if ok {
-		if bdl, ok := sub.(*market.BarDataList); ok {
-			bdl.Bars = append(bdl.Bars, bar)
-			bdl.UpdateEvent.Emit(bdl)
-		}
-	}
-}
-
-func (ib *IB) handleTickSnapshotEnd(r *protocol.FieldReader) {
-	r.Skip(1) // version
-	reqID := r.ReadInt()
-	// Completed in flushSnapshotEnds, after this batch's ticks are applied.
-	ib.snapshots.end(reqID)
-}
-
-func (ib *IB) handleMarketDataType(r *protocol.FieldReader) {
-	r.Skip(1) // version
-	reqID := r.ReadInt()
-	mktDataType := int(r.ReadInt())
-
-	ib.state.Mu.RLock()
-	ticker, ok := ib.state.ReqID2Ticker[reqID]
-	ib.state.Mu.RUnlock()
-
-	if ok {
-		ticker.MarketDataType = mktDataType
-	}
-}
-
 // --- ReqHistoricalData public method ---
 
 // ReqHistoricalData requests historical bar data.
@@ -1578,82 +1430,6 @@ func (ib *IB) ReqHistoricalData(ctx context.Context, con *contract.Contract, end
 }
 
 // --- ReqMktData subscription ---
-
-// ReqMktData subscribes to streaming market data for a contract.
-func (ib *IB) ReqMktData(con *contract.Contract, genericTickList string, snapshot, regulatorySnapshot bool) (*market.Ticker, error) {
-	reqID := ib.client.GetReqID()
-	ticker := market.NewTicker(con)
-
-	key := con.Key()
-	ib.state.Mu.Lock()
-	if key != 0 {
-		// Unqualified contracts (conId 0) would all collide on key 0.
-		ib.state.Tickers[key] = ticker
-	}
-	ib.state.ReqID2Ticker[reqID] = ticker
-	ib.state.ReqID2Contract[reqID] = con
-	ib.state.Mu.Unlock()
-
-	// Register snapshot tracking before sending so a fast tickSnapshotEnd
-	// cannot arrive before the request exists.
-	if snapshot || regulatorySnapshot {
-		ib.state.StartReq(reqID, con)
-	}
-
-	if err := ib.client.ReqMktData(reqID, con, genericTickList, snapshot, regulatorySnapshot, nil); err != nil {
-		ib.state.Mu.Lock()
-		if key != 0 && ib.state.Tickers[key] == ticker {
-			delete(ib.state.Tickers, key)
-		}
-		delete(ib.state.ReqID2Ticker, reqID)
-		ib.state.Mu.Unlock()
-		ib.state.CancelReq(reqID)
-		return nil, err
-	}
-
-	return ticker, nil
-}
-
-// CancelMktData unsubscribes from streaming market data. The ticker is found
-// by contract pointer first (works for unqualified contracts), then by key.
-// Pending ReqTickerSnapshot requests are never matched; they end on their own
-// or when their context ends.
-func (ib *IB) CancelMktData(con *contract.Contract) {
-	key := con.Key()
-	cancelID := int64(-1)
-
-	ib.state.Mu.Lock()
-	for reqID, t := range ib.state.ReqID2Ticker {
-		if t.Contract == con && !ib.snapshots.isOwned(reqID) {
-			cancelID = reqID
-			break
-		}
-	}
-	if cancelID < 0 && key != 0 {
-		if ticker, ok := ib.state.Tickers[key]; ok {
-			for reqID, t := range ib.state.ReqID2Ticker {
-				if t == ticker {
-					cancelID = reqID
-					break
-				}
-			}
-		}
-	}
-	if cancelID >= 0 {
-		t := ib.state.ReqID2Ticker[cancelID]
-		delete(ib.state.ReqID2Ticker, cancelID)
-		delete(ib.state.ReqID2Contract, cancelID)
-		if key != 0 && ib.state.Tickers[key] == t {
-			delete(ib.state.Tickers, key)
-		}
-	}
-	ib.state.Mu.Unlock()
-
-	// Network send (may wait on the throttle) happens outside the state lock.
-	if cancelID >= 0 {
-		_ = ib.client.CancelMktData(cancelID)
-	}
-}
 
 // --- PlaceOrder ---
 
@@ -2209,32 +1985,10 @@ func (ib *IB) handleUpdatePortfolio(r *protocol.FieldReader) {
 		ib.state.Portfolio[acctName][c.ConID] = item
 	}
 	ib.state.Mu.Unlock()
-}
+	ib.noteAcctDownload(acctName, c.ConID)
 
-func (ib *IB) handleRealtimeBar(r *protocol.FieldReader) {
-	r.Skip(1) // version
-	reqID := r.ReadInt()
-	bar := market.RealTimeBar{
-		Time:   time.Unix(r.ReadInt(), 0),
-		Open:   r.ReadFloat(),
-		High:   r.ReadFloat(),
-		Low:    r.ReadFloat(),
-		Close:  r.ReadFloat(),
-		Volume: r.ReadFloat(),
-		WAP:    r.ReadFloat(),
-		Count:  int(r.ReadInt()),
-	}
-
-	ib.state.Mu.RLock()
-	sub, ok := ib.state.ReqID2Subscriber[reqID]
-	ib.state.Mu.RUnlock()
-
-	if ok {
-		if rtbl, ok := sub.(*market.RealTimeBarList); ok {
-			rtbl.Bars = append(rtbl.Bars, bar)
-			rtbl.UpdateEvent.Emit(rtbl)
-		}
-	}
+	cp := *item
+	ib.PortfolioEvent.Emit(&cp)
 }
 
 func (ib *IB) handleSecDefOptParams(r *protocol.FieldReader) {
@@ -2299,43 +2053,10 @@ func (ib *IB) ReqSecDefOptParams(ctx context.Context, underlyingSymbol, futFopEx
 	return chains, nil
 }
 
-// ReqRealTimeBars subscribes to real-time 5-second bars.
-func (ib *IB) ReqRealTimeBars(con *contract.Contract, barSize int, whatToShow string, useRTH bool) (*market.RealTimeBarList, error) {
-	reqID := ib.client.GetReqID()
-	rtbl := &market.RealTimeBarList{
-		ReqID:      reqID,
-		Contract:   con,
-		BarSize:    barSize,
-		WhatToShow: whatToShow,
-		UseRTH:     useRTH,
-	}
-
-	ib.state.Mu.Lock()
-	ib.state.ReqID2Subscriber[reqID] = rtbl
-	ib.state.Mu.Unlock()
-
-	if err := ib.client.ReqRealTimeBars(reqID, con, barSize, whatToShow, useRTH, nil); err != nil {
-		ib.state.Mu.Lock()
-		delete(ib.state.ReqID2Subscriber, reqID)
-		ib.state.Mu.Unlock()
-		return nil, err
-	}
-
-	return rtbl, nil
-}
-
-// CancelRealTimeBars unsubscribes from real-time bars.
-func (ib *IB) CancelRealTimeBars(rtbl *market.RealTimeBarList) {
-	ib.state.Mu.Lock()
-	delete(ib.state.ReqID2Subscriber, rtbl.ReqID)
-	ib.state.Mu.Unlock()
-	ib.client.CancelRealTimeBars(rtbl.ReqID)
-}
-
 // ReqCompletedOrders requests all completed (filled/cancelled) orders.
 // Serialized: IB sends one completedOrdersEnd for all outstanding requests.
 func (ib *IB) ReqCompletedOrders(ctx context.Context, apiOnly bool) ([]*order.Trade, error) {
-	v, err := ib.runSingle(ctx, ib.completedReq, func() error {
+	v, err := ib.runSingle(ctx, ib.completedReq, true, func() error {
 		return ib.client.ReqCompletedOrders(apiOnly)
 	})
 	if err != nil {
@@ -2606,17 +2327,14 @@ func (ib *IB) handleOrderBound(r *protocol.FieldReader) {
 	}
 }
 
-func (ib *IB) handleCurrentTime(r *protocol.FieldReader) {
-	r.Skip(1) // version
-	serverTime := r.ReadInt()
-	ib.serverTime.Store(serverTime)
-}
-
 // singleReq serialises a request type whose responses carry no request id.
 // The slot is held for the whole request; handlers read the active key.
 type singleReq struct {
 	sem chan struct{}
 	key atomic.Int64
+	// roRejected is set while the in-flight request is one that TWS
+	// rejects (with reqId -1) when the API is in read-only mode.
+	roRejected atomic.Bool
 }
 
 func newSingleReq() *singleReq {
@@ -2628,9 +2346,21 @@ func (sr *singleReq) active() int64 {
 	return sr.key.Load()
 }
 
+// readOnlyRejectedSingles returns the keys of in-flight id-less requests
+// that TWS rejects in read-only mode.
+func (ib *IB) readOnlyRejectedSingles() []int64 {
+	var keys []int64
+	for _, sr := range []*singleReq{ib.openOrdersReq, ib.completedReq} {
+		if k := sr.active(); k != 0 && sr.roRejected.Load() {
+			keys = append(keys, k)
+		}
+	}
+	return keys
+}
+
 // runSingle runs one serialised request: waits for the slot, registers a
 // synthetic key, sends, and waits for the end message.
-func (ib *IB) runSingle(ctx context.Context, sr *singleReq, send func() error) (interface{}, error) {
+func (ib *IB) runSingle(ctx context.Context, sr *singleReq, roRejected bool, send func() error) (interface{}, error) {
 	select {
 	case sr.sem <- struct{}{}:
 	case <-ctx.Done():
@@ -2638,11 +2368,13 @@ func (ib *IB) runSingle(ctx context.Context, sr *singleReq, send func() error) (
 	}
 	defer func() {
 		sr.key.Store(0)
+		sr.roRejected.Store(false)
 		<-sr.sem
 	}()
 
 	key := ib.syntheticReqID.Add(-1)
 	ch := ib.state.StartReq(key, nil)
+	sr.roRejected.Store(roRejected)
 	sr.key.Store(key)
 	if err := send(); err != nil {
 		ib.state.CancelReq(key)
