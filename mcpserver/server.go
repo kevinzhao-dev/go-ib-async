@@ -38,6 +38,9 @@ import (
 // Broker is the part of *ibgo.IB the server uses.
 type Broker interface {
 	IsConnected() bool
+	// LastConnectError is why the last connection attempt failed (nil when
+	// it succeeded), see ibgo.IB.LastConnectError.
+	LastConnectError() error
 	ServerVersion() int
 	ManagedAccounts() []string
 	ClientID() int64
@@ -418,9 +421,26 @@ func (s *Server) instructions() string {
 
 func (s *Server) requireConnected() error {
 	if !s.b.IsConnected() {
+		if p := s.connectionProblem(); p != "" {
+			return fmt.Errorf("not connected to TWS/IB Gateway: %s (the server keeps retrying; check get_status)", p)
+		}
 		return errors.New("not connected to TWS/IB Gateway (the server keeps retrying; check get_status)")
 	}
 	return nil
+}
+
+// connectionProblem says why the last connection attempt failed, or "" when
+// none failed since the last successful connection.
+func (s *Server) connectionProblem() string {
+	err := s.b.LastConnectError()
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	if errors.Is(err, ibgo.ErrClientIDInUse) {
+		msg += " — another API client is connected with this client id, for example an ib-mcp started by another agent session: stop it, or start this server with a different -client-id (env IB_CLIENT_ID)"
+	}
+	return msg
 }
 
 // ownClientID returns the API client id whose orders the trading tools may

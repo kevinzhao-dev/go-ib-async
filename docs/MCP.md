@@ -49,7 +49,21 @@ Claude Desktop (`claude_desktop_config.json`):
 Ports: 4002 Gateway paper, 4001 Gateway live, 7497 TWS paper, 7496 TWS live.
 The API must be enabled in TWS/Gateway (Configure → API → Settings). The
 server starts even when the gateway is down and keeps reconnecting;
-`get_status` tells the agent whether it is connected.
+`get_status` tells the agent whether it is connected and, when it is not,
+why the last attempt failed (`connection_error`, e.g. TWS error 326: the
+client id is already in use).
+
+Every agent session that loads this config starts its own ib-mcp, and TWS
+accepts one API client per client id. Without `-enable-trading` a server
+whose client id is taken tries the next ones (`-client-id-fallbacks`,
+default 9: ids 17-26), so several sessions can read at the same time;
+`get_status` reports the id in use. With `-enable-trading` the client id is
+fixed, because orders belong to the client id that placed them: give each
+trading server its own `-client-id`. A read-only server that fell back
+reconnects with the id it had, so after a TWS restart it does not take the
+id of a trading server that shares its base `-client-id`; a trading server
+that starts after the read-only ones does find its id taken, so start it
+first or give it an id outside their range.
 
 ## Tools
 

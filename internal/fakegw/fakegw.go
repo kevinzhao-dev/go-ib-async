@@ -116,6 +116,8 @@ type Server struct {
 	handlers  map[int]func(req []string) [][]byte
 	version   int
 	reject    func(o *Order) string
+	inUse     map[int64]bool // client ids refused with error 326
+	attempts  []int64        // client ids of every startApi received
 	connCh    chan struct{}
 	closed    bool
 	wg        sync.WaitGroup
@@ -190,6 +192,25 @@ func (s *Server) SetReject(f func(o *Order) string) {
 	s.mu.Lock()
 	s.reject = f
 	s.mu.Unlock()
+}
+
+// SetClientIDsInUse makes the fake refuse these client ids like TWS does
+// when another API client is connected with them: error 326, then it closes
+// the connection. No ids (the default) accepts every client id.
+func (s *Server) SetClientIDsInUse(ids ...int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.inUse = map[int64]bool{}
+	for _, id := range ids {
+		s.inUse[id] = true
+	}
+}
+
+// ClientIDAttempts returns the client id of every startApi received, in order.
+func (s *Server) ClientIDAttempts() []int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]int64(nil), s.attempts...)
 }
 
 // Handle installs a scripted responder for request message msgID, replacing
@@ -366,6 +387,12 @@ func (s *Server) handleConn(c net.Conn) {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
+		return
+	}
+	s.attempts = append(s.attempts, clientID)
+	if s.inUse[clientID] {
+		s.mu.Unlock()
+		s.send(c, msg(4, 2, -1, 326, "Unable to connect as the client id is already in use. Retry with a unique client id.", ""))
 		return
 	}
 	s.conn = c

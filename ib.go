@@ -62,6 +62,9 @@ type IB struct {
 	connEpoch atomic.Int64
 	// mdType is the last market data type requested (0 = never).
 	mdType atomic.Int64
+	// connErr holds the error of the last failed attempt of
+	// ConnectWithReconnect (connErrBox; nil box = none).
+	connErr atomic.Pointer[connErrBox]
 	// depthFresh holds depth requests whose book is emptied before their
 	// first update (see depthStarted).
 	depthMu    sync.Mutex
@@ -204,9 +207,13 @@ func (ib *IB) Disconnect() {
 	ib.mdType.Store(0)
 }
 
-// IsConnected returns true if connected to TWS/Gateway.
+// IsConnected returns true if connected to TWS/Gateway and the API
+// handshake is complete (TWS accepted the client id and sent the next valid
+// order id and the managed accounts). During the handshake, and when TWS
+// refuses the connection (e.g. error 326, client id already in use), it is
+// false, as in ib_async.
 func (ib *IB) IsConnected() bool {
-	return ib.client.IsConnected()
+	return ib.client.IsReady()
 }
 
 // ServerVersion returns the TWS/Gateway server version.
