@@ -124,6 +124,25 @@ After a process restart use `SyncOrders(ctx, SyncOptions{IncludeCompleted: true}
 and `journal.Reconcile(journal.Replay(records), ib.Trades(), clientID)` to
 compare the journal with what the broker reports.
 
+## AI agents (MCP)
+
+`cmd/ib-mcp` exposes the client to AI agents as a
+[Model Context Protocol](https://modelcontextprotocol.io) server over stdio:
+contracts, quotes, bars, option chains, positions, account values, orders and
+executions, plus a what-if `preview_order`. It is read-only by default.
+Trading (`-enable-trading`) is restricted to paper accounts. It requires a
+journal and risk limits, and works in two steps: `preview_order` returns a
+single-use `preview_id`, and `place_order` sends exactly that order through
+the risk manager. Agents can halt trading but cannot resume it.
+
+```bash
+go install github.com/kevinzhao-dev/go-ib-async/cmd/ib-mcp@latest
+claude mcp add ib -- ib-mcp -port 4002
+```
+
+See [docs/MCP.md](docs/MCP.md) for the tools, the safety model and the
+configuration.
+
 ## What Works
 
 | Feature | Status |
@@ -138,6 +157,7 @@ compare the journal with what the broker reports.
 | Pre-trade risk manager (`risk`) | Unit + E2E tested |
 | Persistent order journal (`journal`) | Unit + E2E tested |
 | Real-Time Bars | Implemented, not verified |
+| MCP server for AI agents (`mcpserver`, `cmd/ib-mcp`) | E2E-tested against fake gateway |
 
 "E2E-tested against fake gateway" means the real client (protocol, decoders,
 state, events) runs against `internal/fakegw`, an in-process TWS fake that
@@ -161,6 +181,7 @@ ibgo (root)          IB facade - Connect, public API, message dispatch
   event/             Generic Event[T] pub/sub
   risk/              Pre-trade risk checks, kill switch, daily loss limit
   journal/           Append-only JSONL order journal, replay, reconcile
+  mcpserver/         MCP server (stdio) exposing the client to AI agents
   protocol/          TCP connection, wire encoder/decoder, client
   internal/state/    State manager, request tracking, tick maps
   internal/fakegw/   Fake TWS for end-to-end tests

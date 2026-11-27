@@ -29,13 +29,15 @@ wire protocol); **unit** = unit tests only.
 | WhatIf order | e2e | `WhatIfOrder` returns `*order.OrderState`; never creates a trade |
 | Persistent order journal | unit, e2e | `journal` package: fsync'd JSONL, write-ahead submit, crash-tolerant load, `Replay`, `Reconcile` |
 | Risk management | unit, e2e | `risk` package: qty, notional, worst-case position, open orders, rate, duplicates, price collar, symbol/account lists, kill switch, daily loss |
+| Market data snapshot (blocking) | e2e | `ReqTickerSnapshot` waits for tickSnapshotEnd (signalled after the batch's ticks are applied) and detaches the ticker; `ReqMarketDataType` |
+| MCP server for AI agents | e2e | `mcpserver` + `cmd/ib-mcp`: stdio MCP, read tools, preview → place with single-use previews, paper-only by default; see docs/MCP.md |
 | End-to-end trading test | e2e; live test provided | `e2e_test.go` (CI); `integration_trading_test.go` (paper account, opt-in, **not yet run**) |
 
 ## Public API
 
 ### Implemented
 Connect, Disconnect, ConnectWithReconnect, ReqContractDetails, ReqHistoricalData,
-ReqMktData, CancelMktData, ReqRealTimeBars, CancelRealTimeBars, ReqPositions,
+ReqMktData, CancelMktData, ReqTickerSnapshot, ReqMarketDataType, ReqRealTimeBars, CancelRealTimeBars, ReqPositions,
 ReqAccountSummary, ReqSecDefOptParams, PlaceOrder, CancelOrder, ReqGlobalCancel,
 WhatIfOrder, BracketOrder, PlaceBracketOrder, ReqOpenOrders, ReqAllOpenOrders,
 ReqAutoOpenOrders, ReqExecutions, ReqCompletedOrders, SyncOrders,
@@ -111,7 +113,7 @@ Other:
 ## Test Coverage
 
 Total library coverage (all packages except `cmd/` and `internal/fakegw`,
-measured across packages by `scripts/coverage.sh`): **95.6%**. CI fails below 90%.
+measured across packages by `scripts/coverage.sh`): **96.2%**. CI fails below 90%.
 
 | Package | Coverage |
 |---------|----------|
@@ -125,6 +127,7 @@ measured across packages by `scripts/coverage.sh`): **95.6%**. CI fails below 90
 | risk | 98.1% |
 | protocol | 96.5% |
 | journal | 95.2% |
+| mcpserver | 96.6% |
 | ibgo (root) | 93.5% |
 | internal/fakegw (test infrastructure) | 73.2% own tests; exercised further by the E2E tests |
 

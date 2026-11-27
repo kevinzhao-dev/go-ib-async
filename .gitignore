@@ -30,3 +30,6 @@ coverage.txt
 
 # Fuzz corpus (can be large)
 testdata/fuzz/
+
+# MCP server binary (go build ./cmd/ib-mcp)
+/ib-mcp

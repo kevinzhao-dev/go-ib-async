@@ -239,3 +239,15 @@ func TestConditionAccessors(t *testing.T) {
 		t.Fatal("unknown condition type")
 	}
 }
+
+func TestTradeOrderSnapshot(t *testing.T) {
+	tr := NewTrade(&contract.Contract{ConID: 1}, LimitOrder("BUY", 10, 100))
+	snap := tr.OrderSnapshot()
+	snap.LmtPrice = 1
+	if tr.Order.LmtPrice != 100 || snap.Action != "BUY" {
+		t.Fatal("OrderSnapshot must return a copy")
+	}
+	if (&Trade{}).OrderSnapshot().Action != "" {
+		t.Fatal("nil order must give the zero order")
+	}
+}
