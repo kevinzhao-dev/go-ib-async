@@ -318,32 +318,40 @@ func (ib *IB) handleTickByTick(r *protocol.FieldReader) {
 			Exchange:          r.ReadString(),
 			SpecialConditions: r.ReadString(),
 		}
-		ib.updateTicker(reqID, func(t *market.Ticker) {
-			t.PrevLast, t.PrevLastSize = t.Last, t.LastSize
-			t.Last, t.LastSize = price, size
-			t.TickByTicks = append(t.TickByTicks, tick)
-		})
+		ib.updateTicker(reqID, func(t *market.Ticker) { applyTickByTickLast(t, tick) })
 	case 3:
 		tick := market.TickByTickBidAsk{Time: tm, BidPrice: r.ReadFloat(), AskPrice: r.ReadFloat(), BidSize: r.ReadFloat(), AskSize: r.ReadFloat()}
 		mask := r.ReadInt()
 		tick.TickAttribBidAsk = market.TickAttribBidAsk{BidPastLow: mask&1 != 0, AskPastHigh: mask&2 != 0}
-		ib.updateTicker(reqID, func(t *market.Ticker) {
-			if tick.BidPrice != t.Bid || tick.BidSize != t.BidSize {
-				t.PrevBid, t.PrevBidSize = t.Bid, t.BidSize
-				t.Bid, t.BidSize = tick.BidPrice, tick.BidSize
-			}
-			if tick.AskPrice != t.Ask || tick.AskSize != t.AskSize {
-				t.PrevAsk, t.PrevAskSize = t.Ask, t.AskSize
-				t.Ask, t.AskSize = tick.AskPrice, tick.AskSize
-			}
-			t.TickByTicks = append(t.TickByTicks, tick)
-		})
+		ib.updateTicker(reqID, func(t *market.Ticker) { applyTickByTickBidAsk(t, tick) })
 	case 4:
 		tick := market.TickByTickMidPoint{Time: tm, MidPoint: r.ReadFloat()}
-		ib.updateTicker(reqID, func(t *market.Ticker) {
-			t.TickByTicks = append(t.TickByTicks, tick)
-		})
+		ib.updateTicker(reqID, func(t *market.Ticker) { applyTickByTickMidPoint(t, tick) })
 	}
+}
+
+// Tick-by-tick updates (live or backfill), applied under the ticker lock.
+
+func applyTickByTickLast(t *market.Ticker, tick market.TickByTickAllLast) {
+	t.PrevLast, t.PrevLastSize = t.Last, t.LastSize
+	t.Last, t.LastSize = tick.Price, tick.Size
+	t.TickByTicks = append(t.TickByTicks, tick)
+}
+
+func applyTickByTickBidAsk(t *market.Ticker, tick market.TickByTickBidAsk) {
+	if tick.BidPrice != t.Bid || tick.BidSize != t.BidSize {
+		t.PrevBid, t.PrevBidSize = t.Bid, t.BidSize
+		t.Bid, t.BidSize = tick.BidPrice, tick.BidSize
+	}
+	if tick.AskPrice != t.Ask || tick.AskSize != t.AskSize {
+		t.PrevAsk, t.PrevAskSize = t.Ask, t.AskSize
+		t.Ask, t.AskSize = tick.AskPrice, tick.AskSize
+	}
+	t.TickByTicks = append(t.TickByTicks, tick)
+}
+
+func applyTickByTickMidPoint(t *market.Ticker, tick market.TickByTickMidPoint) {
+	t.TickByTicks = append(t.TickByTicks, tick)
 }
 
 // handleMktDepth: version, reqId, position, operation, side, price, size.
@@ -372,13 +380,26 @@ func (ib *IB) handleMktDepthL2(r *protocol.FieldReader) {
 	ib.applyDepth(reqID, position, marketMaker, operation, side, price, size)
 }
 
+// resetDepth empties the order book of a depth request (error 317: TWS
+// resets the book and re-sends it).
+func (ib *IB) resetDepth(reqID int64) {
+	ib.updateTicker(reqID, func(t *market.Ticker) {
+		t.DomBids, t.DomAsks = nil, nil
+	})
+}
+
 // applyDepth updates the order book: operation 0 insert, 1 update,
 // 2 delete; side 0 ask, 1 bid.
 func (ib *IB) applyDepth(reqID int64, position int, marketMaker string, operation, side int, price, size float64) {
 	if position < 0 {
 		return
 	}
+	fresh := ib.takeDepthFresh(reqID)
 	ib.updateTicker(reqID, func(t *market.Ticker) {
+		if fresh {
+			// First update of a (re)request: drop the previous book.
+			t.DomBids, t.DomAsks = nil, nil
+		}
 		dom := &t.DomAsks
 		if side == 1 {
 			dom = &t.DomBids

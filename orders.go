@@ -19,6 +19,11 @@ import (
 // 0 also manual TWS orders) and returns their trades. Existing Trade objects
 // are updated in place; orders not yet known are added to the state.
 //
+// With client id 0 TWS also binds the manual orders to the API, which can
+// cancel and resubmit a working order (losing its queue priority). Use
+// ReqAllOpenOrders to only read them. cmd/ibguard blocks reqOpenOrders from
+// client id 0.
+//
 // TWS rejects reqOpenOrders when the API is in read-only mode; the error
 // then matches ErrReadOnlyAPI (ReqAllOpenOrders still works).
 func (ib *IB) ReqOpenOrders(ctx context.Context) ([]*order.Trade, error) {
@@ -91,7 +96,9 @@ func (ib *IB) ReqExecutions(ctx context.Context, filter order.ExecutionFilter) (
 // SyncOptions controls SyncOrders.
 type SyncOptions struct {
 	// AllClients uses reqAllOpenOrders (orders of every API client and TWS)
-	// instead of reqOpenOrders (this client's orders only).
+	// instead of reqOpenOrders (this client's orders only). With client id
+	// 0 SyncOrders never sends reqOpenOrders, which would bind manual TWS
+	// orders: it filters reqAllOpenOrders to client 0 instead.
 	AllClients bool
 	// ExecFilter restricts the executions request (zero value: all of today's).
 	ExecFilter order.ExecutionFilter
@@ -136,21 +143,30 @@ func (ib *IB) SyncOrders(ctx context.Context, opts SyncOptions) (*SyncReport, er
 	report := &SyncReport{}
 
 	myClient := ib.ClientID()
+	// This client's orders out of reqAllOpenOrders.
+	ownOpenOrders := func() ([]*order.Trade, error) {
+		all, err := ib.ReqAllOpenOrders(ctx)
+		var own []*order.Trade
+		for _, t := range all {
+			if t.Order.ClientID == myClient {
+				own = append(own, t)
+			}
+		}
+		return own, err
+	}
 	var open []*order.Trade
 	var err error
-	if opts.AllClients {
+	switch {
+	case opts.AllClients:
 		open, err = ib.ReqAllOpenOrders(ctx)
-	} else {
+	case myClient == 0:
+		// reqOpenOrders from client 0 binds manual TWS orders: read only.
+		open, err = ownOpenOrders()
+	default:
 		open, err = ib.ReqOpenOrders(ctx)
 		if errors.Is(err, ErrReadOnlyAPI) {
 			report.ReadOnly = true
-			var all []*order.Trade
-			all, err = ib.ReqAllOpenOrders(ctx)
-			for _, t := range all {
-				if t.Order.ClientID == myClient {
-					open = append(open, t)
-				}
-			}
+			open, err = ownOpenOrders()
 		}
 	}
 	if err != nil {

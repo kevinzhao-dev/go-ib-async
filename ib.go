@@ -59,12 +59,21 @@ type IB struct {
 	connEpoch atomic.Int64
 	// mdType is the last market data type requested (0 = never).
 	mdType atomic.Int64
+	// depthFresh holds depth requests whose book is emptied before their
+	// first update (see depthStarted).
+	depthMu    sync.Mutex
+	depthFresh map[int64]bool
 
-	// Account updates subscription (nil = none) and its download waiter.
+	// acctMu guards the account updates subscription (nil = none) and
+	// serialises the requests that change it (subscribe, cancel, restore)
+	// so they reach TWS in the order their effect is recorded.
 	acctMu      sync.Mutex
 	acctUpdates *string
 	acctReq     *singleReq
 	timeReq     *singleReq
+	// acctDL is the running account download (see beginAcctDownload).
+	dlMu   sync.Mutex
+	acctDL *acctDownload
 
 	pnlMu     sync.Mutex
 	pnl       map[pnlKey]*account.PnL
@@ -125,6 +134,7 @@ func New() *IB {
 		completedReq:  newSingleReq(),
 		openOrdersReq: newSingleReq(),
 		subs:          map[int64]*subscription{},
+		depthFresh:    map[int64]bool{},
 		acctReq:       newSingleReq(),
 		timeReq:       newSingleReq(),
 		pnl:           map[pnlKey]*account.PnL{},
@@ -168,8 +178,14 @@ func (ib *IB) Connect(ctx context.Context, host string, port, clientID int) erro
 		return err
 	}
 	// Before ConnectedEvent: subscriptions made from its handlers belong to
-	// this connection and are not re-sent by restoreSubscriptions.
+	// this connection and are not re-sent by restoreSubscriptions, and they
+	// get the market data type chosen before the reconnect.
 	ib.connEpoch.Add(1)
+	if t := ib.mdType.Load(); t != 0 {
+		if err := ib.client.ReqMarketDataType(int(t)); err != nil {
+			log.Printf("ibgo: restore market data type: %v", err)
+		}
+	}
 	ib.ConnectedEvent.Emit(struct{}{})
 	return nil
 }
@@ -434,7 +450,7 @@ func (ib *IB) handleMessage(msgID int, r *protocol.FieldReader) {
 // warningCodes are error codes TWS uses for warnings: the request or the
 // order is still alive (mirrors ib_async).
 var warningCodes = map[int]bool{
-	105: true, 110: true, 165: true, 321: true, 329: true,
+	105: true, 110: true, 165: true, 317: true, 321: true, 329: true,
 	399: true, 404: true, 434: true, 492: true, 10167: true,
 	// "Part of requested market data is not subscribed / requires an
 	// additional subscription": the rest of the data keeps streaming.
@@ -455,10 +471,24 @@ func (ib *IB) handleError(r *protocol.FieldReader) {
 		advanced = r.ReadString()
 	}
 
+	// 2101: another API client is subscribed to a different account, so
+	// the pending ReqAccountUpdates was refused.
+	if code == 2101 {
+		if key := ib.acctReq.active(); key != 0 {
+			ibErr := &IBError{ReqID: reqID, Code: code, Message: msg, AdvancedOrderReject: advanced}
+			ib.ErrorEvent.Emit(ibErr)
+			ib.state.EndReq(key, nil, ibErr)
+			return
+		}
+	}
 	// Info codes (2100-2199: data farm status etc.) are logged only.
 	if code >= 2100 && code < 2200 {
 		log.Printf("ibgo: info %d: %s", code, msg)
 		return
+	}
+	// 317: TWS reset the market depth book; it re-sends it from scratch.
+	if code == 317 {
+		ib.resetDepth(reqID)
 	}
 
 	isRequest := reqID >= 0 && ib.state.Requests.Has(reqID)
@@ -1950,6 +1980,7 @@ func (ib *IB) handleUpdatePortfolio(r *protocol.FieldReader) {
 		ib.state.Portfolio[acctName][c.ConID] = item
 	}
 	ib.state.Mu.Unlock()
+	ib.noteAcctDownload(acctName, c.ConID)
 
 	cp := *item
 	ib.PortfolioEvent.Emit(&cp)

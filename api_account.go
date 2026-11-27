@@ -31,24 +31,44 @@ func (ib *IB) defaultAccount(acct string) (string, error) {
 // ReqAccountUpdates subscribes to account values and portfolio updates of
 // one account ("" = the only managed account) and waits until the initial
 // download is complete. Afterwards AccountValues() and Portfolio() stay up
-// to date and AccountValueEvent / PortfolioEvent fire on changes. TWS
-// supports one such subscription at a time; it is re-sent after an
-// automatic reconnect.
+// to date and AccountValueEvent / PortfolioEvent fire on changes. When a
+// download completes, positions of the account it did not report (closed
+// meanwhile) are removed from Portfolio().
+//
+// TWS supports one such subscription at a time (per API client; error 2101
+// when another client holds one for a different account fails the call);
+// it is re-sent after an automatic reconnect. A CancelAccountUpdates while
+// the download is running ends the call with ErrRequestCancelled.
 func (ib *IB) ReqAccountUpdates(ctx context.Context, acct string) error {
 	acct, err := ib.defaultAccount(acct)
 	if err != nil {
 		return err
 	}
+	var mine *string
 	_, err = ib.runSingle(ctx, ib.acctReq, false, func() error {
-		return ib.client.ReqAccountUpdates(true, acct)
+		ib.acctMu.Lock()
+		defer ib.acctMu.Unlock()
+		ib.beginAcctDownload(acct)
+		if err := ib.client.ReqAccountUpdates(true, acct); err != nil {
+			return err
+		}
+		// Recorded with the send, so a cancel or restore that follows is
+		// ordered after it.
+		mine = &acct
+		ib.acctUpdates = mine
+		return nil
 	})
-	if err != nil {
-		return err
+	if err != nil && mine != nil {
+		// Failed or abandoned after subscribing: unsubscribe, unless the
+		// subscription was cancelled or replaced meanwhile.
+		ib.acctMu.Lock()
+		if ib.acctUpdates == mine {
+			ib.acctUpdates = nil
+			_ = ib.client.ReqAccountUpdates(false, acct)
+		}
+		ib.acctMu.Unlock()
 	}
-	ib.acctMu.Lock()
-	ib.acctUpdates = &acct
-	ib.acctMu.Unlock()
-	return nil
+	return err
 }
 
 // CancelAccountUpdates stops the ReqAccountUpdates subscription.
@@ -58,9 +78,69 @@ func (ib *IB) CancelAccountUpdates(acct string) error {
 		return err
 	}
 	ib.acctMu.Lock()
+	defer ib.acctMu.Unlock()
 	ib.acctUpdates = nil
-	ib.acctMu.Unlock()
-	return ib.client.ReqAccountUpdates(false, acct)
+	ib.dlMu.Lock()
+	ib.acctDL = nil
+	ib.dlMu.Unlock()
+	err = ib.client.ReqAccountUpdates(false, acct)
+	// A download still running belongs to the cancelled subscription.
+	if key := ib.acctReq.active(); key != 0 {
+		ib.state.EndReq(key, nil, ErrRequestCancelled)
+	}
+	return err
+}
+
+// acctDownload tracks a running account updates download: the contracts
+// it reported, to drop the portfolio items it did not report at its end.
+type acctDownload struct {
+	account string
+	seen    map[int64]bool
+}
+
+// beginAcctDownload starts tracking the download of a (re)subscription.
+func (ib *IB) beginAcctDownload(acct string) {
+	ib.dlMu.Lock()
+	ib.acctDL = &acctDownload{account: acct, seen: map[int64]bool{}}
+	ib.dlMu.Unlock()
+}
+
+// noteAcctDownload records a portfolio row of the running download.
+func (ib *IB) noteAcctDownload(acct string, conID int64) {
+	ib.dlMu.Lock()
+	if dl := ib.acctDL; dl != nil && dl.account == acct {
+		dl.seen[conID] = true
+	}
+	ib.dlMu.Unlock()
+}
+
+// finishAcctDownload replaces the account's portfolio with the rows of the
+// download that just ended: items it did not report are removed (and fire
+// PortfolioEvent with a zero position).
+func (ib *IB) finishAcctDownload(acct string) {
+	ib.dlMu.Lock()
+	dl := ib.acctDL
+	if dl == nil || dl.account != acct {
+		ib.dlMu.Unlock()
+		return
+	}
+	ib.acctDL = nil
+	ib.dlMu.Unlock()
+
+	var gone []account.PortfolioItem
+	ib.state.Mu.Lock()
+	for conID, it := range ib.state.Portfolio[acct] {
+		if !dl.seen[conID] {
+			gone = append(gone, *it)
+			delete(ib.state.Portfolio[acct], conID)
+		}
+	}
+	ib.state.Mu.Unlock()
+	sort.Slice(gone, func(i, j int) bool { return gone[i].Contract.ConID < gone[j].Contract.ConID })
+	for i := range gone {
+		gone[i].Position, gone[i].MarketValue = 0, 0
+		ib.PortfolioEvent.Emit(&gone[i])
+	}
 }
 
 // Portfolio returns the portfolio items received through ReqAccountUpdates
@@ -85,7 +165,7 @@ func (ib *IB) Portfolio() []account.PortfolioItem {
 
 func (ib *IB) handleAccountDownloadEnd(r *protocol.FieldReader) {
 	r.Skip(1) // version
-	_ = r.ReadString()
+	ib.finishAcctDownload(r.ReadString())
 	if key := ib.acctReq.active(); key != 0 {
 		ib.state.EndReq(key, nil, nil)
 	}
@@ -305,14 +385,17 @@ func (e *QualifyError) Unwrap() error { return e.Err }
 // even when others fail; the error joins one *QualifyError per failure
 // (errors.Is: ErrContractNotFound, ErrAmbiguousContract).
 //
-// An exchange of "SMART" is kept (TWS reports the listing exchange).
+// An exchange of "SMART" and IncludeExpired are kept (TWS reports the
+// listing exchange; IncludeExpired is a request option).
 func (ib *IB) QualifyContracts(ctx context.Context, contracts ...*contract.Contract) error {
 	errs := make([]error, len(contracts))
+	found := make([]*contract.Contract, len(contracts))
 	var wg sync.WaitGroup
 	for i, c := range contracts {
 		wg.Add(1)
 		go func(i int, c *contract.Contract) {
 			defer wg.Done()
+			// Only reads c: the same pointer may be passed more than once.
 			details, err := ib.ReqContractDetails(ctx, c)
 			var ibe *IBError
 			switch {
@@ -325,15 +408,25 @@ func (ib *IB) QualifyContracts(ctx context.Context, contracts ...*contract.Contr
 			case len(details) > 1:
 				errs[i] = &QualifyError{Contract: c, Matches: details, Err: ErrAmbiguousContract}
 			default:
-				exchange := c.Exchange
-				*c = *details[0].Contract
-				if exchange == "SMART" {
-					c.Exchange = exchange
-				}
+				found[i] = details[0].Contract
 			}
 		}(i, c)
 	}
 	wg.Wait()
+	// Update in place once all lookups are done.
+	for i, c := range contracts {
+		q := found[i]
+		if q == nil {
+			continue
+		}
+		exchange, includeExpired := c.Exchange, c.IncludeExpired
+		*c = *q
+		if exchange == "SMART" {
+			c.Exchange = exchange
+		}
+		// A request option, not reported in the contract details.
+		c.IncludeExpired = includeExpired
+	}
 	return errors.Join(errs...)
 }
 

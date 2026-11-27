@@ -238,13 +238,33 @@ func (m *Manager) ClearPendingTickers() {
 // pending request results) but keeps orders, fills, positions and account
 // values so that Trade objects held by callers survive a reconnect and can be
 // re-synchronised with the broker.
-func (m *Manager) ResetSession() {
+//
+// The ticker, subscriber and contract mappings of the request ids in keep
+// (streaming subscriptions about to be re-requested) are kept, and so is
+// the contract index of their tickers.
+func (m *Manager) ResetSession(keep map[int64]bool) {
 	m.Mu.Lock()
 	defer m.Mu.Unlock()
 
+	old := m.MarketState
+	oldContracts := m.ReqID2Contract
 	m.MarketState.reset()
 	m.Results = make(map[int64]interface{})
 	m.ReqID2Contract = make(map[int64]*contract.Contract)
+	for id := range keep {
+		if t := old.ReqID2Ticker[id]; t != nil {
+			m.ReqID2Ticker[id] = t
+			if key := t.Contract.Key(); key != 0 && old.Tickers[key] == t {
+				m.Tickers[key] = t
+			}
+		}
+		if v, ok := old.ReqID2Subscriber[id]; ok {
+			m.ReqID2Subscriber[id] = v
+		}
+		if c := oldContracts[id]; c != nil {
+			m.ReqID2Contract[id] = c
+		}
+	}
 }
 
 // Reset clears all state (called on explicit disconnect).

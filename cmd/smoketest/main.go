@@ -398,6 +398,10 @@ func orderQueries(ib *ibgo.IB) {
 		}
 	}
 	rep, err := ib.SyncOrders(ctx, ibgo.SyncOptions{IncludeCompleted: true})
+	if rep == nil { // an early query failed
+		bad("SyncOrders", "err=%v", err)
+		return
+	}
 	check("SyncOrders", err == nil, "open=%d readOnly=%v err=%v", len(rep.OpenTrades), rep.ReadOnly, err)
 }
 
@@ -455,7 +459,11 @@ func streamingChecks(ib *ibgo.IB, connected chan struct{}, connects *atomic.Int3
 	}
 	check("real-time bars", len(rt.Snapshot()) > 0, "%d bars", len(rt.Snapshot()))
 	bs := bars.Snapshot()
-	check("keepUpToDate bars", len(bs) > 0, "%d bars, last %s", len(bs), bs[len(bs)-1].Date.Format(time.RFC3339))
+	last := "-"
+	if len(bs) > 0 {
+		last = bs[len(bs)-1].Date.Format(time.RFC3339)
+	}
+	check("keepUpToDate bars", len(bs) > 0, "%d bars, last %s", len(bs), last)
 
 	if *guardPID != 0 {
 		section("reconnect (connection dropped by ibguard)")

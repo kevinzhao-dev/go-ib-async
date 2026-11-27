@@ -49,10 +49,9 @@ func (ib *IB) ReqMktData(con *contract.Contract, genericTickList string, snapsho
 	if con == nil {
 		return nil, errors.New("ibgo: ReqMktData needs a contract")
 	}
-	ticker := ib.tickerForContract(con)
 	if snapshot || regulatorySnapshot {
 		reqID := ib.client.GetReqID()
-		ib.registerTickerReq(reqID, con, ticker)
+		ticker := ib.acquireTicker(reqID, con)
 		// Tracked so tickSnapshotEnd / errors can complete it.
 		ib.state.StartReq(reqID, con)
 		if err := ib.client.ReqMktData(reqID, con, genericTickList, snapshot, regulatorySnapshot, nil); err != nil {
@@ -62,19 +61,18 @@ func (ib *IB) ReqMktData(con *contract.Contract, genericTickList string, snapsho
 		}
 		return ticker, nil
 	}
-	_, err := ib.startSub(&subscription{
-		kind:   subMktData,
-		con:    con,
-		ticker: ticker,
+	s := &subscription{
+		kind: subMktData,
+		con:  con,
 		send: func(reqID int64) error {
 			return ib.client.ReqMktData(reqID, con, genericTickList, false, false, nil)
 		},
 		cancel: ib.client.CancelMktData,
-	})
-	if err != nil {
+	}
+	if _, err := ib.startSub(s); err != nil {
 		return nil, err
 	}
-	return ticker, nil
+	return s.ticker, nil
 }
 
 // CancelMktData cancels a ReqMktData subscription. The subscription is found
@@ -94,11 +92,9 @@ func (ib *IB) ReqTickers(ctx context.Context, contracts ...*contract.Contract) (
 	chans := make([]<-chan state.Result, len(contracts))
 	var errs []error
 	for i, con := range contracts {
-		t := ib.tickerForContract(con)
-		tickers[i] = t
 		reqID := ib.client.GetReqID()
 		ids[i] = reqID
-		ib.registerTickerReq(reqID, con, t)
+		tickers[i] = ib.acquireTicker(reqID, con)
 		chans[i] = ib.state.StartReq(reqID, con)
 		if err := ib.client.ReqMktData(reqID, con, "", true, false, nil); err != nil {
 			ib.state.CancelReq(reqID)
@@ -135,25 +131,26 @@ const (
 )
 
 // ReqTickByTickData subscribes to tick-by-tick data. Ticks arrive in
-// ticker.TickByTicks (per update batch) and also update Last/Bid/Ask.
+// ticker.TickByTicks (per update batch) and also update Last/Bid/Ask. With
+// numberOfTicks > 0 TWS first sends up to that many recent ticks; they are
+// delivered the same way, before the live ticks.
 func (ib *IB) ReqTickByTickData(con *contract.Contract, tickType string, numberOfTicks int, ignoreSize bool) (*market.Ticker, error) {
 	switch tickType {
 	case TickByTickLast, TickByTickAllLast, TickByTickBidAsk, TickByTickMidPoint:
 	default:
 		return nil, fmt.Errorf("ibgo: invalid tick-by-tick type %q", tickType)
 	}
-	ticker := ib.tickerForContract(con)
-	_, err := ib.startSub(&subscription{
-		kind: subTickByTick, con: con, ticker: ticker, tag: tickType,
+	s := &subscription{
+		kind: subTickByTick, con: con, tag: tickType,
 		send: func(reqID int64) error {
 			return ib.client.ReqTickByTickData(reqID, con, tickType, numberOfTicks, ignoreSize)
 		},
 		cancel: ib.client.CancelTickByTickData,
-	})
-	if err != nil {
+	}
+	if _, err := ib.startSub(s); err != nil {
 		return nil, err
 	}
-	return ticker, nil
+	return s.ticker, nil
 }
 
 // CancelTickByTickData cancels a ReqTickByTickData subscription.
@@ -163,27 +160,27 @@ func (ib *IB) CancelTickByTickData(con *contract.Contract, tickType string) {
 
 // ReqMktDepth subscribes to market depth (order book). The book is kept in
 // ticker.DomBids / ticker.DomAsks; ticker.DomTicks holds the changes of the
-// current update batch.
+// current update batch. A contract (its ticker) has one book, so one depth
+// subscription at a time, SMART or not: a second one fails with
+// ErrDepthSubscribed. The book is emptied when the first update of a
+// (re)request arrives and when TWS resets it (error 317).
 func (ib *IB) ReqMktDepth(con *contract.Contract, numRows int, isSmartDepth bool) (*market.Ticker, error) {
-	ticker := ib.tickerForContract(con)
 	tag := "exchange"
 	if isSmartDepth {
 		tag = "smart"
 	}
-	_, err := ib.startSub(&subscription{
-		kind: subMktDepth, con: con, ticker: ticker, tag: tag,
+	s := &subscription{
+		kind: subMktDepth, con: con, tag: tag,
 		send: func(reqID int64) error {
-			ticker.Lock()
-			ticker.DomBids, ticker.DomAsks = nil, nil
-			ticker.Unlock()
 			return ib.client.ReqMktDepth(reqID, con, numRows, isSmartDepth, nil)
 		},
 		cancel: func(reqID int64) error { return ib.client.CancelMktDepth(reqID, isSmartDepth) },
-	})
-	if err != nil {
+		onSend: ib.depthStarted,
+	}
+	if _, err := ib.startSub(s); err != nil {
 		return nil, err
 	}
-	return ticker, nil
+	return s.ticker, nil
 }
 
 // CancelMktDepth cancels a ReqMktDepth subscription.
@@ -209,8 +206,8 @@ func (ib *IB) ReqRealTimeBars(con *contract.Contract, barSize int, whatToShow st
 		send: func(reqID int64) error {
 			return ib.client.ReqRealTimeBars(reqID, con, barSize, whatToShow, useRTH, nil)
 		},
-		cancel:    ib.client.CancelRealTimeBars,
-		onRestart: func(reqID int64) { rtbl.Lock(); rtbl.ReqID = reqID; rtbl.Unlock() },
+		cancel:   ib.client.CancelRealTimeBars,
+		setReqID: func(reqID int64) { rtbl.Lock(); rtbl.ReqID = reqID; rtbl.Unlock() },
 	})
 	if err != nil {
 		return nil, err
@@ -247,16 +244,14 @@ func (ib *IB) ReqHistoricalDataStream(ctx context.Context, con *contract.Contrac
 			return ib.client.ReqHistoricalData(reqID, con, "", durationStr, barSizeSetting, whatToShow, useRTH, formatDate, true, nil)
 		},
 		cancel: ib.client.CancelHistoricalData,
-		onRestart: func(reqID int64) {
+		onSend: func(reqID int64) {
 			if firstID == 0 {
 				// First request: track it so the caller can wait for it.
 				firstID = reqID
 				ch = ib.state.StartReq(reqID, con)
 			}
-			bdl.Lock()
-			bdl.ReqID = reqID
-			bdl.Unlock()
 		},
+		setReqID: func(reqID int64) { bdl.Lock(); bdl.ReqID = reqID; bdl.Unlock() },
 	})
 	if err != nil {
 		if firstID != 0 {
@@ -442,21 +437,44 @@ func (ib *IB) handleHeadTimestamp(r *protocol.FieldReader) {
 	ib.state.EndReq(reqID, r.ReadString(), nil)
 }
 
+// historicalTicksDone completes a ReqHistoricalTicks request with the
+// ticks, or delivers them to the ticker of a tick-by-tick subscription
+// whose numberOfTicks backfill they are.
+func historicalTicksDone[T any](ib *IB, reqID int64, ticks []T, done bool, apply func(*market.Ticker, T)) {
+	if !ib.state.Requests.Has(reqID) {
+		if len(ticks) > 0 {
+			ib.updateTicker(reqID, func(t *market.Ticker) {
+				for _, tk := range ticks {
+					apply(t, tk)
+				}
+			})
+		}
+		return
+	}
+	for _, tk := range ticks {
+		ib.state.AppendResult(reqID, tk)
+	}
+	if done {
+		ib.state.EndReq(reqID, nil, nil)
+	}
+}
+
 // handleHistoricalTicks (MIDPOINT): reqId, n, n x (time, unused, price,
 // size), done.
 func (ib *IB) handleHistoricalTicks(r *protocol.FieldReader) {
 	reqID := r.ReadInt()
 	n := int(r.ReadInt())
+	ticks := make([]market.HistoricalTick, 0, n)
 	for range n {
 		t := market.HistoricalTick{Time: time.Unix(r.ReadInt(), 0).UTC()}
 		r.Skip(1)
 		t.Price = r.ReadFloat()
 		t.Size = r.ReadFloat()
-		ib.state.AppendResult(reqID, t)
+		ticks = append(ticks, t)
 	}
-	if r.ReadBool() {
-		ib.state.EndReq(reqID, nil, nil)
-	}
+	historicalTicksDone(ib, reqID, ticks, r.ReadBool(), func(t *market.Ticker, h market.HistoricalTick) {
+		applyTickByTickMidPoint(t, market.TickByTickMidPoint{Time: h.Time, MidPoint: h.Price})
+	})
 }
 
 // handleHistoricalTicksBidAsk: reqId, n, n x (time, mask, bid, ask,
@@ -464,6 +482,7 @@ func (ib *IB) handleHistoricalTicks(r *protocol.FieldReader) {
 func (ib *IB) handleHistoricalTicksBidAsk(r *protocol.FieldReader) {
 	reqID := r.ReadInt()
 	n := int(r.ReadInt())
+	ticks := make([]market.HistoricalTickBidAsk, 0, n)
 	for range n {
 		t := market.HistoricalTickBidAsk{Time: time.Unix(r.ReadInt(), 0).UTC()}
 		mask := r.ReadInt()
@@ -472,11 +491,14 @@ func (ib *IB) handleHistoricalTicksBidAsk(r *protocol.FieldReader) {
 		t.PriceAsk = r.ReadFloat()
 		t.SizeBid = r.ReadFloat()
 		t.SizeAsk = r.ReadFloat()
-		ib.state.AppendResult(reqID, t)
+		ticks = append(ticks, t)
 	}
-	if r.ReadBool() {
-		ib.state.EndReq(reqID, nil, nil)
-	}
+	historicalTicksDone(ib, reqID, ticks, r.ReadBool(), func(t *market.Ticker, h market.HistoricalTickBidAsk) {
+		applyTickByTickBidAsk(t, market.TickByTickBidAsk{
+			Time: h.Time, BidPrice: h.PriceBid, AskPrice: h.PriceAsk, BidSize: h.SizeBid, AskSize: h.SizeAsk,
+			TickAttribBidAsk: h.TickAttribBidAsk,
+		})
+	})
 }
 
 // handleHistoricalTicksLast: reqId, n, n x (time, mask, price, size,
@@ -484,6 +506,7 @@ func (ib *IB) handleHistoricalTicksBidAsk(r *protocol.FieldReader) {
 func (ib *IB) handleHistoricalTicksLast(r *protocol.FieldReader) {
 	reqID := r.ReadInt()
 	n := int(r.ReadInt())
+	ticks := make([]market.HistoricalTickLast, 0, n)
 	for range n {
 		t := market.HistoricalTickLast{Time: time.Unix(r.ReadInt(), 0).UTC()}
 		mask := r.ReadInt()
@@ -492,9 +515,26 @@ func (ib *IB) handleHistoricalTicksLast(r *protocol.FieldReader) {
 		t.Size = r.ReadFloat()
 		t.Exchange = r.ReadString()
 		t.SpecialConditions = r.ReadString()
-		ib.state.AppendResult(reqID, t)
+		ticks = append(ticks, t)
 	}
-	if r.ReadBool() {
-		ib.state.EndReq(reqID, nil, nil)
+	tickType := 1 // Last
+	if ib.subTag(reqID) == TickByTickAllLast {
+		tickType = 2
 	}
+	historicalTicksDone(ib, reqID, ticks, r.ReadBool(), func(t *market.Ticker, h market.HistoricalTickLast) {
+		applyTickByTickLast(t, market.TickByTickAllLast{
+			TickType: tickType, Time: h.Time, Price: h.Price, Size: h.Size,
+			TickAttribLast: h.TickAttribLast, Exchange: h.Exchange, SpecialConditions: h.SpecialConditions,
+		})
+	})
+}
+
+// subTag returns the tag of the subscription with the request id, or "".
+func (ib *IB) subTag(reqID int64) string {
+	ib.subsMu.Lock()
+	defer ib.subsMu.Unlock()
+	if s := ib.subs[reqID]; s != nil {
+		return s.tag
+	}
+	return ""
 }

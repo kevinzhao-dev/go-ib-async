@@ -7,6 +7,7 @@ package ibgo
 // by the application keep updating.
 
 import (
+	"errors"
 	"log"
 	"slices"
 
@@ -27,35 +28,60 @@ const (
 )
 
 type subscription struct {
-	kind   subKind
-	con    *contract.Contract
-	ticker *market.Ticker // tick subscriptions
-	target interface{}    // ReqID2Subscriber value (bar lists, PnL keys)
-	tag    string         // kind-specific discriminator (tick type, smart depth)
+	kind subKind
+	con  *contract.Contract
+	// ticker of a tick subscription (subMktData, subTickByTick,
+	// subMktDepth): the contract's shared ticker, set when the
+	// subscription is first registered unless given.
+	ticker *market.Ticker
+	target interface{} // ReqID2Subscriber value (bar lists, PnL keys)
+	tag    string      // kind-specific discriminator (tick type, smart depth)
 	send   func(reqID int64) error
 	cancel func(reqID int64) error
-	// onRestart is called with the new request id after a reconnect.
-	onRestart func(reqID int64)
+	// onSend is called with the request id before every send, while
+	// subOpMu is held: it may only touch internal state, never a lock an
+	// application can hold (ticker, bar list).
+	onSend func(reqID int64)
+	// setReqID publishes a new request id on the returned object (bar
+	// lists). After a reconnect it runs once subOpMu is released.
+	setReqID func(reqID int64)
 	// epoch is the connection (IB.connEpoch) the subscription was last
 	// sent on, 0 if that send failed. Guarded by IB.subsMu.
 	epoch int64
 }
 
-// tickerForContract returns the ticker already used for the contract (one
-// ticker per qualified contract, like ib_async) or a new one.
-func (ib *IB) tickerForContract(con *contract.Contract) *market.Ticker {
-	if key := con.Key(); key != 0 {
-		ib.state.Mu.RLock()
-		t := ib.state.Tickers[key]
-		ib.state.Mu.RUnlock()
-		if t != nil {
-			return t
-		}
-	}
-	return market.NewTicker(con)
+func (s *subscription) usesTicker() bool {
+	return s.kind == subMktData || s.kind == subTickByTick || s.kind == subMktDepth
 }
 
-// registerTickerReq maps a market data request id to its ticker.
+// ErrDepthSubscribed is returned by ReqMktDepth when the contract already
+// has a market depth subscription: its ticker holds a single order book.
+var ErrDepthSubscribed = errors.New("ibgo: market depth already subscribed for this contract (cancel it first)")
+
+// Lock order: subOpMu, then subsMu / depthMu, then state.Mu. Ticker and
+// bar-list locks are never taken while holding subOpMu: applications may
+// hold their read locks while calling Cancel*.
+
+// acquireTicker maps reqID to the ticker already used for the contract
+// (one ticker per qualified contract, like ib_async) or to a new one, under
+// one lock so concurrent requests for a contract cannot create two.
+func (ib *IB) acquireTicker(reqID int64, con *contract.Contract) *market.Ticker {
+	ib.state.Mu.Lock()
+	defer ib.state.Mu.Unlock()
+	key := con.Key()
+	t := ib.state.Tickers[key]
+	if key == 0 || t == nil {
+		t = market.NewTicker(con)
+		if key != 0 {
+			ib.state.Tickers[key] = t
+		}
+	}
+	ib.state.ReqID2Ticker[reqID] = t
+	ib.state.ReqID2Contract[reqID] = con
+	return t
+}
+
+// registerTickerReq maps a request id to a given ticker.
 func (ib *IB) registerTickerReq(reqID int64, con *contract.Contract, t *market.Ticker) {
 	ib.state.Mu.Lock()
 	ib.state.ReqID2Ticker[reqID] = t
@@ -91,14 +117,22 @@ func (ib *IB) releaseReq(reqID int64) {
 }
 
 func (ib *IB) registerSub(reqID int64, s *subscription, epoch int64) {
-	if s.ticker != nil {
-		ib.registerTickerReq(reqID, s.con, s.ticker)
+	if s.usesTicker() {
+		if s.ticker == nil {
+			s.ticker = ib.acquireTicker(reqID, s.con)
+		} else {
+			ib.registerTickerReq(reqID, s.con, s.ticker)
+		}
+	}
+	ib.state.Mu.Lock()
+	if s.con != nil {
+		// Lets errors of the request carry its contract (IBError.Contract).
+		ib.state.ReqID2Contract[reqID] = s.con
 	}
 	if s.target != nil {
-		ib.state.Mu.Lock()
 		ib.state.ReqID2Subscriber[reqID] = s.target
-		ib.state.Mu.Unlock()
 	}
+	ib.state.Mu.Unlock()
 	ib.subsMu.Lock()
 	s.epoch = epoch
 	ib.subs[reqID] = s
@@ -110,22 +144,56 @@ func (ib *IB) unregisterSub(reqID int64) *subscription {
 	s := ib.subs[reqID]
 	delete(ib.subs, reqID)
 	ib.subsMu.Unlock()
+	ib.depthDone(reqID)
 	ib.releaseReq(reqID)
 	return s
 }
 
 // startSub registers a subscription under a new request id and sends it.
+// Registering and sending are serialised with cancelling (subOpMu), so a
+// concurrent Cancel* either finds nothing or cancels after the send.
 func (ib *IB) startSub(s *subscription) (int64, error) {
+	ib.subOpMu.Lock()
+	defer ib.subOpMu.Unlock()
+	if s.kind == subMktDepth && ib.hasSub(func(o *subscription) bool {
+		return o.kind == subMktDepth && sameContract(o.con, s.con)
+	}) {
+		return 0, ErrDepthSubscribed
+	}
 	reqID := ib.client.GetReqID()
 	ib.registerSub(reqID, s, ib.connEpoch.Load())
-	if s.onRestart != nil {
-		s.onRestart(reqID)
+	if s.setReqID != nil {
+		s.setReqID(reqID) // the object is not returned yet: nobody holds its lock
+	}
+	if s.onSend != nil {
+		s.onSend(reqID)
 	}
 	if err := s.send(reqID); err != nil {
 		ib.unregisterSub(reqID)
 		return 0, err
 	}
 	return reqID, nil
+}
+
+func (ib *IB) hasSub(pred func(*subscription) bool) bool {
+	ib.subsMu.Lock()
+	defer ib.subsMu.Unlock()
+	for _, s := range ib.subs {
+		if pred(s) {
+			return true
+		}
+	}
+	return false
+}
+
+// sameContract reports whether a and b denote the same contract (and so
+// share a ticker): the same pointer or the same contract key.
+func sameContract(a, b *contract.Contract) bool {
+	if a == b {
+		return true
+	}
+	k := a.Key()
+	return k != 0 && k == b.Key()
 }
 
 // endSub cancels the first subscription matching pred: the lowest request
@@ -165,6 +233,7 @@ func (ib *IB) endSub(pred func(*subscription) bool) bool {
 	live := s.epoch != 0 && s.epoch == cur
 	ib.subsMu.Unlock()
 
+	ib.depthDone(reqID)
 	ib.releaseReq(reqID)
 	// A subscription not (re)sent on the current connection is unknown to
 	// TWS: there is nothing to cancel.
@@ -192,13 +261,34 @@ func (ib *IB) clearSubs() {
 	ib.subsMu.Lock()
 	ib.subs = map[int64]*subscription{}
 	ib.subsMu.Unlock()
+	ib.depthMu.Lock()
+	clear(ib.depthFresh)
+	ib.depthMu.Unlock()
 	ib.acctMu.Lock()
 	ib.acctUpdates = nil
 	ib.acctMu.Unlock()
+	ib.dlMu.Lock()
+	ib.acctDL = nil
+	ib.dlMu.Unlock()
 	ib.pnlMu.Lock()
 	clear(ib.pnl)
 	clear(ib.pnlSingle)
 	ib.pnlMu.Unlock()
+}
+
+// resetSession drops the per-connection state after the connection was
+// lost, keeping the request-id mappings of the registered subscriptions
+// (and with them the one ticker per contract) until restoreSubscriptions
+// moves each to a new request id. Request ids are never reused, so nothing
+// arrives for the old ones.
+func (ib *IB) resetSession() {
+	ib.subsMu.Lock()
+	keep := make(map[int64]bool, len(ib.subs))
+	for id := range ib.subs {
+		keep[id] = true
+	}
+	ib.subsMu.Unlock()
+	ib.state.ResetSession(keep)
 }
 
 // releaseFailedSnapshot drops the ticker mapping of a failed one-off
@@ -216,23 +306,18 @@ func (ib *IB) releaseFailedSnapshot(reqID int64) {
 // that was sent on an earlier connection (or whose re-send failed).
 // Subscriptions already made on the current connection, e.g. from a
 // ConnectedEvent handler, are left alone. A subscription whose re-send
-// fails stays registered and is retried after the next reconnect. Market
-// data type and account updates are restored first so the re-requested
-// data arrives in the expected form.
+// fails stays registered and is retried after the next reconnect. Account
+// updates are restored first; the market data type was already re-applied
+// by Connect.
 func (ib *IB) restoreSubscriptions() {
-	if t := ib.mdType.Load(); t != 0 {
-		if err := ib.client.ReqMarketDataType(int(t)); err != nil {
-			log.Printf("ibgo: restore market data type: %v", err)
-		}
-	}
 	ib.acctMu.Lock()
-	acct := ib.acctUpdates
-	ib.acctMu.Unlock()
-	if acct != nil {
+	if acct := ib.acctUpdates; acct != nil {
+		ib.beginAcctDownload(*acct)
 		if err := ib.client.ReqAccountUpdates(true, *acct); err != nil {
 			log.Printf("ibgo: restore account updates: %v", err)
 		}
 	}
+	ib.acctMu.Unlock()
 
 	cur := ib.connEpoch.Load()
 	ib.subsMu.Lock()
@@ -247,8 +332,12 @@ func (ib *IB) restoreSubscriptions() {
 
 	restored, failed := 0, 0
 	var firstErr error
+	var publish []func()
 	for _, id := range ids {
-		ok, err := ib.restoreSub(id, cur)
+		ok, pub, err := ib.restoreSub(id, cur)
+		if pub != nil {
+			publish = append(publish, pub)
+		}
 		switch {
 		case err != nil:
 			failed++
@@ -258,6 +347,12 @@ func (ib *IB) restoreSubscriptions() {
 		case ok:
 			restored++
 		}
+	}
+	// New request ids are published on the returned objects after every
+	// subscription was re-sent: this takes their locks, which the
+	// application may hold for a while.
+	for _, pub := range publish {
+		pub()
 	}
 	if restored > 0 {
 		log.Printf("ibgo: restored %d subscriptions", restored)
@@ -270,31 +365,68 @@ func (ib *IB) restoreSubscriptions() {
 // restoreSub re-sends one subscription of an earlier connection under a new
 // request id. It reports false when the subscription was cancelled
 // meanwhile; on a send error the subscription stays registered, marked as
-// not sent, for the next reconnect.
-func (ib *IB) restoreSub(oldID, epoch int64) (bool, error) {
+// not sent, for the next reconnect. The returned func, if any, publishes
+// the new request id on the subscription's object; call it without locks.
+func (ib *IB) restoreSub(oldID, epoch int64) (bool, func(), error) {
 	ib.subOpMu.Lock()
-	defer ib.subOpMu.Unlock()
-
 	ib.subsMu.Lock()
 	s := ib.subs[oldID]
 	if s == nil || s.epoch == epoch {
 		ib.subsMu.Unlock()
-		return false, nil
+		ib.subOpMu.Unlock()
+		return false, nil, nil
 	}
 	delete(ib.subs, oldID)
 	ib.subsMu.Unlock()
-	ib.releaseReq(oldID)
 
+	// Register the new id before releasing the old one, so the contract's
+	// ticker stays the registered one throughout.
 	reqID := ib.client.GetReqID()
 	ib.registerSub(reqID, s, epoch)
-	if s.onRestart != nil {
-		s.onRestart(reqID)
+	ib.depthDone(oldID)
+	ib.releaseReq(oldID)
+	if s.onSend != nil {
+		s.onSend(reqID)
 	}
-	if err := s.send(reqID); err != nil {
+	err := s.send(reqID)
+	if err != nil {
 		ib.subsMu.Lock()
 		s.epoch = 0
 		ib.subsMu.Unlock()
-		return false, err
 	}
-	return true, nil
+	ib.subOpMu.Unlock()
+
+	// Not under subOpMu: setReqID takes the lock of an object the
+	// application holds and may be reading while it calls Cancel*.
+	var publish func()
+	if s.setReqID != nil {
+		publish = func() { s.setReqID(reqID) }
+	}
+	return err == nil, publish, err
+}
+
+// --- market depth books ---
+
+// depthStarted marks a depth request whose ticker book must be emptied
+// before its first update is applied (on the reader goroutine, which owns
+// the book: callbacks may read DomBids/DomAsks without locking).
+func (ib *IB) depthStarted(reqID int64) {
+	ib.depthMu.Lock()
+	ib.depthFresh[reqID] = true
+	ib.depthMu.Unlock()
+}
+
+func (ib *IB) depthDone(reqID int64) {
+	ib.depthMu.Lock()
+	delete(ib.depthFresh, reqID)
+	ib.depthMu.Unlock()
+}
+
+// takeDepthFresh reports (once) whether reqID's book must be emptied.
+func (ib *IB) takeDepthFresh(reqID int64) bool {
+	ib.depthMu.Lock()
+	defer ib.depthMu.Unlock()
+	fresh := ib.depthFresh[reqID]
+	delete(ib.depthFresh, reqID)
+	return fresh
 }

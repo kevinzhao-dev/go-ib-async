@@ -105,7 +105,7 @@ func TestSnapshotsAndResetSession(t *testing.T) {
 		t.Fatalf("last time = %v %v", lt, ts)
 	}
 
-	m.ResetSession()
+	m.ResetSession(nil)
 	if len(m.Trades) != 2 || len(m.Fills) != 1 || len(m.Positions) != 1 || len(m.AccountValues) != 1 {
 		t.Fatal("ResetSession must keep orders, fills, positions and account values")
 	}

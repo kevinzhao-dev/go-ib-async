@@ -54,26 +54,13 @@ var permissionCodes = map[int]string{
 	10197: "COMPETING LIVE SESSION",
 }
 
-// errLog records request errors with the phase (request kind) that was
-// running when they arrived. Errors carry no request kind, so this is how
-// an error is attributed when a contract has several kinds of requests.
+// errLog records request errors by the contract pointer of the request
+// (IBError.Contract). Every probe sends its own copy of the contract, so an
+// error is attributed to the request that caused it whenever it arrives.
 type errLog struct {
-	mu      sync.Mutex
-	phase   string
-	entries []errEntry
-	others  []string
-}
-
-type errEntry struct {
-	phase string
-	conID int64
-	err   *ibgo.IBError
-}
-
-func (l *errLog) setPhase(p string) {
-	l.mu.Lock()
-	l.phase = p
-	l.mu.Unlock()
+	mu     sync.Mutex
+	byCon  map[*contract.Contract][]*ibgo.IBError
+	others []string
 }
 
 func (l *errLog) add(e *ibgo.IBError) {
@@ -82,24 +69,24 @@ func (l *errLog) add(e *ibgo.IBError) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if e.Contract != nil && e.Contract.ConID != 0 {
-		l.entries = append(l.entries, errEntry{l.phase, e.Contract.ConID, e})
+	if e.Contract != nil {
+		l.byCon[e.Contract] = append(l.byCon[e.Contract], e)
 		return
 	}
-	l.others = append(l.others, fmt.Sprintf("[%s reqId=%d] %d %.100s", l.phase, e.ReqID, e.Code, e.Message))
+	l.others = append(l.others, fmt.Sprintf("[reqId=%d] %d %.100s", e.ReqID, e.Code, e.Message))
 }
 
-// get returns the errors of conID, of one phase or ("") of all phases.
-func (l *errLog) get(phase string, conID int64) []*ibgo.IBError {
+// get returns the errors of the requests sent with con.
+func (l *errLog) get(con *contract.Contract) []*ibgo.IBError {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	var out []*ibgo.IBError
-	for _, en := range l.entries {
-		if en.conID == conID && (phase == "" || en.phase == phase) {
-			out = append(out, en.err)
-		}
-	}
-	return out
+	return append([]*ibgo.IBError(nil), l.byCon[con]...)
+}
+
+// probeCopy returns a copy of c for one probe (see errLog).
+func probeCopy(c *contract.Contract) *contract.Contract {
+	cp := *c
+	return &cp
 }
 
 // counts are accumulated in UpdateEvent callbacks: the per-update tick
@@ -147,7 +134,7 @@ type item struct {
 func main() {
 	flag.Parse()
 	ib := ibgo.New()
-	errs := &errLog{}
+	errs := &errLog{byCon: map[*contract.Contract][]*ibgo.IBError{}}
 	ib.ErrorEvent.Subscribe(errs.add)
 	ctx, cancel := tctx(15 * time.Second)
 	err := ib.Connect(ctx, *host, *port, *clientID)
@@ -168,7 +155,6 @@ func main() {
 	items := contracts(ib, now)
 	cnt := &counter{m: map[*market.Ticker]*counts{}}
 
-	errs.setPhase("mktData")
 	for i := range items {
 		t, err := ib.ReqMktData(items[i].con, "", false, false)
 		if err != nil {
@@ -183,7 +169,7 @@ func main() {
 	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
 		settled := true
 		for _, it := range items {
-			if it.ticker != nil && cnt.get(it.ticker).updates == 0 && len(errs.get("", it.con.ConID)) == 0 {
+			if it.ticker != nil && cnt.get(it.ticker).updates == 0 && len(errs.get(it.con)) == 0 {
 				settled = false
 			}
 		}
@@ -193,41 +179,47 @@ func main() {
 		time.Sleep(200 * time.Millisecond)
 	}
 
+	// Extra probes, each with its own contract copy.
+	type probe struct {
+		con    *contract.Contract
+		ticker *market.Ticker
+		bars   *market.RealTimeBarList
+	}
 	var extra []*contract.Contract
-	hasExtra := map[int64]bool{}
 	for _, it := range items {
 		if it.con.SecType == "STK" && (it.con.Symbol == "SPY" || it.con.Symbol == "AAPL") || it.con.Symbol == "MES" {
 			extra = append(extra, it.con)
-			hasExtra[it.con.ConID] = true
 		}
 	}
-	errs.setPhase("tickByTick")
-	tbt := map[*contract.Contract]*market.Ticker{}
+	tbt := map[*contract.Contract]*probe{}
 	for _, c := range extra {
-		if t, err := ib.ReqTickByTickData(c, ibgo.TickByTickBidAsk, 0, false); err == nil {
-			tbt[c] = t
+		p := &probe{con: probeCopy(c)}
+		if t, err := ib.ReqTickByTickData(p.con, ibgo.TickByTickBidAsk, 0, false); err == nil {
+			p.ticker = t
+			tbt[c] = p
 			cnt.watch(t)
 		}
 	}
 	time.Sleep(3 * time.Second)
-	errs.setPhase("bars")
-	bars := map[*contract.Contract]*market.RealTimeBarList{}
+	bars := map[*contract.Contract]*probe{}
 	for _, c := range extra {
-		if b, err := ib.ReqRealTimeBars(c, 5, "TRADES", false); err == nil {
-			bars[c] = b
+		p := &probe{con: probeCopy(c)}
+		if b, err := ib.ReqRealTimeBars(p.con, 5, "TRADES", false); err == nil {
+			p.bars = b
+			bars[c] = p
 		}
 	}
 	time.Sleep(3 * time.Second)
-	errs.setPhase("depth")
-	depth := map[*contract.Contract]*market.Ticker{}
+	depth := map[*contract.Contract]*probe{}
 	for _, c := range extra {
-		if t, err := ib.ReqMktDepth(c, 5, c.SecType == "STK"); err == nil {
-			depth[c] = t
+		p := &probe{con: probeCopy(c)}
+		if t, err := ib.ReqMktDepth(p.con, 5, c.SecType == "STK"); err == nil {
+			p.ticker = t
+			depth[c] = p
 			cnt.watch(t)
 		}
 	}
 	time.Sleep(3 * time.Second)
-	errs.setPhase("streaming")
 	fmt.Printf("streaming for %s ...\n", *watch)
 	time.Sleep(*watch)
 
@@ -242,11 +234,7 @@ func main() {
 		}
 		d := it.ticker.Snapshot()
 		c := cnt.get(it.ticker)
-		phase := "" // only market data was requested: every error is its
-		if hasExtra[it.con.ConID] {
-			phase = "mktData"
-		}
-		e := errs.get(phase, it.con.ConID)
+		e := errs.get(it.con)
 		age := "-"
 		if !d.LastTimestamp.IsZero() {
 			age = time.Since(d.LastTimestamp).Round(time.Second).String()
@@ -262,26 +250,26 @@ func main() {
 
 	fmt.Printf("\n== tick-by-tick (BidAsk) / 5-second bars / depth ==\n")
 	for _, c := range extra {
-		if t := tbt[c]; t != nil {
-			n := cnt.get(t).tickByTicks
-			fmt.Printf("  %-30s %s\n", "tick-by-tick "+c.Symbol, extraVerdict(n, "ticks", errs.get("tickByTick", c.ConID)))
+		if p := tbt[c]; p != nil {
+			n := cnt.get(p.ticker).tickByTicks
+			fmt.Printf("  %-30s %s\n", "tick-by-tick "+c.Symbol, extraVerdict(n, "ticks", errs.get(p.con)))
 		}
 	}
 	for _, c := range extra {
-		if b := bars[c]; b != nil {
-			n := len(b.Snapshot())
-			fmt.Printf("  %-30s %s\n", "5-second bars "+c.Symbol, extraVerdict(n, "bars", errs.get("bars", c.ConID)))
+		if p := bars[c]; p != nil {
+			n := len(p.bars.Snapshot())
+			fmt.Printf("  %-30s %s\n", "5-second bars "+c.Symbol, extraVerdict(n, "bars", errs.get(p.con)))
 		}
 	}
 	for _, c := range extra {
-		if t := depth[c]; t != nil {
-			d := t.Snapshot()
+		if p := depth[c]; p != nil {
+			d := p.ticker.Snapshot()
 			kind := "depth "
 			if c.SecType == "STK" {
 				kind = "SMART depth "
 			}
 			fmt.Printf("  %-30s %s (%d bid / %d ask levels)\n", kind+c.Symbol,
-				extraVerdict(cnt.get(t).domTicks, "updates", errs.get("depth", c.ConID)), len(d.DomBids), len(d.DomAsks))
+				extraVerdict(cnt.get(p.ticker).domTicks, "updates", errs.get(p.con)), len(d.DomBids), len(d.DomAsks))
 		}
 	}
 	errs.mu.Lock()
@@ -295,14 +283,14 @@ func main() {
 			ib.CancelMktData(it.con)
 		}
 	}
-	for c := range tbt {
-		ib.CancelTickByTickData(c, ibgo.TickByTickBidAsk)
+	for _, p := range tbt {
+		ib.CancelTickByTickData(p.con, ibgo.TickByTickBidAsk)
 	}
-	for _, b := range bars {
-		ib.CancelRealTimeBars(b)
+	for _, p := range bars {
+		ib.CancelRealTimeBars(p.bars)
 	}
-	for c := range depth {
-		ib.CancelMktDepth(c, c.SecType == "STK")
+	for _, p := range depth {
+		ib.CancelMktDepth(p.con, p.con.SecType == "STK")
 	}
 	time.Sleep(time.Second)
 }

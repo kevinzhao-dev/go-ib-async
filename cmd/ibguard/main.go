@@ -1,14 +1,16 @@
 // ibguard is a TCP proxy between API clients and a TWS/IB Gateway that
 // guarantees no order can reach the gateway: it parses every client->gateway
 // message and kills the session, without forwarding the message, when it is
-// placeOrder, cancelOrder, reqGlobalCancel, exerciseOptions, replaceFA or
-// reqAutoOpenOrders. Everything else (market data, account, historical data,
-// contract details, ...) passes through.
+// placeOrder, cancelOrder, reqGlobalCancel, exerciseOptions, replaceFA,
+// reqAutoOpenOrders, or reqOpenOrders from client id 0 (which binds manual
+// TWS orders to the API). Everything else (market data, account, historical
+// data, contract details, ...) passes through.
 //
-// It fails closed: a message whose id is not a plain decimal id between 1
-// and maxMsgID also kills the session. The API version offered by the
-// client is capped at maxServerVersion, because newer servers send binary
-// message ids and protobuf messages the guard cannot inspect.
+// It fails closed: only message ids on an explicit allowlist pass, so a
+// message whose id is unassigned or not a plain decimal number also kills
+// the session. The API version offered by the client is capped at
+// maxServerVersion, because newer servers send binary message ids and
+// protobuf messages the guard cannot inspect.
 //
 // Use it to develop or test read-only features against a live account:
 //
@@ -57,40 +59,121 @@ var blocked = map[int]string{
 	58: "REQ_GLOBAL_CANCEL",
 }
 
+// allowed lists every outbound message id that may reach the gateway (up to
+// maxServerVersion). Ids not listed, including unassigned ones, kill the
+// session. REQ_OPEN_ORDERS is further restricted, see session.check.
+var allowed = map[int]string{
+	1: "REQ_MKT_DATA", 2: "CANCEL_MKT_DATA", 5: "REQ_OPEN_ORDERS",
+	6: "REQ_ACCOUNT_UPDATES", 7: "REQ_EXECUTIONS", 8: "REQ_IDS",
+	9: "REQ_CONTRACT_DETAILS", 10: "REQ_MKT_DEPTH", 11: "CANCEL_MKT_DEPTH",
+	12: "REQ_NEWS_BULLETINS", 13: "CANCEL_NEWS_BULLETINS",
+	14: "SET_SERVER_LOGLEVEL", 16: "REQ_ALL_OPEN_ORDERS",
+	17: "REQ_MANAGED_ACCTS", 18: "REQ_FA", 20: "REQ_HISTORICAL_DATA",
+	22: "REQ_SCANNER_SUBSCRIPTION", 23: "CANCEL_SCANNER_SUBSCRIPTION",
+	24: "REQ_SCANNER_PARAMETERS", 25: "CANCEL_HISTORICAL_DATA",
+	49: "REQ_CURRENT_TIME", 50: "REQ_REAL_TIME_BARS", 51: "CANCEL_REAL_TIME_BARS",
+	52: "REQ_FUNDAMENTAL_DATA", 53: "CANCEL_FUNDAMENTAL_DATA",
+	54: "REQ_CALC_IMPLIED_VOLAT", 55: "REQ_CALC_OPTION_PRICE",
+	56: "CANCEL_CALC_IMPLIED_VOLAT", 57: "CANCEL_CALC_OPTION_PRICE",
+	59: "REQ_MARKET_DATA_TYPE", 61: "REQ_POSITIONS", 62: "REQ_ACCOUNT_SUMMARY",
+	63: "CANCEL_ACCOUNT_SUMMARY", 64: "CANCEL_POSITIONS",
+	65: "VERIFY_REQUEST", 66: "VERIFY_MESSAGE", 67: "QUERY_DISPLAY_GROUPS",
+	68: "SUBSCRIBE_TO_GROUP_EVENTS", 69: "UPDATE_DISPLAY_GROUP",
+	70: "UNSUBSCRIBE_FROM_GROUP_EVENTS", 71: "START_API",
+	72: "VERIFY_AND_AUTH_REQUEST", 73: "VERIFY_AND_AUTH_MESSAGE",
+	74: "REQ_POSITIONS_MULTI", 75: "CANCEL_POSITIONS_MULTI",
+	76: "REQ_ACCOUNT_UPDATES_MULTI", 77: "CANCEL_ACCOUNT_UPDATES_MULTI",
+	78: "REQ_SEC_DEF_OPT_PARAMS", 79: "REQ_SOFT_DOLLAR_TIERS",
+	80: "REQ_FAMILY_CODES", 81: "REQ_MATCHING_SYMBOLS",
+	82: "REQ_MKT_DEPTH_EXCHANGES", 83: "REQ_SMART_COMPONENTS",
+	84: "REQ_NEWS_ARTICLE", 85: "REQ_NEWS_PROVIDERS", 86: "REQ_HISTORICAL_NEWS",
+	87: "REQ_HEAD_TIMESTAMP", 88: "REQ_HISTOGRAM_DATA", 89: "CANCEL_HISTOGRAM_DATA",
+	90: "CANCEL_HEAD_TIMESTAMP", 91: "REQ_MARKET_RULE", 92: "REQ_PNL",
+	93: "CANCEL_PNL", 94: "REQ_PNL_SINGLE", 95: "CANCEL_PNL_SINGLE",
+	96: "REQ_HISTORICAL_TICKS", 97: "REQ_TICK_BY_TICK_DATA",
+	98: "CANCEL_TICK_BY_TICK_DATA", 99: "REQ_COMPLETED_ORDERS",
+	100: "REQ_WSH_META_DATA", 101: "CANCEL_WSH_META_DATA",
+	102: "REQ_WSH_EVENT_DATA", 103: "CANCEL_WSH_EVENT_DATA", 104: "REQ_USER_INFO",
+}
+
 const (
 	// maxServerVersion is the highest API version negotiated through the
 	// guard. Up to it every message starts with its id as decimal text.
 	maxServerVersion = 178
-	// maxMsgID is the highest outbound message id up to maxServerVersion
-	// (REQ_USER_INFO); higher ids are unknown and rejected.
-	maxMsgID = 104
+
+	msgReqOpenOrders = 5
+	msgStartAPI      = 71
 )
 
-// checkOutbound returns why a client message must not be forwarded, or ""
-// when it may pass. The id is parsed as TWS parses it (a decimal number),
-// so encodings like "03" cannot sneak past the block list.
-func checkOutbound(p []byte) string {
-	i := bytes.IndexByte(p, 0)
-	if i <= 0 {
+// session holds what the guard learned about one client session.
+type session struct {
+	// clientID is the API client id sent with START_API, -1 before.
+	clientID int
+}
+
+func newSession() *session { return &session{clientID: -1} }
+
+// check returns why a client message must not be forwarded, or "" when it
+// may pass. The id is parsed as TWS parses it (a decimal number), so
+// encodings like "03" cannot sneak past the lists.
+//
+// REQ_OPEN_ORDERS from client id 0 (or before START_API) is blocked: for
+// client 0 TWS binds manually placed orders to the API, which can cancel
+// and resubmit a working order and cost its queue priority.
+// REQ_ALL_OPEN_ORDERS reads the same orders without binding them.
+func (s *session) check(p []byte) string {
+	fields := bytes.Split(p, []byte{0})
+	if len(fields) < 2 || len(fields[0]) == 0 {
 		return "message without a text id"
 	}
-	s := string(p[:i])
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			return fmt.Sprintf("non-numeric message id %q", s)
-		}
-	}
-	id, err := strconv.Atoi(s)
-	if err != nil {
-		return fmt.Sprintf("bad message id %q", s)
+	id, why := parseID(fields[0])
+	if why != "" {
+		return why
 	}
 	if name, bad := blocked[id]; bad {
 		return fmt.Sprintf("%s (%d)", name, id)
 	}
-	if id < 1 || id > maxMsgID {
+	name, ok := allowed[id]
+	if !ok {
 		return fmt.Sprintf("unknown message id %d", id)
 	}
+	switch id {
+	case msgStartAPI:
+		// START_API: id, version, clientId, optional capabilities.
+		if s.clientID >= 0 {
+			return "second START_API"
+		}
+		if len(fields) < 4 {
+			return "START_API without a client id"
+		}
+		cid, why := parseID(fields[2])
+		if why != "" {
+			return "START_API client id: " + why
+		}
+		s.clientID = cid
+	case msgReqOpenOrders:
+		if s.clientID <= 0 {
+			return fmt.Sprintf("%s (%d) from client id 0 or before START_API (binds manual TWS orders; use REQ_ALL_OPEN_ORDERS)", name, id)
+		}
+	}
 	return ""
+}
+
+// parseID parses a plain non-negative decimal number.
+func parseID(b []byte) (int, string) {
+	if len(b) == 0 || len(b) > 9 {
+		return 0, fmt.Sprintf("bad message id %q", b)
+	}
+	for _, c := range b {
+		if c < '0' || c > '9' {
+			return 0, fmt.Sprintf("non-numeric message id %q", b)
+		}
+	}
+	n, err := strconv.Atoi(string(b))
+	if err != nil {
+		return 0, fmt.Sprintf("bad message id %q", b)
+	}
+	return n, ""
 }
 
 // capHandshake rewrites the client's version range "vMIN..MAX[ options]"
@@ -239,6 +322,7 @@ func handle(id int, client net.Conn) {
 	if err := writeFrame(server, capped); err != nil {
 		return
 	}
+	sess := newSession()
 	for {
 		p, err := readFrame(r)
 		if err != nil {
@@ -246,7 +330,7 @@ func handle(id int, client net.Conn) {
 			log.Printf("c%d: session closed", id)
 			return
 		}
-		if why := checkOutbound(p); why != "" {
+		if why := sess.check(p); why != "" {
 			record(id, "XX", p)
 			log.Printf("c%d: BLOCKED outbound %s - session killed, nothing forwarded", id, why)
 			kill()
@@ -273,7 +357,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("guard listening on %s -> %s (pid %d, blocking %d order message types)", *listen, *upstream, os.Getpid(), len(blocked))
+	log.Printf("guard listening on %s -> %s (pid %d, %d message types allowed, %d order message types blocked)", *listen, *upstream, os.Getpid(), len(allowed), len(blocked))
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGUSR1)
 	go func() {

@@ -14,7 +14,7 @@ wire protocol); **unit** = unit tests only.
 | Feature | Status | Notes |
 |---------|--------|-------|
 | TCP connection / handshake | live, e2e | Dial honours context; `ErrAlreadyConnected` on double connect; state resets when the peer closes |
-| Reconnection / heartbeat | live, e2e | Auto-reconnect keeps orders/fills/positions, re-requests every streaming subscription and the market data type; optional post-connect `SyncOrders` |
+| Reconnection / heartbeat | live, e2e | Auto-reconnect keeps orders/fills/positions and one Ticker per contract, re-applies the market data type before `ConnectedEvent`, re-requests every streaming subscription; the account download after a reconnect replaces the portfolio; optional post-connect `SyncOrders` (never binds manual orders) |
 | Contract details, `QualifyContracts` | live | Not found / ambiguous errors (`ErrContractNotFound`, `ErrAmbiguousContract`, `*QualifyError`) |
 | `ReqMatchingSymbols`, `ReqMarketRule`, `ReqSecDefOptParams` | live | |
 | Historical bars | live | Intraday dates with time zone; `formatDate=2` in UTC |
@@ -22,10 +22,10 @@ wire protocol); **unit** = unit tests only.
 | `ReqHistoricalTicks` (TRADES / BID_ASK / MIDPOINT), `ReqHeadTimeStamp` | live | |
 | Market data: `ReqMktData`, `ReqTickers` (snapshots), `ReqMarketDataType` | live | Real-time (US stocks, OPRA, CME/CBOT/NYMEX/COMEX futures) and delayed ticks, tickReqParams (minTick, BBO exchange), one Ticker per contract; permissions per venue: `cmd/mdcheck` |
 | Option greeks (tickOptionComputation) | live | Bid/ask/last/model greeks; TWS sentinels map to nil |
-| `ReqTickByTickData`, `ReqMktDepth` | live | |
+| `ReqTickByTickData`, `ReqMktDepth` | live, e2e | Tick-by-tick `numberOfTicks` backfill delivered to the Ticker; one depth stream per contract, book reset on error 317 |
 | `ReqRealTimeBars` | live | |
 | Positions, account summary | live, e2e | |
-| `ReqAccountUpdates`, `Portfolio`, `PortfolioEvent` | live | |
+| `ReqAccountUpdates`, `Portfolio`, `PortfolioEvent` | live, e2e | Error 2101 fails the request; cancel during the download ends it |
 | `ReqPnL`, `ReqPnLSingle` | live | |
 | `ReqCurrentTime` | live | |
 | Read-only API mode | live | `ErrReadOnlyAPI`; `SyncOrders` falls back to reqAllOpenOrders |
@@ -74,6 +74,19 @@ Field layouts were checked against ib_async's `decoder.py` (server version
 157–178) and, for every message marked live above, against captured Gateway
 traffic.
 
+## Fixed after the second review (November 2026)
+
+1. `cmd/ibguard` passed reqOpenOrders, which binds manual TWS orders for client id 0 (TWS may cancel and resubmit them). It is now blocked for client 0 and before startApi, and only allowlisted message ids pass. `SyncOrders` uses reqAllOpenOrders for client 0.
+2. Lock cycle: the reconnect restore took bar-list / ticker write locks while holding the lock `Cancel*` needs, so a caller holding a read lock and calling `Cancel*` deadlocked. Restore and cancel no longer take application-visible locks.
+3. A cancel racing with a stalled initial send could reach TWS first, leaving the request streaming with nothing to cancel it. Start, cancel and restore are serialised.
+4. The depth book was cleared on the caller / reconnect goroutine (data race with `UpdateEvent` callbacks), error 317 (book reset) was ignored, and two depth streams for one contract mixed their rows. The reader now owns the reset; one depth stream per contract (`ErrDepthSubscribed`).
+5. After a reconnect a request from a `ConnectedEvent` handler got a second Ticker for a contract; concurrent requests could too. Ticker lookup and registration are atomic and survive the session reset.
+6. Tick-by-tick backfill (`numberOfTicks > 0`) was dropped.
+7. Account updates: error 2101 left `ReqAccountUpdates` hanging; a cancel during the download or the restore could be undone; positions closed while disconnected stayed in `Portfolio()`.
+8. The market data type was re-applied after `ConnectedEvent`, so requests made from its handlers used live data.
+9. `QualifyContracts` raced when given the same pointer twice and cleared `IncludeExpired`.
+10. `cmd/mdcheck` attributed errors by arrival time (now by request); `cmd/smoketest` panicked on empty results.
+
 ## Fixed after live Gateway testing (November 2026)
 
 1. **Inbound message ids 79–85 were misnumbered** (symbolSamples, tickReqParams, ...): tickReqParams (81) was decoded as symbolSamples and completed unrelated pending requests, e.g. market data snapshots ended before their data arrived.
@@ -117,11 +130,15 @@ Other:
 - `protocol.Client.ServerVersion` is a method (`SetServerVersion` for tests).
 - Unsolicited `openOrder` messages fire `OpenOrderEvent` (was `OrderStatusEvent`).
 - `ConnectWithReconnect` keeps trades across reconnects (explicit `Disconnect` still clears all state); `DefaultReconnectConfig` enables `SyncOrders`.
+- `ReqMktDepth` fails with `ErrDepthSubscribed` while the contract already has a depth stream.
+- `SyncOrders` with client id 0 reads open orders with reqAllOpenOrders (filtered to client 0) instead of reqOpenOrders.
+- `CancelAccountUpdates` during a running `ReqAccountUpdates` makes it return `ErrRequestCancelled`.
 
 ## Known Gaps
 
 1. The trading paths have not been run against a live (paper) account yet.
 2. A streaming subscription rejected by TWS (e.g. missing permissions) stays registered (and is re-sent after a reconnect) until cancelled.
+   The depth book of a re-requested stream is emptied when its first update arrives, so it shows the old rows until then.
 3. With real-time subscriptions, option quotes and stock tick-by-tick / 5-second bars have only been checked outside US market hours (permissions confirmed, no data yet); futures were verified streaming.
 4. See "Not Implemented" above.
 

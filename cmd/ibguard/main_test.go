@@ -17,9 +17,10 @@ func frame(p string) []byte {
 }
 
 // TestBlocksOrderMessages: allowed messages are forwarded, the first
-// order-mutating message kills the session and never reaches upstream.
+// order-mutating message (or reqOpenOrders, here sent before START_API)
+// kills the session and never reaches upstream.
 func TestBlocksOrderMessages(t *testing.T) {
-	for _, id := range []string{"3", "4", "15", "19", "21", "58"} {
+	for _, id := range []string{"3", "4", "15", "19", "21", "58", "5"} {
 		t.Run("msg"+id, func(t *testing.T) {
 			up, err := net.Listen("tcp", "127.0.0.1:0")
 			if err != nil {
@@ -71,7 +72,7 @@ func TestBlocksOrderMessages(t *testing.T) {
 	}
 }
 
-func TestCheckOutbound(t *testing.T) {
+func TestCheck(t *testing.T) {
 	for _, tc := range []struct {
 		frame string
 		pass  bool
@@ -79,6 +80,8 @@ func TestCheckOutbound(t *testing.T) {
 		{"49\x001\x00", true},
 		{"1\x0011\x00", true},
 		{"104\x0024\x00", true},
+		{"16\x001\x00", true}, // reqAllOpenOrders
+		{"5\x001\x00", true},  // reqOpenOrders from client 99
 		{"3\x0042\x00", false},
 		{"03\x0042\x00", false},     // TWS parses the id as a number
 		{"+3\x0042\x00", false},     // not a plain decimal id
@@ -86,11 +89,47 @@ func TestCheckOutbound(t *testing.T) {
 		{"\x00\x00\x00\x03", false}, // binary message id (server version 201+)
 		{"203\x00", false},          // protobuf placeOrder
 		{"105\x00", false},          // newer than maxServerVersion
+		{"26\x00", false},           // unassigned
+		{"60\x00", false},           // unassigned
 		{"0\x00", false},
-		{"49", false}, // no field terminator
+		{"49", false},                    // no field terminator
+		{"71\x002\x0099\x00\x00", false}, // second START_API
 	} {
-		if got := checkOutbound([]byte(tc.frame)) == ""; got != tc.pass {
-			t.Errorf("checkOutbound(%q) pass = %v, want %v", tc.frame, got, tc.pass)
+		s := newSession()
+		s.clientID = 99
+		if got := s.check([]byte(tc.frame)) == ""; got != tc.pass {
+			t.Errorf("check(%q) pass = %v, want %v", tc.frame, got, tc.pass)
+		}
+	}
+}
+
+// reqOpenOrders binds manual TWS orders for client id 0: it is blocked for
+// client 0 and before START_API, and passes for other client ids.
+func TestReqOpenOrdersNeedsNonZeroClient(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		start string // START_API frame, "" = none
+		pass  bool
+	}{
+		{"no START_API", "", false},
+		{"client 0", "71\x002\x000\x00\x00", false},
+		{"client 7", "71\x002\x007\x00\x00", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newSession()
+			if tc.start != "" {
+				if why := s.check([]byte(tc.start)); why != "" {
+					t.Fatalf("START_API blocked: %s", why)
+				}
+			}
+			if got := s.check([]byte("5\x001\x00")) == ""; got != tc.pass {
+				t.Fatalf("reqOpenOrders pass = %v, want %v", got, tc.pass)
+			}
+		})
+	}
+	for _, bad := range []string{"71\x002\x00\x00", "71\x002\x00-1\x00\x00", "71\x002\x00x\x00\x00", "71\x002\x00"} {
+		if why := newSession().check([]byte(bad)); why == "" {
+			t.Errorf("malformed START_API %q passed", bad)
 		}
 	}
 }

@@ -65,7 +65,7 @@ func main() {
 ```go
 ticker, _ := ib.ReqMktData(con, "233", false, false)      // streaming quotes
 ib.ReqTickByTickData(con, ibgo.TickByTickBidAsk, 0, false) // same Ticker
-ib.ReqMktDepth(con, 10, false)                              // ticker.DomBids / DomAsks
+ib.ReqMktDepth(con, 10, false)                              // ticker.DomBids / DomAsks (one depth stream per contract)
 ticker.UpdateEvent.Subscribe(func(t *market.Ticker) {
     // runs on the reader goroutine: fields can be read directly here
     fmt.Println(t.Bid, t.Ask, len(t.TickByTicks))
@@ -145,8 +145,11 @@ subscription (market data, tick-by-tick, depth, bars, PnL, account updates)
 and the market data type, so `Ticker` and bar list objects keep updating.
 Do not re-request them in `onConnect`: that would create a second
 subscription. Subscriptions made on the new connection (e.g. from a
-`ConnectedEvent` handler) are not sent twice, and one whose re-send fails is
-retried after the next reconnect. `SyncOrders` then refreshes open
+`ConnectedEvent` handler) are not sent twice, get the market data type
+chosen before the reconnect and share the contract's existing `Ticker`; one
+whose re-send fails is retried after the next reconnect. When the account
+updates download of the new connection completes, positions closed while
+disconnected leave `Portfolio()`. `SyncOrders` then refreshes open
 orders, fetches executions (missed fills are added to their trades),
 finalises orders that completed while disconnected and refreshes positions.
 After a process restart use `SyncOrders(ctx, SyncOptions{IncludeCompleted: true})`
@@ -183,9 +186,11 @@ See [STATUS.md](STATUS.md) for full details.
 ### Testing against a live account safely
 
 `cmd/ibguard` is a proxy that blocks every order message (place, cancel,
-global cancel, exercise, ...) at the socket level. It fails closed (any
-message id it does not recognise ends the session) and caps the negotiated
-API version at 178, above which messages can no longer be inspected as text.
+global cancel, exercise, ...) at the socket level, and `reqOpenOrders` from
+client id 0, which binds manual TWS orders to the API (that can cancel and
+resubmit them). It fails closed (only message ids on an explicit allowlist
+pass; anything else ends the session) and caps the negotiated API version at
+178, above which messages can no longer be inspected as text.
 `cmd/smoketest` runs
 ~45 read-only checks with sanity checks on the decoded values:
 
