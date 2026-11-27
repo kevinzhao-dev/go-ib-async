@@ -143,7 +143,7 @@ func TestE2ELimitOrderPartialFillsWithJournalAndRisk(t *testing.T) {
 	if ex.Shares != 40 || ex.Price != 150 || ex.Side != "BOT" || ex.PermID != tr.PermID() || ex.OrderID != tr.Order.OrderID {
 		t.Fatalf("execution decoded wrong: %+v", ex)
 	}
-	if ex.Time.IsZero() || ex.Time.Location().String() != "America/New_York" && ex.Time.Year() < 2000 {
+	if ex.Time.Location().String() != "America/New_York" || ex.Time.Year() < 2000 {
 		t.Fatalf("execution time not parsed: %v", ex.Time)
 	}
 	if fills[0].CommissionReport.Commission != 1 {
@@ -268,8 +268,12 @@ func TestE2EModifyAndCancel(t *testing.T) {
 func TestE2ERejectedOrderIsCancelled(t *testing.T) {
 	srv := startFake(t)
 	ib := connectFake(t, srv)
+	release := make(chan struct{})
+	reject := sync.OnceFunc(func() { close(release) })
+	defer reject()
 	srv.SetReject(func(o *fakegw.Order) string {
 		if o.Qty > 500 {
+			<-release
 			return "size exceeds exchange limit"
 		}
 		return ""
@@ -283,6 +287,7 @@ func TestE2ERejectedOrderIsCancelled(t *testing.T) {
 		t.Fatal(err)
 	}
 	cancelled := tr.CancelledEvent.Once()
+	reject()
 	select {
 	case <-cancelled:
 	case <-time.After(3 * time.Second):

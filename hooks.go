@@ -21,7 +21,8 @@ type PreTradeChecker interface {
 // PlaceBracketOrder checks every leg before it sends the first, so the legs
 // checked earlier are not open orders yet when a later leg is checked.
 // CheckBracketLeg receives how many legs of the same bracket were accepted
-// before this one, so that limits on open orders can count them.
+// before this one, so that limits on open orders can count them. For a custom
+// checker that implements both hooks, bracket legs go through CheckBracketLeg.
 type BracketChecker interface {
 	CheckBracketLeg(con *contract.Contract, ord *order.Order, acceptedLegs int) error
 }

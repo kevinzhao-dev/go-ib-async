@@ -115,3 +115,47 @@ func TestHaltReasonMentionsRule(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func TestLimitsRequiringBrokerState(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		limits Limits
+		rule   string
+	}{
+		{"position", Limits{MaxPositionQuantity: 5}, RulePosition},
+		{"open orders", Limits{MaxOpenOrders: 5}, RuleOpenOrders},
+		{"order size only", Limits{MaxOrderQuantity: 5}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o := order.LimitOrder("BUY", 1, 100)
+			wantRule(t, New(tc.limits, &fakeState{}).CheckOrder(aapl(), o, false), "")
+			wantRule(t, New(tc.limits, nil).CheckOrder(aapl(), o, false), tc.rule)
+		})
+	}
+}
+
+func TestCashOrderWithUnknownShareQuantity(t *testing.T) {
+	st := &fakeState{positions: []account.Position{{Account: "DU1", Contract: aapl(), Position: 1}}}
+	for _, tc := range []struct {
+		name   string
+		limits Limits
+		halt   bool
+		rule   string
+	}{
+		{"order size cap", Limits{MaxOrderQuantity: 2}, false, RuleOrderQuantity},
+		{"position cap", Limits{MaxPositionQuantity: 2}, false, RulePosition},
+		{"halted with reducing exemption", Limits{AllowReducingWhenHalted: true}, true, RuleHalted},
+		{"unrestricted cash order", Limits{}, false, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := New(tc.limits, st)
+			if tc.halt {
+				m.Halt("test")
+			}
+			cash := order.MarketOrder("SELL", 0)
+			cash.Account = "DU1"
+			cash.CashQty = 10_000
+			wantRule(t, m.CheckOrder(aapl(), cash, false), tc.rule)
+		})
+	}
+}

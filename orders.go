@@ -11,6 +11,7 @@ import (
 	"github.com/kevinzhao-dev/go-ib-async/contract"
 	"github.com/kevinzhao-dev/go-ib-async/order"
 	"github.com/kevinzhao-dev/go-ib-async/protocol"
+	"github.com/kevinzhao-dev/go-ib-async/risk"
 )
 
 // --- Open orders & executions ---
@@ -107,15 +108,11 @@ func (ib *IB) ReqExecutions(ctx context.Context, filter order.ExecutionFilter) (
 	return fills, nil
 }
 
-// TradeFills returns copies of the fills of t. Unlike t.FillsSnapshot, the
-// copies are taken under the lock the reader holds when it attaches a
-// commission report, so their CommissionReport can be read without a race.
+// TradeFills returns value copies of the fills and current commission reports of t.
 func (ib *IB) TradeFills(t *order.Trade) []order.Fill {
 	if t == nil {
 		return nil
 	}
-	ib.state.Mu.RLock()
-	defer ib.state.Mu.RUnlock()
 	ptrs := t.FillsSnapshot()
 	fills := make([]order.Fill, 0, len(ptrs))
 	for _, f := range ptrs {
@@ -355,7 +352,8 @@ func (ib *IB) BracketOrder(action string, quantity, limitPrice, takeProfitPrice,
 // are risk-checked before the first is sent. If a later leg cannot be sent,
 // the legs already sent (still untransmitted, since only the last leg has
 // Transmit=true) are cancelled and an error is returned together with the
-// trades that were created.
+// trades that were created. Every leg must be a new order: a leg whose ID
+// belongs to an existing trade of this client is an error, and nothing is sent.
 func (ib *IB) PlaceBracketOrder(con *contract.Contract, b *order.BracketOrder) ([]*order.Trade, error) {
 	if con == nil || b == nil || b.Parent == nil || b.TakeProfit == nil || b.StopLoss == nil {
 		return nil, errors.New("ibgo: PlaceBracketOrder needs a contract and all three legs")
@@ -373,15 +371,31 @@ func (ib *IB) PlaceBracketOrder(con *contract.Contract, b *order.BracketOrder) (
 	if !ib.client.IsConnected() {
 		return nil, ErrNotConnected
 	}
-	for _, leg := range legs {
-		if leg.OrderID == 0 {
-			leg.OrderID = ib.client.GetReqID()
+	names := []string{"parent", "take-profit", "stop-loss"}
+	for i, leg := range legs {
+		existing, err := ib.tradeForWrite(ib.ClientID(), leg)
+		if err != nil {
+			return nil, err
+		}
+		// Sending it would modify that order instead of creating the leg.
+		if existing != nil {
+			return nil, fmt.Errorf("ibgo: bracket %s leg reuses order ID %d of an existing order", names[i], leg.OrderID)
+		}
+		ib.assignOrderID(leg)
+		if i > 0 && leg.OrderID <= legs[i-1].OrderID {
+			return nil, fmt.Errorf("ibgo: bracket order IDs must increase in transmission order: %d follows %d", leg.OrderID, legs[i-1].OrderID)
 		}
 	}
 	b.Link()
 
-	names := []string{"parent", "take-profit", "stop-loss"}
-	if rc := ib.riskChecker(); rc != nil {
+	rc := ib.riskChecker()
+	// Only the built-in manager owns its duplicate and rate windows.
+	// Custom checkers keep their existing per-leg hooks.
+	if manager, ok := rc.(*risk.Manager); ok {
+		if err := manager.CheckBracket(con, b); err != nil {
+			return nil, fmt.Errorf("ibgo: bracket rejected: %w", err)
+		}
+	} else if rc != nil {
 		bc, _ := rc.(BracketChecker)
 		for i, leg := range legs {
 			var err error
@@ -398,7 +412,7 @@ func (ib *IB) PlaceBracketOrder(con *contract.Contract, b *order.BracketOrder) (
 
 	trades := make([]*order.Trade, 0, len(legs))
 	for i, leg := range legs {
-		t, err := ib.placeOrderLocked(con, leg, false)
+		t, err := ib.placeOrderLocked(con, leg, true)
 		if err != nil {
 			for _, sent := range trades {
 				_, _ = ib.CancelOrder(sent.Order)

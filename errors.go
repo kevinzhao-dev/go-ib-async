@@ -31,6 +31,10 @@ var (
 	// ErrOrderDone is returned when trying to modify a filled/cancelled order.
 	ErrOrderDone = errors.New("ibgo: order is already done")
 
+	// ErrOrderIdentity means the supplied order does not identify the order
+	// that this connection could modify or cancel.
+	ErrOrderIdentity = errors.New("ibgo: order identity does not match this client and order ID")
+
 	// ErrUseWhatIfOrder is returned by PlaceOrder for orders with WhatIf set.
 	ErrUseWhatIfOrder = errors.New("ibgo: order has WhatIf set; use WhatIfOrder")
 

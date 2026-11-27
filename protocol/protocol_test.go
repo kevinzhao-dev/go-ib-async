@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -359,20 +360,21 @@ func TestClientHandshake(t *testing.T) {
 }
 
 func TestClientConnectTimeout(t *testing.T) {
-	// Listen but never accept
-	l, _ := net.Listen("tcp", "127.0.0.1:0")
-	port := l.Addr().(*net.TCPAddr).Port
-	l.Close() // close immediately so connection is refused
+	// TCP connects, but the gateway never sends its handshake.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
 
 	client := NewClient()
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-
-	err := client.Connect(ctx, "127.0.0.1", port, 1)
-	if err == nil {
-		client.Disconnect()
-		t.Fatal("expected error")
+	defer client.Disconnect()
+	if err := client.Connect(ctx, "127.0.0.1", l.Addr().(*net.TCPAddr).Port, 1); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("stalled handshake returned %v, want context deadline", err)
 	}
+	client.Wait()
 }
 
 // --- Decoder Tests ---

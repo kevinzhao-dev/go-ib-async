@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -64,7 +65,8 @@ func IsViolation(err error) (*Violation, bool) {
 
 // Limits configures the checks. Zero values disable a check.
 type Limits struct {
-	// MaxOrderQuantity caps the quantity of a single order.
+	// MaxOrderQuantity caps the quantity of a single order. A cash-sized
+	// order with unknown share quantity cannot satisfy this limit.
 	MaxOrderQuantity float64
 	// MaxOrderNotional caps quantity * price * multiplier of a single order
 	// (in the contract's currency). Needs a price: the limit price, the stop
@@ -262,20 +264,47 @@ func (m *Manager) CheckBracketLeg(con *contract.Contract, ord *order.Order, acce
 // check implements CheckOrder; pendingOpen orders not yet known to the
 // client count towards MaxOpenOrders.
 func (m *Manager) check(con *contract.Contract, ord *order.Order, isModify bool, pendingOpen int) error {
+	positions, open := m.brokerState()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.checkOrderLocked(con, ord, isModify, pendingOpen, positions, open)
+}
+
+// CheckBracket checks a linked bracket as one submission. Each accepted leg
+// uses an open-order slot. A rejected group consumes no rate or duplicate budget.
+func (m *Manager) CheckBracket(con *contract.Contract, b *order.BracketOrder) error {
+	if b == nil {
+		return &Violation{RuleInvalidOrder, "missing bracket"}
+	}
+	positions, open := m.brokerState()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Window pruning edits these slices in place. Stage the changes until
+	// every leg passes, so a rejected child doesn't count an unsent parent.
+	submits, recent := m.submits, m.recent
+	m.submits, m.recent = slices.Clone(submits), slices.Clone(recent)
+	names := [...]string{"parent", "take-profit", "stop-loss"}
+	for i, leg := range b.Orders() {
+		if err := m.checkOrderLocked(con, leg, false, i, positions, open); err != nil {
+			m.submits, m.recent = submits, recent
+			return fmt.Errorf("%s leg: %w", names[i], err)
+		}
+	}
+	return nil
+}
+
+// Read broker state before taking the risk manager lock.
+func (m *Manager) brokerState() ([]account.Position, []*order.Trade) {
+	if m.state == nil {
+		return nil, nil
+	}
+	return m.state.Positions(), m.state.OpenTrades()
+}
+
+func (m *Manager) checkOrderLocked(con *contract.Contract, ord *order.Order, isModify bool, pendingOpen int, positions []account.Position, open []*order.Trade) error {
 	if con == nil || ord == nil {
 		return &Violation{RuleInvalidOrder, "missing contract or order"}
 	}
-
-	// Gather broker state before taking our lock (it takes the client's).
-	var positions []account.Position
-	var open []*order.Trade
-	if m.state != nil {
-		positions = m.state.Positions()
-		open = m.state.OpenTrades()
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	l := m.limits
 	now := m.now()
 
@@ -292,7 +321,7 @@ func (m *Manager) check(con *contract.Contract, ord *order.Order, isModify bool,
 	others := excludeSelf(open, ord, isModify)
 	pos := positionFor(positions, con, ord.Account)
 	openBuy, openSell := openExposure(others, con)
-	reduceOnly := ord.ParentID == 0 && reducesWithOpen(pos, openBuy, openSell, ord.Action, qty)
+	reduceOnly := qty > 0 && ord.ParentID == 0 && reducesWithOpen(pos, openBuy, openSell, ord.Action, qty)
 
 	if m.halted {
 		allowed := l.AllowReducingWhenHalted && reduceOnly
@@ -315,8 +344,13 @@ func (m *Manager) check(con *contract.Contract, ord *order.Order, isModify bool,
 		return &Violation{RuleAccount, fmt.Sprintf("account %q not allowed", ord.Account)}
 	}
 
-	if l.MaxOrderQuantity > 0 && qty > l.MaxOrderQuantity {
-		return &Violation{RuleOrderQuantity, fmt.Sprintf("quantity %g exceeds max %g", qty, l.MaxOrderQuantity)}
+	if l.MaxOrderQuantity > 0 {
+		if qty == 0 {
+			return &Violation{RuleOrderQuantity, "share quantity is unknown for a cash-quantity order"}
+		}
+		if qty > l.MaxOrderQuantity {
+			return &Violation{RuleOrderQuantity, fmt.Sprintf("quantity %g exceeds max %g", qty, l.MaxOrderQuantity)}
+		}
 	}
 
 	refPrice, haveRef := 0.0, false
@@ -354,11 +388,22 @@ func (m *Manager) check(con *contract.Contract, ord *order.Order, isModify bool,
 		}
 	}
 
-	if open := len(others) + pendingOpen; l.MaxOpenOrders > 0 && !isModify && open >= l.MaxOpenOrders {
-		return &Violation{RuleOpenOrders, fmt.Sprintf("%d open orders, max %d", open, l.MaxOpenOrders)}
+	if l.MaxOpenOrders > 0 && !isModify {
+		if m.state == nil {
+			return &Violation{RuleOpenOrders, "open orders unavailable without a state source"}
+		}
+		if count := len(others) + pendingOpen; count >= l.MaxOpenOrders {
+			return &Violation{RuleOpenOrders, fmt.Sprintf("%d open orders, max %d", count, l.MaxOpenOrders)}
+		}
 	}
 
 	if l.MaxPositionQuantity > 0 && ord.ParentID == 0 {
+		if m.state == nil {
+			return &Violation{RulePosition, "positions unavailable without a state source"}
+		}
+		if qty == 0 {
+			return &Violation{RulePosition, "position exposure is unknown for a cash-quantity order"}
+		}
 		long := pos + openBuy
 		short := pos - openSell
 		if ord.Action == "BUY" {
