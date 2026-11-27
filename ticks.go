@@ -289,13 +289,13 @@ func (ib *IB) handleMarketDataType(r *protocol.FieldReader) {
 	})
 }
 
-// handleTickSnapshotEnd completes a snapshot request. TWS cancels snapshot
-// subscriptions itself, so the request id is released here.
+// handleTickSnapshotEnd marks a snapshot request complete. The request is
+// released and completed in flushSnapshotEnds, after this batch's ticks are
+// applied to its ticker.
 func (ib *IB) handleTickSnapshotEnd(r *protocol.FieldReader) {
 	r.Skip(1) // version
 	reqID := r.ReadInt()
-	ib.releaseReq(reqID)
-	ib.state.EndReq(reqID, nil, nil)
+	ib.snapshots.end(reqID)
 }
 
 // handleTickByTick: reqId, tickType, time, then per type:

@@ -44,6 +44,9 @@ type IB struct {
 	// serverTime is the last time reported by reqCurrentTime (unix seconds).
 	serverTime atomic.Int64
 
+	// snapshots defers tickSnapshotEnd to the end of the network batch.
+	snapshots snapshotState
+
 	hooksMu sync.RWMutex
 	risk    PreTradeChecker
 	journal OrderJournal
@@ -167,6 +170,8 @@ func New() *IB {
 		}
 		// Clear pending tickers and their tick lists AFTER emitting events
 		ib.state.ClearPendingTickers()
+		// Snapshot requests complete only now that their tickers are final.
+		ib.flushSnapshotEnds()
 	}
 	return ib
 }

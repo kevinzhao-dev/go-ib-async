@@ -420,6 +420,7 @@ func (s *Server) onPlaceOrder(c net.Conn, f []string) {
 		existing.AuxPrice = p.AuxPrice
 		existing.OrderType = p.OrderType
 		existing.OrderRef = p.OrderRef
+		existing.TIF = p.TIF
 		o := *existing
 		s.mu.Unlock()
 		s.send(c, encodeOpenOrder(&o, false, nil))

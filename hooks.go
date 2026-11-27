@@ -17,6 +17,15 @@ type PreTradeChecker interface {
 	CheckOrder(con *contract.Contract, ord *order.Order, isModify bool) error
 }
 
+// BracketChecker is optionally implemented by a PreTradeChecker.
+// PlaceBracketOrder checks every leg before it sends the first, so the legs
+// checked earlier are not open orders yet when a later leg is checked.
+// CheckBracketLeg receives how many legs of the same bracket were accepted
+// before this one, so that limits on open orders can count them.
+type BracketChecker interface {
+	CheckBracketLeg(con *contract.Contract, ord *order.Order, acceptedLegs int) error
+}
+
 // CommissionObserver is optionally implemented by a PreTradeChecker that
 // wants to see realized P&L (e.g. for a daily loss limit). It is called on
 // the reader goroutine for every commission report of a known execution.
@@ -54,6 +63,12 @@ func (ib *IB) SetJournal(j OrderJournal) {
 	ib.journal = j
 	ib.hooksMu.Unlock()
 }
+
+// RiskManager returns the installed pre-trade checker, or nil.
+func (ib *IB) RiskManager() PreTradeChecker { return ib.riskChecker() }
+
+// Journal returns the installed order journal, or nil.
+func (ib *IB) Journal() OrderJournal { return ib.orderJournal() }
 
 func (ib *IB) riskChecker() PreTradeChecker {
 	ib.hooksMu.RLock()

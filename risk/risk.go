@@ -1,6 +1,7 @@
 // Package risk implements pre-trade risk checks for ibgo.
 //
-// A *Manager satisfies ibgo.PreTradeChecker (and ibgo.CommissionObserver):
+// A *Manager satisfies ibgo.PreTradeChecker (and ibgo.CommissionObserver,
+// ibgo.BracketChecker):
 //
 //	rm := risk.New(risk.Limits{MaxOrderQuantity: 500, MaxPositionQuantity: 1000}, ib)
 //	ib.SetRiskManager(rm)
@@ -248,6 +249,19 @@ func (m *Manager) OnCommissionReport(_ *order.Trade, fill *order.Fill) {
 // CheckOrder validates an order. It implements ibgo.PreTradeChecker.
 // isModify is true when the order replaces a live one with the same id.
 func (m *Manager) CheckOrder(con *contract.Contract, ord *order.Order, isModify bool) error {
+	return m.check(con, ord, isModify, 0)
+}
+
+// CheckBracketLeg validates one leg of a new bracket order. acceptedLegs
+// legs of the same bracket were accepted before it and count as open orders,
+// although they are not sent yet. It implements ibgo.BracketChecker.
+func (m *Manager) CheckBracketLeg(con *contract.Contract, ord *order.Order, acceptedLegs int) error {
+	return m.check(con, ord, false, acceptedLegs)
+}
+
+// check implements CheckOrder; pendingOpen orders not yet known to the
+// client count towards MaxOpenOrders.
+func (m *Manager) check(con *contract.Contract, ord *order.Order, isModify bool, pendingOpen int) error {
 	if con == nil || ord == nil {
 		return &Violation{RuleInvalidOrder, "missing contract or order"}
 	}
@@ -340,8 +354,8 @@ func (m *Manager) CheckOrder(con *contract.Contract, ord *order.Order, isModify 
 		}
 	}
 
-	if l.MaxOpenOrders > 0 && !isModify && len(others) >= l.MaxOpenOrders {
-		return &Violation{RuleOpenOrders, fmt.Sprintf("%d open orders, max %d", len(others), l.MaxOpenOrders)}
+	if open := len(others) + pendingOpen; l.MaxOpenOrders > 0 && !isModify && open >= l.MaxOpenOrders {
+		return &Violation{RuleOpenOrders, fmt.Sprintf("%d open orders, max %d", open, l.MaxOpenOrders)}
 	}
 
 	if l.MaxPositionQuantity > 0 && ord.ParentID == 0 {

@@ -83,12 +83,33 @@ func (ib *IB) ReqExecutions(ctx context.Context, filter order.ExecutionFilter) (
 	}
 	items := resultItems(v)
 	fills := make([]order.Fill, 0, len(items))
+	// Copy under the state lock: the reader sets CommissionReport on these
+	// fills (handleCommissionReport) while holding it.
+	ib.state.Mu.RLock()
 	for _, item := range items {
 		if f, ok := item.(*order.Fill); ok {
 			fills = append(fills, *f)
 		}
 	}
+	ib.state.Mu.RUnlock()
 	return fills, nil
+}
+
+// TradeFills returns copies of the fills of t. Unlike t.FillsSnapshot, the
+// copies are taken under the lock the reader holds when it attaches a
+// commission report, so their CommissionReport can be read without a race.
+func (ib *IB) TradeFills(t *order.Trade) []order.Fill {
+	if t == nil {
+		return nil
+	}
+	ib.state.Mu.RLock()
+	defer ib.state.Mu.RUnlock()
+	ptrs := t.FillsSnapshot()
+	fills := make([]order.Fill, 0, len(ptrs))
+	for _, f := range ptrs {
+		fills = append(fills, *f)
+	}
+	return fills
 }
 
 // --- Order synchronisation ---
@@ -349,8 +370,15 @@ func (ib *IB) PlaceBracketOrder(con *contract.Contract, b *order.BracketOrder) (
 
 	names := []string{"parent", "take-profit", "stop-loss"}
 	if rc := ib.riskChecker(); rc != nil {
+		bc, _ := rc.(BracketChecker)
 		for i, leg := range legs {
-			if err := rc.CheckOrder(con, leg, false); err != nil {
+			var err error
+			if bc != nil {
+				err = bc.CheckBracketLeg(con, leg, i)
+			} else {
+				err = rc.CheckOrder(con, leg, false)
+			}
+			if err != nil {
 				return nil, fmt.Errorf("ibgo: bracket %s leg rejected: %w", names[i], err)
 			}
 		}

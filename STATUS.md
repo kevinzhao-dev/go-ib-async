@@ -38,6 +38,8 @@ wire protocol); **unit** = unit tests only.
 | Persistent order journal | unit, e2e | `journal` package |
 | Risk management | unit, e2e | `risk` package |
 | Request throttling | unit | 45 msg/s sliding window |
+| Blocking snapshot `ReqTickerSnapshot` | e2e | Waits for tickSnapshotEnd (completed after the batch's ticks are applied) and returns a ticker the reader no longer writes |
+| MCP server for AI agents | e2e | `mcpserver` + `cmd/ib-mcp`: stdio MCP, read tools, preview → place with single-use previews, paper-only by default; see docs/MCP.md |
 | End-to-end trading test | e2e; live test provided | `integration_trading_test.go` (paper account, opt-in, **not yet run**) |
 
 ## Public API
@@ -145,7 +147,7 @@ Other:
 ## Test Coverage
 
 Total library coverage (all packages except `cmd/` and `internal/fakegw`,
-measured across packages by `scripts/coverage.sh`): **94.2%**. CI fails below 90%.
+measured across packages by `scripts/coverage.sh`): **95.1%**. CI fails below 90%.
 
 | Package | Coverage |
 |---------|----------|
@@ -159,7 +161,8 @@ measured across packages by `scripts/coverage.sh`): **94.2%**. CI fails below 90
 | risk | 98.1% |
 | protocol | 96.5% |
 | journal | 95.2% |
-| ibgo (root) | 91.7% |
+| mcpserver | 96.8% |
+| ibgo (root) | 92.0% |
 | internal/fakegw (test infrastructure) | 73.2% own tests; exercised further by the E2E tests |
 | cmd/ibguard | blocking of every order message type, fail-closed handling of unknown or binary message ids and the API version cap are tested |
 

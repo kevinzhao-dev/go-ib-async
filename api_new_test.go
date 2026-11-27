@@ -115,10 +115,15 @@ func TestDelayedTicksAndSnapshotRelease(t *testing.T) {
 		t.Fatalf("ticks in batch = %d, want 8", len(d.Ticks))
 	}
 	feedMsg(ib, "57|1|14")
+	// Completed only after the batch is processed (its ticks are stamped
+	// onto the ticker in OnDataProcessed).
+	if ib.tickerFor(14) == nil || !ib.state.Requests.Has(14) {
+		t.Fatal("snapshot completed before the end of its batch")
+	}
+	ib.client.OnDataProcessed()
 	if ib.tickerFor(14) != nil || ib.state.Requests.Has(14) {
 		t.Fatal("snapshot end must release the request")
 	}
-	ib.client.OnDataProcessed()
 	if len(tk.Snapshot().Ticks) != 0 {
 		t.Fatal("per-batch ticks not cleared")
 	}

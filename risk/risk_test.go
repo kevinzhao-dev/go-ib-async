@@ -125,6 +125,12 @@ func TestOpenOrdersRateDuplicate(t *testing.T) {
 	m := New(Limits{MaxOpenOrders: 2}, st, WithClock(clock))
 	wantRule(t, m.CheckOrder(aapl(), order.LimitOrder("BUY", 1, 1), false), RuleOpenOrders)
 
+	// Bracket legs accepted earlier count as open orders.
+	m = New(Limits{MaxOpenOrders: 3}, &fakeState{open: st.open[:1]}, WithClock(clock))
+	wantRule(t, m.CheckBracketLeg(aapl(), order.LimitOrder("BUY", 1, 1), 0), "")
+	wantRule(t, m.CheckBracketLeg(aapl(), order.LimitOrder("SELL", 1, 2), 1), "")
+	wantRule(t, m.CheckBracketLeg(aapl(), order.StopOrder("SELL", 1, 0.5), 2), RuleOpenOrders)
+
 	m = New(Limits{MaxOrdersPerWindow: 2, OrderWindow: time.Second}, nil, WithClock(clock))
 	wantRule(t, m.CheckOrder(aapl(), order.LimitOrder("BUY", 1, 1), false), "")
 	wantRule(t, m.CheckOrder(aapl(), order.LimitOrder("BUY", 2, 1), false), "")

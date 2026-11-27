@@ -129,6 +129,18 @@ func (t *Trade) StatusSnapshot() OrderStatus {
 	return *t.OrderStatus
 }
 
+// OrderSnapshot returns a copy of the order. TWS may change a live order's
+// quantity, prices, type and reference (UpdateFromOpenOrder); read them
+// through this copy. Slice fields are shared with the trade's order.
+func (t *Trade) OrderSnapshot() Order {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.Order == nil {
+		return Order{}
+	}
+	return *t.Order
+}
+
 // FillsSnapshot returns a copy of the fill list.
 func (t *Trade) FillsSnapshot() []*Fill {
 	t.mu.RLock()
@@ -291,6 +303,9 @@ func (t *Trade) UpdateFromOpenOrder(o *Order) {
 	t.Order.AuxPrice = o.AuxPrice
 	t.Order.OrderType = o.OrderType
 	t.Order.OrderRef = o.OrderRef
+	if o.TIF != "" {
+		t.Order.TIF = o.TIF
+	}
 }
 
 // SetPermID records the permanent id assigned by TWS.
