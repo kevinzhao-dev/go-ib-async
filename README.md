@@ -1,319 +1,133 @@
 # go-ib-async
 
-Go client for the Interactive Brokers TWS/Gateway API. Port of the Python [ib_async](https://github.com/ib-api-reloaded/ib_async) library.
+[![CI](https://github.com/kevinzhao-dev/go-ib-async/actions/workflows/ci.yml/badge.svg)](https://github.com/kevinzhao-dev/go-ib-async/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/kevinzhao-dev/go-ib-async.svg)](https://pkg.go.dev/github.com/kevinzhao-dev/go-ib-async)
+[![License](https://img.shields.io/badge/license-BSD--2--Clause-blue.svg)](LICENSE)
 
-> **Status:** market data, account, contract and historical APIs are verified
-> against a live IB Gateway (read-only, server version 178). Order placement
-> is tested end to end against a fake gateway only; run the paper-account
-> trading test before trading live. Not full parity with ib_async: see
-> [STATUS.md](STATUS.md).
+A Go client for the Interactive Brokers TWS / IB Gateway API, ported from
+Python's [ib_async](https://github.com/ib-api-reloaded/ib_async), with guard
+rails for code (and AI agents) that trade.
 
-## Quick Start
+- **Live objects.** Tickers, bars and trades update in place and fire events,
+  like ib_async. `Snapshot()` gives a race-free copy from any goroutine.
+- **Survives disconnects.** Auto-reconnect keeps orders, fills and positions
+  and re-subscribes every stream: the objects you hold keep updating.
+- **Guard rails built in.** Pre-trade risk limits with a kill switch, a
+  write-ahead order journal with crash recovery, and an order-blocking proxy
+  for testing against live accounts.
+- **AI agents via MCP.** `ib-mcp` gives Claude (or any MCP client) market
+  data, account data and, if you allow it, risk-checked paper trading.
+- **Zero dependencies.** Standard library only. Verified against a live
+  Gateway, race-tested, fuzzed, 95% coverage.
+
+## Quick start
+
+```bash
+go get github.com/kevinzhao-dev/go-ib-async
+```
 
 ```go
-package main
-
-import (
-    "context"
-    "fmt"
-    "log"
-    "time"
-
-    ibgo "github.com/kevinzhao-dev/go-ib-async"
-    "github.com/kevinzhao-dev/go-ib-async/contract"
-)
-
 func main() {
+    ctx := context.Background()
     ib := ibgo.New()
-    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-    defer cancel()
-
-    // Connect to IB Gateway (paper: 4002, live: 4001; TWS: 7497/7496)
-    if err := ib.Connect(ctx, "127.0.0.1", 4002, 1); err != nil {
+    if err := ib.Connect(ctx, "127.0.0.1", 4002, 1); err != nil { // IB Gateway (paper)
         log.Fatal(err)
     }
     defer ib.Disconnect()
 
-    // Fill in conId etc. (errors.Is: ErrContractNotFound, ErrAmbiguousContract)
     aapl := contract.Stock("AAPL", "SMART", "USD")
     if err := ib.QualifyContracts(ctx, aapl); err != nil {
-        log.Fatal(err)
+        log.Fatal(err) // errors.Is(err, ibgo.ErrContractNotFound), ...
     }
 
-    bars, err := ib.ReqHistoricalData(ctx, aapl, "", "5 D", "1 day", "TRADES", true, 1)
+    // Live objects: the Ticker updates in place and fires an event per update.
+    ib.ReqMarketDataType(ibgo.MarketDataDelayed) // works without a data subscription
+    ticker, err := ib.ReqMktData(aapl, "", false, false)
     if err != nil {
         log.Fatal(err)
     }
-    for _, b := range bars {
-        fmt.Printf("%s  O=%.2f H=%.2f L=%.2f C=%.2f\n",
-            b.Date.Format("2006-01-02"), b.Open, b.High, b.Low, b.Close)
-    }
+    ticker.UpdateEvent.Subscribe(func(t *market.Ticker) {
+        fmt.Printf("AAPL bid %.2f ask %.2f\n", t.Bid, t.Ask)
+    })
 
-    // Free delayed data when the account has no live subscription.
-    ib.ReqMarketDataType(ibgo.MarketDataDelayed)
-    tickers, err := ib.ReqTickers(ctx, aapl) // waits for the snapshot
-    if err != nil {
-        log.Print(err) // e.g. missing permissions; tickers are still returned
-    }
-    t := tickers[0].Snapshot() // consistent copy, safe from any goroutine
-    fmt.Printf("bid=%v ask=%v last=%v close=%v\n", t.Bid, t.Ask, t.Last, t.Close)
+    // Guard rails: every order passes the risk manager before it is sent.
+    ib.SetRiskManager(risk.New(risk.Limits{MaxOrderQuantity: 100, MaxDailyLoss: 1000}, ib))
+    _, err = ib.PlaceOrder(aapl, order.LimitOrder("BUY", 1000, 150))
+    fmt.Println(err) // risk: order_quantity: quantity 1000 exceeds max 100 (nothing sent)
+
+    time.Sleep(10 * time.Second)
 }
 ```
 
-## Market data
-
-```go
-ticker, _ := ib.ReqMktData(con, "233", false, false)      // streaming quotes
-ib.ReqTickByTickData(con, ibgo.TickByTickBidAsk, 0, false) // same Ticker
-ib.ReqMktDepth(con, 10, false)                              // ticker.DomBids / DomAsks (one depth stream per contract)
-ticker.UpdateEvent.Subscribe(func(t *market.Ticker) {
-    // runs on the reader goroutine: fields can be read directly here
-    fmt.Println(t.Bid, t.Ask, len(t.TickByTicks))
-})
-// From other goroutines use ticker.Snapshot() (or RLock/RUnlock).
-
-rt, _ := ib.ReqRealTimeBars(con, 5, "TRADES", false)
-bars, _ := ib.ReqHistoricalDataStream(ctx, con, "1 D", "1 min", "TRADES", false, 1)
-bars.UpdateEvent.Subscribe(func(b *market.BarDataList) { /* b.NewBar */ })
-
-ib.ReqAccountUpdates(ctx, "")   // AccountValues(), Portfolio(), PortfolioEvent
-ib.ReqPnL("", "")               // PnL(), PnLEvent
-ib.ReqPnLSingle("", "", conID)  // PnLSingles(), PnLSingleEvent
-```
-
-Options: `ticker.ModelGreeks` / `BidGreeks` / `AskGreeks` / `LastGreeks`
-(`nil` fields mean "not computed"). Other lookups: `ReqSecDefOptParams`,
-`ReqMatchingSymbols`, `ReqMarketRule`, `ReqHeadTimeStamp`,
-`ReqHistoricalTicks`, `ReqCurrentTime`.
-
-## Trading
-
-```go
-con := details[0].Contract
-
-// Optional safety layers: pre-trade risk checks and a write-ahead journal.
-rm := risk.New(risk.Limits{
-    MaxOrderQuantity:    500,
-    MaxPositionQuantity: 1000,
-    MaxOrdersPerWindow:  10, // per second
-    MaxDailyLoss:        2000,
-}, ib)
-ib.SetRiskManager(rm)
-
-j, err := journal.Open("orders-2026-11-26.jsonl", journal.Options{})
-if err != nil {
-    log.Fatal(err)
-}
-defer j.Close()
-ib.SetJournal(j)
-
-// What-if: margin/commission impact without placing.
-st, err := ib.WhatIfOrder(ctx, con, order.LimitOrder("BUY", 100, 150))
-
-// Place, modify, cancel.
-trade, err := ib.PlaceOrder(con, order.LimitOrder("BUY", 100, 150))
-filled := trade.FilledEvent.Once()
-trade.FillEvent.Subscribe(func(f *order.Fill) { /* partial fill */ })
-
-mod := *trade.Order
-mod.LmtPrice = 150.5
-ib.PlaceOrder(con, &mod) // same orderId = modification
-
-ib.CancelOrder(trade.Order)
-
-// Bracket: limit entry + take-profit + stop-loss, released together.
-b, err := ib.BracketOrder("BUY", 100, 150, 160, 145)
-legs, err := ib.PlaceBracketOrder(con, b)
-```
-
-Read trade state through the locked accessors (`trade.Status()`,
-`trade.StatusSnapshot()`, `trade.FillsSnapshot()`, `trade.FilledQty()`),
-not the struct fields: trades are updated on the reader goroutine.
-
-### Reconnect and order synchronisation
-
-```go
-cfg := ibgo.DefaultReconnectConfig() // heartbeat + SyncOrders after each connect
-go ib.ConnectWithReconnect(ctx, "127.0.0.1", 4002, 1, cfg, func() {
-    // called after every (re)connect
-})
-```
-
-An automatic reconnect keeps orders, fills and positions, so `*order.Trade`
-objects held by the application stay valid, and re-requests every streaming
-subscription (market data, tick-by-tick, depth, bars, PnL, account updates)
-and the market data type, so `Ticker` and bar list objects keep updating.
-Do not re-request them in `onConnect`: that would create a second
-subscription. Subscriptions made on the new connection (e.g. from a
-`ConnectedEvent` handler) are not sent twice, get the market data type
-chosen before the reconnect and share the contract's existing `Ticker`; one
-whose re-send fails is retried after the next reconnect. When the account
-updates download of the new connection completes, positions closed while
-disconnected leave `Portfolio()`. `SyncOrders` then refreshes open
-orders, fetches executions (missed fills are added to their trades),
-finalises orders that completed while disconnected and refreshes positions.
-After a process restart use `SyncOrders(ctx, SyncOptions{IncludeCompleted: true})`
-and `journal.Reconcile(journal.Replay(records), ib.Trades(), clientID)` to
-compare the journal with what the broker reports.
+The [guide](docs/GUIDE.md) covers streaming data, bars, orders and brackets,
+the order journal, and reconnecting.
 
 ## AI agents (MCP)
 
-`cmd/ib-mcp` exposes the client to AI agents as a
-[Model Context Protocol](https://modelcontextprotocol.io) server over stdio:
-contracts, quotes, bars, option chains, positions, account values, orders and
-executions, plus a what-if `preview_order`. It is read-only by default.
-Trading (`-enable-trading`) is restricted to paper accounts. It requires a
-journal and risk limits, and works in two steps: `preview_order` returns a
-single-use `preview_id`, and `place_order` sends exactly that order through
-the risk manager. Agents can halt trading but cannot resume it.
+`ib-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io)
+server that runs next to TWS / IB Gateway:
 
 ```bash
 go install github.com/kevinzhao-dev/go-ib-async/cmd/ib-mcp@latest
 claude mcp add ib -- ib-mcp -port 4002
 ```
 
-See [docs/MCP.md](docs/MCP.md) for the tools, the safety model and the
-configuration.
+Then ask things like *"What's my buying power?"*, *"Show SPY's daily bars
+for the last month"* or *"What would buying 10 MSFT at 410 do to my
+margin?"*. The agent can look up contracts, quotes, bars and option chains,
+read positions, balances, orders and fills, and preview orders.
 
-## What Works
-
-| Feature | Status |
-|---------|--------|
-| Connect / Disconnect / handshake, reconnect + heartbeat | Verified live (incl. dropped connection and subscription restore) |
-| Contract details, `QualifyContracts`, symbol search, market rules, option chains | Verified live |
-| Historical bars (incl. keep-up-to-date), historical ticks, head timestamp | Verified live |
-| Market data: snapshots (`ReqTickers`), streaming, delayed data, greeks, tick-by-tick, depth, real-time bars | Verified live |
-| Positions, account summary, account updates / portfolio, PnL, PnL single | Verified live |
-| Read-only order queries (`ReqAllOpenOrders`, `ReqExecutions`, `SyncOrders`) | Verified live (read-only API mode) |
-| Read-only API mode detection (`ErrReadOnlyAPI`) | Verified live |
-| Place / Modify / Cancel order, partial fills, commissions | E2E-tested against fake gateway |
-| Bracket orders, OCA helper, WhatIf, completed orders | E2E-tested against fake gateway |
-| Pre-trade risk manager (`risk`) | Unit + E2E tested |
-| Persistent order journal (`journal`) | Unit + E2E tested |
-| MCP server for AI agents (`mcpserver`, `cmd/ib-mcp`) | E2E-tested against fake gateway |
-
-"E2E-tested against fake gateway" means the real client (protocol, decoders,
-state, events) runs against `internal/fakegw`, an in-process TWS fake that
-speaks the v178 wire protocol (layouts follow ib_async). A live paper-account
-trading test exists (`integration_trading_test.go`) but must be run by you:
-
-```bash
-IB_E2E_TRADING=1 go test -tags=integration -v -run TestIntegrationTrading .
-```
-
-See [STATUS.md](STATUS.md) for full details.
-
-### Testing against a live account safely
-
-`cmd/ibguard` is a proxy that blocks every order message (place, cancel,
-global cancel, exercise, ...) at the socket level, and `reqOpenOrders` from
-client id 0, which binds manual TWS orders to the API (that can cancel and
-resubmit them). It fails closed (only message ids on an explicit allowlist
-pass; anything else ends the session) and caps the negotiated API version at
-178, above which messages can no longer be inspected as text.
-`cmd/smoketest` runs
-~45 read-only checks with sanity checks on the decoded values:
-
-```bash
-go run ./cmd/ibguard -upstream 127.0.0.1:4001 -listen 127.0.0.1:4011 &
-go run ./cmd/smoketest -port 4011 -guard-pid $(pgrep -x ibguard)
-```
-
-`-guard-pid` enables the reconnect check (the guard drops the connection on
-SIGUSR1). Pass the guard's own pid, which it logs at startup; under `go run`,
-`$!` is the `go` command, which does not forward the signal.
-
-`cmd/mdcheck` shows which market data the account receives through the API.
-It requests live data (no delayed fallback) for US stocks on each network,
-OPRA options, CME/CBOT/NYMEX/COMEX/CFE futures and the SPX index, plus
-tick-by-tick, 5-second bars and market depth, and prints a verdict per line
-(`OK live quotes`, `OK no quotes (closed?)`, `NOT SUBSCRIBED`, `DELAYED`, ...):
-
-```bash
-go run ./cmd/mdcheck -port 4011
-```
-
-Run it during US market hours to see quotes: outside them stocks and options
-have no live quotes and stock tick-by-tick / 5-second bars stay empty, without
-any permission error.
-
-Keep "Read-Only API" enabled in TWS/Gateway while developing against a live
-account: orders, `ReqOpenOrders` and `ReqCompletedOrders` are then rejected
-(the errors match `ErrReadOnlyAPI`; `SyncOrders` falls back to
-`ReqAllOpenOrders`).
+It is **read-only by default**. With `-enable-trading` it trades paper
+accounts only, behind risk limits and a journal, and an order is sent only
+from a single-use preview, so what reaches IB is exactly what you approved.
+Agents can halt trading but never resume it. See [docs/MCP.md](docs/MCP.md)
+for the tools, the safety model and Claude Desktop setup.
 
 ## Architecture
 
-```
-ibgo (root)          IB facade - Connect, public API, message dispatch
-  contract/          Contract, Stock, Option, Future, etc.
-  order/             Order, Trade, OrderStatus, conditions, brackets
-  market/            Ticker, BarData, OptionComputation, depth
-  account/           AccountValue, Position, PnL, news
-  event/             Generic Event[T] pub/sub
-  risk/              Pre-trade risk checks, kill switch, daily loss limit
-  journal/           Append-only JSONL order journal, replay, reconcile
-  mcpserver/         MCP server (stdio) exposing the client to AI agents
-  protocol/          TCP connection, wire encoder/decoder, client
-  internal/state/    State manager, request tracking, tick maps
-  internal/fakegw/   Fake TWS for end-to-end tests
-```
+```mermaid
+flowchart LR
+    agent["AI agent<br/>(MCP client)"] -- "stdio" --> mcp
+    app["Your Go program"] <-- "calls · events" --> ib
 
-**Concurrency model:** Single reader goroutine processes all inbound messages
-and runs event callbacks (keep callbacks short; hand work to your own
-goroutines). Request-response matching via per-request buffered channels.
-State maps are guarded by a `sync.RWMutex`; `Trade`, `Ticker`, `BarDataList`
-and `RealTimeBarList` have their own locks (`Snapshot()` for reads from other
-goroutines). Order placement is serialised so risk checks cannot be raced.
+    subgraph lib["go-ib-async"]
+        mcp["mcpserver<br/>cmd/ib-mcp"] --> ib
+        ib["ibgo.IB<br/>API · state · events"]
+        ib -- "1 · check" --> risk["risk<br/>limits · kill switch"]
+        ib -- "2 · record" --> journal["journal<br/>write-ahead log"]
+        ib <-- "3 · send / receive" --> proto["protocol<br/>wire codec · throttle"]
+    end
 
-## Development
-
-```bash
-make                  # build + vet + test (no Gateway needed)
-make ci               # everything CI runs: build, lint, shuffled race tests, coverage gate
-make lint             # go vet (incl. integration tag), gofmt, go mod tidy -diff
-make test-race        # tests with race detector
-make test-shuffle     # race detector + random test order
-make cover-check      # coverage.out/.txt/.html, fails below COVERAGE_MIN (default 90%)
-make fuzz-all         # every fuzz target, FUZZTIME each (default 10s)
-make test-live        # integration tests (needs Gateway running)
-make smoke            # read-only live smoke test (needs Gateway; see above)
-make bench            # benchmarks
+    proto <-- "TCP" --> tws[("TWS /<br/>IB Gateway")]
 ```
 
-### Tests
+An order is checked against the risk limits and recorded in the journal
+before it is sent; order placement is serialised, so concurrent orders cannot
+race past the limits. One reader goroutine decodes every inbound message,
+updates state and runs event callbacks, so keep callbacks short. Data types
+live in `contract`, `order`, `market` and `account`. More in the
+[concurrency model](docs/GUIDE.md#concurrency-model).
 
-| Kind | Where | What it checks |
-|------|-------|----------------|
-| Wire format (outbound) | `protocol/requests_test.go`, `order_wire_test.go` | Every request and `placeOrder` field-by-field against ib_async's `client.py` layout, incl. server-version branches |
-| Wire format (inbound) | `handlers_test.go`, `order_wire_test.go` | Every handled message decoded from the ib_async `decoder.py` layout (ticks, contract details, bars, account, portfolio, openOrder with all optional blocks, conditions) |
-| Client / connection | `protocol/client_test.go`, `review_fixes_test.go` | Handshake, version checks, disconnect/reconnect, framing limits, panic recovery |
-| Order lifecycle | `order/`, `internal/state/`, `review_fixes_test.go` | Trade status semantics, duplicates, rejects, warnings, concurrency (`-race`) |
-| Risk / journal | `risk/`, `journal/` | Every limit, kill switch, daily loss; write-ahead, crash recovery, replay, reconcile |
-| End to end | `e2e_test.go`, `api_misc_test.go` | Real client against `internal/fakegw` (fake TWS): fills, modify/cancel, brackets, whatIf, reconnect sync, restart recovery |
-| Fuzz | `protocol/fuzz_test.go` | Decoder/encoder robustness |
-| Live (opt-in) | `integration*_test.go` (`//go:build integration`) | Real Gateway; `IB_E2E_TRADING=1` places paper orders |
+## Status
 
-### CI
+- **Verified against a live IB Gateway** (server version 178): connection
+  and reconnect, contracts, historical data, streaming market data (incl.
+  greeks, tick-by-tick, depth), positions, account values and PnL.
+- **Tested end to end against a fake gateway**: placing, modifying and
+  cancelling orders, brackets, what-if, risk manager, journal, MCP server.
+  Run the [paper trading test](docs/LIVE_TESTING.md#paper-trading-test)
+  before trading live.
+- **Not yet implemented**: scanners, news, fundamental data, histograms, FA
+  and WSH.
 
-GitHub Actions (`.github/workflows/ci.yml`) runs on pushes and PRs to `main`:
+Full feature matrix and change log: [STATUS.md](STATUS.md).
 
-- **test (1.24 / 1.25)**: build, `go vet` (also with `-tags=integration`), `go test -race -shuffle=on ./...`. Required for merging into `main`.
-- **lint**: gofmt and `go mod tidy -diff`.
-- **coverage**: `scripts/coverage.sh` with a 90% minimum; uploads `coverage.html` as an artifact and posts a per-package table to the job summary.
-- **fuzz**: every fuzz target for 10s.
+## Documentation
 
-## Known Limitations
+- [Guide](docs/GUIDE.md): market data, orders, risk and journal, reconnect, concurrency
+- [MCP server](docs/MCP.md): tools, safety model, configuration, embedding
+- [Live testing](docs/LIVE_TESTING.md): `ibguard` proxy, smoke test, market data check, paper trading test
+- [Development](docs/DEVELOPMENT.md): make targets, test suite, CI
+- [Status](STATUS.md): parity with ib_async, verified features, known gaps
 
-- **Order paths not yet verified against a live (paper) account.** Run the paper trading test above before trading live.
-- **Partial message coverage.** Scanners, news, fundamental data, histograms, FA and WSH requests are not implemented yet; see STATUS.md.
-- Errors not tied to a request (e.g. data farm status) only reach `ErrorEvent`; streaming subscriptions that fail (e.g. no permissions) stay registered until cancelled.
-
-## Requirements
-
-- Go 1.24+
-- IB TWS or Gateway (for live testing)
-
-## License
-
-BSD 2-Clause. See [LICENSE](LICENSE).
+Requires Go 1.24+. BSD 2-Clause, see [LICENSE](LICENSE).
