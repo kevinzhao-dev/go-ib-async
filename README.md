@@ -191,6 +191,20 @@ go run ./cmd/smoketest -port 4011 -guard-pid $(pgrep -x ibguard)
 SIGUSR1). Pass the guard's own pid, which it logs at startup; under `go run`,
 `$!` is the `go` command, which does not forward the signal.
 
+`cmd/mdcheck` shows which market data the account receives through the API.
+It requests live data (no delayed fallback) for US stocks on each network,
+OPRA options, CME/CBOT/NYMEX/COMEX/CFE futures and the SPX index, plus
+tick-by-tick, 5-second bars and market depth, and prints a verdict per line
+(`OK live quotes`, `OK no quotes (closed?)`, `NOT SUBSCRIBED`, `DELAYED`, ...):
+
+```bash
+go run ./cmd/mdcheck -port 4011
+```
+
+Run it during US market hours to see quotes: outside them stocks and options
+have no live quotes and stock tick-by-tick / 5-second bars stay empty, without
+any permission error.
+
 Keep "Read-Only API" enabled in TWS/Gateway while developing against a live
 account: orders, `ReqOpenOrders` and `ReqCompletedOrders` are then rejected
 (the errors match `ErrReadOnlyAPI`; `SyncOrders` falls back to

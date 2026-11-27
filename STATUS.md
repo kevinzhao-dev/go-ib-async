@@ -20,7 +20,7 @@ wire protocol); **unit** = unit tests only.
 | Historical bars | live | Intraday dates with time zone; `formatDate=2` in UTC |
 | `ReqHistoricalDataStream` (keepUpToDate) | live, e2e | Last bar revised / new bar appended (`NewBar`), `CancelHistoricalData` |
 | `ReqHistoricalTicks` (TRADES / BID_ASK / MIDPOINT), `ReqHeadTimeStamp` | live | |
-| Market data: `ReqMktData`, `ReqTickers` (snapshots), `ReqMarketDataType` | live | Delayed ticks, tickReqParams (minTick, BBO exchange), one Ticker per contract |
+| Market data: `ReqMktData`, `ReqTickers` (snapshots), `ReqMarketDataType` | live | Real-time (US stocks, OPRA, CME/CBOT/NYMEX/COMEX futures) and delayed ticks, tickReqParams (minTick, BBO exchange), one Ticker per contract; permissions per venue: `cmd/mdcheck` |
 | Option greeks (tickOptionComputation) | live | Bid/ask/last/model greeks; TWS sentinels map to nil |
 | `ReqTickByTickData`, `ReqMktDepth` | live | |
 | `ReqRealTimeBars` | live | |
@@ -122,7 +122,8 @@ Other:
 
 1. The trading paths have not been run against a live (paper) account yet.
 2. A streaming subscription rejected by TWS (e.g. missing permissions) stays registered (and is re-sent after a reconnect) until cancelled.
-3. See "Not Implemented" above.
+3. With real-time subscriptions, option quotes and stock tick-by-tick / 5-second bars have only been checked outside US market hours (permissions confirmed, no data yet); futures were verified streaming.
+4. See "Not Implemented" above.
 
 ## Test Coverage
 
