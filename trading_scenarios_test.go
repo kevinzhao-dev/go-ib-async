@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -190,6 +191,57 @@ func TestBracketConflictingIDsSendNothing(t *testing.T) {
 			roundTrip(t, ib)
 			if n := srv.Received(protocol.MsgPlaceOrder); err == nil || n != 0 || len(ib.Trades()) != 0 {
 				t.Fatalf("conflicting bracket: err %v, %d placements, %d local trades", err, n, len(ib.Trades()))
+			}
+		})
+	}
+}
+
+// A leg that reuses the ID of an existing order would be sent as a
+// modification of that order, which the risk manager checked as a new leg.
+func TestBracketLegWithExistingOrderID(t *testing.T) {
+	const existingID = 3000
+	for _, tc := range []struct {
+		name   string
+		ids    [3]int64
+		filled bool
+	}{
+		{"parent", [3]int64{existingID, 3005, 3006}, false},
+		{"take-profit", [3]int64{2990, existingID, 3006}, false},
+		{"stop-loss", [3]int64{2990, 2995, existingID}, false},
+		// Before the check, the parent and take-profit were sent and then cancelled.
+		{"stop-loss", [3]int64{2990, 2995, existingID}, true},
+	} {
+		t.Run(fmt.Sprintf("%s/filled=%v", tc.name, tc.filled), func(t *testing.T) {
+			srv := startFake(t)
+			ib := connectFake(t, srv)
+			con := aaplE2E()
+			existing := order.LimitOrder("BUY", 1, 90)
+			existing.OrderID = existingID
+			if _, err := ib.PlaceOrder(con, existing); err != nil {
+				t.Fatal(err)
+			}
+			roundTrip(t, ib)
+			if tc.filled {
+				if err := srv.Fill(e2eClientID, existingID, 1, 90); err != nil {
+					t.Fatal(err)
+				}
+				roundTrip(t, ib)
+			}
+			b, err := order.NewBracket("SELL", 5, 100, 95, 105)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b.Parent.OrderID, b.TakeProfit.OrderID, b.StopLoss.OrderID = tc.ids[0], tc.ids[1], tc.ids[2]
+			trades, err := ib.PlaceBracketOrder(con, b)
+			roundTrip(t, ib)
+			if err == nil || !strings.Contains(err.Error(), tc.name+" leg") || len(trades) != 0 {
+				t.Fatalf("bracket reusing order %d: err %v, %d trades", existingID, err, len(trades))
+			}
+			if placed, cancels := srv.Received(protocol.MsgPlaceOrder), srv.Received(protocol.MsgCancelOrder); placed != 1 || cancels != 0 || len(ib.Trades()) != 1 {
+				t.Fatalf("gateway received %d placements and %d cancels, %d local trades; want only the existing order", placed, cancels, len(ib.Trades()))
+			}
+			if o, ok := srv.Order(e2eClientID, existingID); !ok || o.Action != "BUY" || o.Qty != 1 || o.LmtPrice != 90 || o.ParentID != 0 {
+				t.Fatalf("existing broker order changed: %+v", o)
 			}
 		})
 	}

@@ -86,7 +86,7 @@ positions on the initial subscription. [IBKR order cancellation](https://www.int
 | Scenario | Observed before the fix | Behavior covered by regression tests |
 |---|---|---|
 | Two clients share order ID 1000 | Modifying or cancelling a trade returned by `ReqAllOpenOrders` for the other client changed the current client's order | `ErrOrderIdentity` is returned before transmission. A valid local order with the default client ID can still be modified or cancelled. The tests include a peer using client ID 0. |
-| Explicit IDs and delayed acknowledgements | A new order overwrote a staged order with ID 1001. A bracket with an explicit parent assigned 1001 to a child as well. An unsolicited status for order 5000 still allowed automatic ID 1000. | Placing an order reserves its ID locally. A broker status advances the allocator even for an unknown order. Conflicting bracket IDs fail before any leg is sent. |
+| Explicit IDs and delayed acknowledgements | A new order overwrote a staged order with ID 1001. A bracket with an explicit parent assigned 1001 to a child as well. An unsolicited status for order 5000 still allowed automatic ID 1000. A bracket leg reusing a working order's ID modified that order without an error. | Placing an order reserves its ID locally. A broker status advances the allocator even for an unknown order. Conflicting bracket IDs, including a leg that reuses an existing order's ID, fail before any leg is sent. |
 | Three-leg bracket with room for two | A bracket rejected at the rate limit used up the duplicate window for its unsent parent. | The built-in risk manager counts all three open-order slots and rolls back the group's rate and duplicate entries on a risk rejection. Custom checkers still receive each leg. |
 | Missing broker state or unknown share count | An absent state source satisfied position and open-order limits. Cash-sized orders with zero specified shares passed quantity limits and could qualify as reducing during a halt. | The applicable limits reject an order whose exposure cannot be established. Cash-sized orders remain supported when these share limits are disabled. |
 | Partial fills, cancellation and two execution syncs | Two fills incurred 2 in commission and 9.5 in net realized P&L. Journal replay returned 6 and 28.5. | Replay counts each identified execution's latest commission report. A fill snapshot taken in the execution callback also retains the fee information available at that instant. |
@@ -173,7 +173,7 @@ Total library coverage (all packages except `cmd/` and `internal/fakegw`,
 measured across packages by `scripts/coverage.sh`): **95.1%**. CI fails below 90%.
 
 On Go 1.26.3 (darwin/arm64), the full suite passed five repetitions under the
-race detector with shuffled test order. The 29 added scenarios across 16 test
+race detector with shuffled test order. The 33 added scenarios across 17 test
 functions also passed 25 repetitions. All six protocol fuzz targets passed
 10 seconds each. The integration-tagged suite was compiled. The paper-account
 trading test remains pending.
