@@ -720,7 +720,10 @@ func (s *Server) refreshReference(ctx context.Context, p *plan) error {
 	qctx, cancel := context.WithTimeout(ctx, quoteTimeout)
 	_, qerr := s.quote(qctx, p.con)
 	cancel()
-	if _, ok := s.ReferencePrice(p.con); ok {
+	// Same margin as above: when the refresh failed, the old quote could
+	// otherwise expire before the risk check runs, which then skips the
+	// collar.
+	if _, ok := s.referenceWithin(p.con, s.cfg.QuoteMaxAge/2); ok {
 		return nil
 	}
 	collared := false

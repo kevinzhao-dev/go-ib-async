@@ -12,6 +12,7 @@ import (
 
 	ibgo "github.com/kevinzhao-dev/go-ib-async"
 	"github.com/kevinzhao-dev/go-ib-async/contract"
+	"github.com/kevinzhao-dev/go-ib-async/internal/fakegw"
 	"github.com/kevinzhao-dev/go-ib-async/order"
 	"github.com/kevinzhao-dev/go-ib-async/risk"
 )
@@ -88,6 +89,23 @@ func TestPlaceRefreshesStaleQuote(t *testing.T) {
 	id = m.previewID(map[string]any{"contract": aapl(), "action": "SELL", "quantity": 1, "order_type": "MKT"})
 	time.Sleep(60 * time.Millisecond)
 	m.ok("place_order", map[string]any{"preview_id": id, "wait_seconds": 1})
+}
+
+// A failed refresh must not fall back to an old quote that could expire
+// before the risk check, which would then skip the collar.
+func TestPlaceRejectsAgingQuoteAfterFailedRefresh(t *testing.T) {
+	h := newHarness(t, harnessOpts{trading: true, limits: collarLimits(),
+		config: func(c *Config) { c.QuoteMaxAge = 400 * time.Millisecond }})
+	id := h.previewID(limitBuy(1, 200))
+	h.gw.Handle(1, func(req []string) [][]byte { // quotes stop: no prices
+		return [][]byte{fakegw.Msg(57, 1, req[2])}
+	})
+	time.Sleep(250 * time.Millisecond) // older than QuoteMaxAge/2, not expired
+	sent := h.gw.Received(3)
+	h.fail("place_order", map[string]any{"preview_id": id}, "so the price collar cannot check the limit price. Nothing was sent")
+	if h.gw.Received(3) != sent {
+		t.Fatal("order sent without a current reference price")
+	}
 }
 
 func TestCollarFailsClosedWithoutQuote(t *testing.T) {
