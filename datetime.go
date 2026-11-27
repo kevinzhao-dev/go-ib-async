@@ -60,7 +60,7 @@ func allDigits(s string) bool {
 // ib_async's util.parseIBDatetime):
 //
 //	"20231019"                       date (UTC midnight)
-//	"1697722200"                     unix seconds (formatDate=2)
+//	"1697722200"                     unix seconds (formatDate=2), in UTC
 //	"20231019 09:30:00 US/Eastern"   wall time with zone
 //	"20231019  09:30:00"             wall time, no zone (two spaces)
 //	"2023-10-19 09:30:00.0"          ISO-ish
@@ -83,7 +83,7 @@ func parseIBDatetime(s string) time.Time {
 		if err != nil {
 			return time.Time{}
 		}
-		return time.Unix(n, 0)
+		return time.Unix(n, 0).UTC()
 	}
 	if strings.Count(s, " ") >= 2 && !strings.Contains(s, "  ") {
 		parts := strings.SplitN(s, " ", 3)

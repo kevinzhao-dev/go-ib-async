@@ -49,7 +49,7 @@ type PnLSingle struct {
 	DailyPnL      float64
 	UnrealizedPnL float64
 	RealizedPnL   float64
-	Position      int
+	Position      float64
 	Value         float64
 }
 

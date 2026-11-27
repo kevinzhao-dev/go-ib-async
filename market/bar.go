@@ -2,6 +2,8 @@ package market
 
 import (
 	"math"
+	"slices"
+	"sync"
 	"time"
 
 	"github.com/kevinzhao-dev/go-ib-async/contract"
@@ -47,7 +49,34 @@ type BarDataList struct {
 	KeepUpToDate   bool
 	ChartOptions   []contract.TagValue
 
+	// NewBar is true during an UpdateEvent when the update appended a new
+	// bar, false when it revised the last bar.
+	NewBar bool
+
+	mu sync.RWMutex
+
+	// UpdateEvent fires on the client's reader goroutine after each update.
 	UpdateEvent event.Event[*BarDataList]
+}
+
+// Lock acquires the write lock (used by the client while updating Bars).
+func (l *BarDataList) Lock() { l.mu.Lock() }
+
+// Unlock releases the write lock.
+func (l *BarDataList) Unlock() { l.mu.Unlock() }
+
+// RLock acquires the read lock: hold it to read fields (ReqID, NewBar,
+// Bars) from a goroutine other than the client's reader goroutine.
+func (l *BarDataList) RLock() { l.mu.RLock() }
+
+// RUnlock releases the read lock.
+func (l *BarDataList) RUnlock() { l.mu.RUnlock() }
+
+// Snapshot returns a copy of the bars that is safe to use from any goroutine.
+func (l *BarDataList) Snapshot() []BarData {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return slices.Clone(l.Bars)
 }
 
 // RealTimeBarList is a container for real-time bars with metadata.
@@ -60,7 +89,30 @@ type RealTimeBarList struct {
 	UseRTH              bool
 	RealTimeBarsOptions []contract.TagValue
 
+	mu sync.RWMutex
+
+	// UpdateEvent fires on the client's reader goroutine for every new bar.
 	UpdateEvent event.Event[*RealTimeBarList]
+}
+
+// Lock acquires the write lock (used by the client while appending bars).
+func (l *RealTimeBarList) Lock() { l.mu.Lock() }
+
+// Unlock releases the write lock.
+func (l *RealTimeBarList) Unlock() { l.mu.Unlock() }
+
+// RLock acquires the read lock: hold it to read fields (ReqID, Bars) from a
+// goroutine other than the client's reader goroutine.
+func (l *RealTimeBarList) RLock() { l.mu.RLock() }
+
+// RUnlock releases the read lock.
+func (l *RealTimeBarList) RUnlock() { l.mu.RUnlock() }
+
+// Snapshot returns a copy of the bars that is safe to use from any goroutine.
+func (l *RealTimeBarList) Snapshot() []RealTimeBar {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return slices.Clone(l.Bars)
 }
 
 // Bar is an aggregated bar from tick streams.

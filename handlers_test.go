@@ -349,6 +349,9 @@ func TestReqMktDataSnapshot(t *testing.T) {
 	srv := startFake(t)
 	srv.Handle(1, func(req []string) [][]byte {
 		id := req[2]
+		if req[17] != "1" { // streaming request: no snapshot end
+			return nil
+		}
 		return [][]byte{
 			fakegw.Msg(1, 6, id, 1, 150.0, 100.0, 0),
 			fakegw.Msg(1, 6, id, 2, 150.1, 200.0, 0),
@@ -364,7 +367,19 @@ func TestReqMktDataSnapshot(t *testing.T) {
 	if tk.Bid != 150 || tk.Ask != 150.1 || tk.BidSize != 100 || tk.AskSize != 200 {
 		t.Fatalf("ticker bid %g/%g ask %g/%g", tk.Bid, tk.BidSize, tk.Ask, tk.AskSize)
 	}
-	ib.CancelMktData(aaplE2E()) // matched by contract key (conId)
+	// TWS ends snapshot subscriptions itself: the request id is released.
+	ib.state.Mu.RLock()
+	left := len(ib.state.ReqID2Ticker)
+	ib.state.Mu.RUnlock()
+	if left != 0 {
+		t.Fatalf("%d tickers still registered after snapshot end", left)
+	}
+
+	// Streaming subscriptions are cancelled by contract key (conId).
+	if _, err := ib.ReqMktData(aaplE2E(), "", false, false); err != nil {
+		t.Fatal(err)
+	}
+	ib.CancelMktData(aaplE2E())
 	waitFor(t, "cancelMktData", func() bool { return srv.Received(2) == 1 })
 }
 

@@ -1,4 +1,4 @@
-.PHONY: all build vet lint fmt test test-race test-shuffle test-live test-cover cover-check fuzz fuzz-all bench smoke ci clean
+.PHONY: all build vet lint fmt test test-race test-shuffle test-live test-cover cover-check fuzz fuzz-all bench smoke mdcheck ci clean
 
 # Default: build + vet + test
 all: build vet test
@@ -46,6 +46,10 @@ cover-check:
 # Live smoke test
 smoke:
 	go run ./cmd/smoketest
+
+# Live market data permission check
+mdcheck:
+	go run ./cmd/mdcheck
 
 fuzz:
 	go test -run='^$$' -fuzz=FuzzDecodeMessage -fuzztime=10s ./protocol/
