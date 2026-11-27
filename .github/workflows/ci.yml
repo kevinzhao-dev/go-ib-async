@@ -5,11 +5,23 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  # Job id and matrix are referenced by branch protection on main
+  # ("test (1.24)", "test (1.25)"): keep them stable.
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
+      fail-fast: false
       matrix:
         go-version: ['1.24', '1.25']
     steps:
@@ -21,12 +33,71 @@ jobs:
       - name: Build
         run: go build ./...
 
-      - name: Vet
-        run: go vet ./...
+      - name: Vet (including integration-tagged files)
+        run: |
+          go vet ./...
+          go vet -tags=integration ./...
 
-      - name: Test (unit only, no IB Gateway required)
-        run: go test -race -count=1 -tags='!integration' ./...
+      - name: Unit + E2E tests (race detector, random order; no IB Gateway needed)
+        run: go test -race -count=1 -shuffle=on ./...
 
-      - name: Coverage
-        if: matrix.go-version == '1.25'
-        run: go test -cover -tags='!integration' ./...
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go mod tidy
+        run: go mod tidy -diff
+
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Coverage gate (minimum 90%)
+        env:
+          COVERAGE_MIN: '90'
+        run: ./scripts/coverage.sh
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            coverage.out
+            coverage.txt
+            coverage.html
+          if-no-files-found: ignore
+          retention-days: 14
+
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Fuzz protocol decoders (10s per target)
+        env:
+          FUZZTIME: 10s
+        run: ./scripts/fuzz.sh

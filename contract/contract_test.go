@@ -240,3 +240,20 @@ func TestNewContractDetails(t *testing.T) {
 		t.Fatalf("MdSizeMultiplier = %d, want 1", cd.MdSizeMultiplier)
 	}
 }
+
+func TestKeyBagWithoutLegsAndReversedSpread(t *testing.T) {
+	if Bag().Key() != 0 {
+		t.Fatal("a BAG without legs has key 0")
+	}
+	spread := func(a1, a2 string) *Contract {
+		c := Bag()
+		c.ComboLegs = []ComboLeg{{ConID: 1, Ratio: 1, Action: a1}, {ConID: 2, Ratio: 1, Action: a2}}
+		return c
+	}
+	if spread("BUY", "SELL").Key() == spread("SELL", "BUY").Key() {
+		t.Fatal("a spread and its reverse must have different keys")
+	}
+	if spread("BUY", "SELL").Key() != spread("BUY", "SELL").Key() {
+		t.Fatal("key must be deterministic")
+	}
+}

@@ -92,7 +92,7 @@ Other:
 - `ReqAccountSummary` left the TWS subscription open (max 2 allowed).
 - Execution/bar timestamps with a time zone suffix or two spaces parsed as zero time.
 - `CancelMktData` sent while holding the state lock; unqualified contracts collided.
-- `-tags='!integration'` in the Makefile was a no-op (CI still passes it; harmless).
+- `-tags='!integration'` in the Makefile and CI was a no-op.
 
 ## Breaking API changes
 
@@ -110,16 +110,24 @@ Other:
 
 ## Test Coverage
 
+Total library coverage (all packages except `cmd/` and `internal/fakegw`,
+measured across packages by `scripts/coverage.sh`): **95.6%**. CI fails below 90%.
+
 | Package | Coverage |
 |---------|----------|
 | account | 100% |
+| contract | 100% |
 | event | 100% |
-| market | 100% |
+| internal/state | 100% |
 | internal/throttle | 100% |
-| contract | 97.7% |
-| risk | 90.0% |
-| journal | 82.3% |
-| protocol | 66.2% |
-| ibgo (root) | 60.0% |
-| internal/state | 53.0% |
-| order | 35.5% (trade methods are covered by root-package tests) |
+| market | 100% |
+| order | 100% |
+| risk | 98.1% |
+| protocol | 96.5% |
+| journal | 95.2% |
+| ibgo (root) | 93.5% |
+| internal/fakegw (test infrastructure) | 73.2% own tests; exercised further by the E2E tests |
+
+Found while adding tests (fixed): `reqHeadTimestamp` sent `whatToShow`/`useRTH`
+swapped, `reqScannerSubscription` sent its two option lists swapped, and the
+BAG contract key ignored leg actions (a spread and its reverse collided).

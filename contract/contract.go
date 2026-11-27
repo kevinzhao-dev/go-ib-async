@@ -87,11 +87,15 @@ func (c *Contract) bagHash() int64 {
 	sort.Slice(sorted, func(i, j int) bool {
 		return sorted[i].ConID < sorted[j].ConID
 	})
-	// Simple hash combining leg conIds, ratios, actions
+	// Combine leg conIds, ratios and actions: a spread and its reverse
+	// (BUY/SELL swapped) are different contracts.
 	var h int64
 	for _, leg := range sorted {
 		h = h*31 + leg.ConID
 		h = h*31 + int64(leg.Ratio)
+		for i := 0; i < len(leg.Action); i++ {
+			h = h*31 + int64(leg.Action[i])
+		}
 	}
 	return h
 }
