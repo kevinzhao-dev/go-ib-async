@@ -164,3 +164,22 @@ func TestReplayMergesByPermIDAndOrdersEntries(t *testing.T) {
 		t.Fatalf("discrepancies = %+v (only the two unmatched open entries; other clients ignored)", d)
 	}
 }
+
+func TestReplayCommissionReportsByExecution(t *testing.T) {
+	reports := []CommissionSnapshot{
+		{ExecID: "first", Commission: 1, RealizedPNL: -5},
+		{ExecID: "second", Commission: 2, RealizedPNL: 10},
+		{ExecID: "first", Commission: 1, RealizedPNL: -5}, // repeated on a sync
+		{ExecID: "first", Commission: 0.5, RealizedPNL: -4.5},
+		{Commission: 0.25}, // records without an execution ID cannot be matched
+		{Commission: 0.25},
+	}
+	var records []Record
+	for _, cr := range reports {
+		records = append(records, Record{Type: TypeCommission, ClientID: 1, OrderID: 42, Commission: &cr})
+	}
+	e := Replay(records)[Key{ClientID: 1, OrderID: 42}]
+	if e == nil || e.Commission != 3 || e.RealizedPNL != 5.5 {
+		t.Fatalf("replayed commission reports = %+v, want fees 3 and realized P&L 5.5", e)
+	}
+}

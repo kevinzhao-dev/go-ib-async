@@ -141,12 +141,18 @@ func (t *Trade) OrderSnapshot() Order {
 	return *t.Order
 }
 
-// FillsSnapshot returns a copy of the fill list.
+// FillsSnapshot returns the fills with the commission reports available now.
+// Later reports are visible in subsequent snapshots.
 func (t *Trade) FillsSnapshot() []*Fill {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	out := make([]*Fill, len(t.Fills))
-	copy(out, t.Fills)
+	for i, fill := range t.Fills {
+		if fill != nil {
+			snapshot := *fill
+			out[i] = &snapshot
+		}
+	}
 	return out
 }
 
@@ -293,6 +299,13 @@ func (t *Trade) AddFill(f *Fill, now time.Time) {
 	})
 }
 
+// SetFillCommission attaches a report to a fill under the snapshot lock.
+func (t *Trade) SetFillCommission(f *Fill, report *CommissionReport) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	f.CommissionReport = report
+}
+
 // UpdateFromOpenOrder copies the fields TWS may change on a live order.
 func (t *Trade) UpdateFromOpenOrder(o *Order) {
 	t.mu.Lock()
@@ -305,6 +318,17 @@ func (t *Trade) UpdateFromOpenOrder(o *Order) {
 	t.Order.OrderRef = o.OrderRef
 	if o.TIF != "" {
 		t.Order.TIF = o.TIF
+	}
+}
+
+// BindOrderID adopts the negative API order ID that TWS binds a manual order
+// to, when the trade was created before the binding (orderId 0). Without it
+// the order could only be addressed by an ID that no longer matches.
+func (t *Trade) BindOrderID(orderID int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.Order.OrderID == 0 && orderID < 0 {
+		t.Order.OrderID = orderID
 	}
 }
 

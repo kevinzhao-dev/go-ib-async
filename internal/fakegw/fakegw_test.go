@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"math"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -101,11 +102,7 @@ func TestHandshakeVersion(t *testing.T) {
 }
 
 func TestOrderLifecycleAndErrors(t *testing.T) {
-	s, err := Start()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
+	s := startTestServer(t)
 	rc, _ := dial(t, s, 5)
 
 	rc.send(placeOrderFields(1000, "BUY", "10", "100", "1", 0, false)...)
@@ -173,15 +170,24 @@ func TestOrderLifecycleAndErrors(t *testing.T) {
 	}
 }
 
+func startTestServer(t *testing.T) *Server {
+	t.Helper()
+	s, err := Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Close)
+	return s
+}
+
 func TestWhatIfIsNotStored(t *testing.T) {
-	s, _ := Start()
-	defer s.Close()
+	s := startTestServer(t)
 	rc, _ := dial(t, s, 1)
 	rc.send(placeOrderFields(2000, "BUY", "1", "1", "1", 0, true)...)
 	first := rc.expect("5")
 	second := rc.expect("5")
-	if first[len(first)-1] == "" && second[0] != "5" {
-		t.Fatal("expected two openOrder messages")
+	if slices.Contains(first, "1500.25") || !slices.Contains(second, "1500.25") {
+		t.Fatal("the second what-if reply must supply the initial margin change")
 	}
 	if _, ok := s.Order(1, 2000); ok {
 		t.Fatal("what-if orders must not be stored")
@@ -189,18 +195,17 @@ func TestWhatIfIsNotStored(t *testing.T) {
 }
 
 func TestHeldBracketReleasedByLastLeg(t *testing.T) {
-	s, _ := Start()
-	defer s.Close()
+	s := startTestServer(t)
 	rc, _ := dial(t, s, 1)
 	rc.send(placeOrderFields(10, "BUY", "1", "100", "0", 0, false)...)
 	rc.send(placeOrderFields(11, "SELL", "1", "110", "0", 10, false)...)
-	time.Sleep(50 * time.Millisecond)
+	rc.send("49", "1")
+	rc.expect("49") // both staged orders have been processed
 	if o, _ := s.Order(1, 10); !o.held || s.Fill(1, 10, 1, 100) == nil {
 		t.Fatal("untransmitted parent must be held and not fillable")
 	}
 	rc.send(placeOrderFields(12, "SELL", "1", "90", "1", 10, false)...)
 	rc.expect("3")
-	time.Sleep(50 * time.Millisecond)
 	p, _ := s.Order(1, 10)
 	c, _ := s.Order(1, 12)
 	if p.Status != "Submitted" || c.Status != "PreSubmitted" {
@@ -208,7 +213,7 @@ func TestHeldBracketReleasedByLastLeg(t *testing.T) {
 	}
 	// Cancelling the parent cancels the children.
 	rc.send("4", "1", "10", "")
-	time.Sleep(50 * time.Millisecond)
+	rc.expect("4") // the gateway reports error 202 after cancelling the group
 	for _, id := range []int64{10, 11, 12} {
 		if o, _ := s.Order(1, id); o.Status != "Cancelled" {
 			t.Fatalf("order %d status %s", id, o.Status)
@@ -217,8 +222,7 @@ func TestHeldBracketReleasedByLastLeg(t *testing.T) {
 }
 
 func TestPositionAccounting(t *testing.T) {
-	s, _ := Start()
-	defer s.Close()
+	s := startTestServer(t)
 	c := Contract{ConID: 1}
 	s.mu.Lock()
 	defer s.mu.Unlock()
