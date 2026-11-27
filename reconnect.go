@@ -34,8 +34,11 @@ type ReconnectConfig struct {
 	// ClientIDFallbacks is how many following client ids (clientID+1,
 	// clientID+2, ...) a connection attempt tries when TWS refuses the
 	// client id because another API client is connected with it (error
-	// 326), before the attempt counts as failed. Every attempt starts again
-	// from clientID; ClientID reports the id in use. 0 (default) = none.
+	// 326), before the attempt counts as failed. ClientID reports the id in
+	// use. The first connection starts at clientID. A reconnect starts at the
+	// id it was last connected with and wraps around to clientID, so after a
+	// TWS restart a client that had fallen back does not take clientID from
+	// the client that held it. 0 (default) = none.
 	// Leave it 0 for a client that places orders: TWS binds orders to the
 	// client id that placed them, so after connecting with another id the
 	// client could no longer modify or cancel its earlier orders, and
@@ -57,20 +60,27 @@ func (ib *IB) LastConnectError() error {
 	return nil
 }
 
-// connectAnyClientID connects with clientID and, while TWS refuses it as
-// already in use, with up to cfg.ClientIDFallbacks following ids.
-func (ib *IB) connectAnyClientID(ctx context.Context, host string, port, clientID int, cfg ReconnectConfig, timeout time.Duration) error {
+// connectAnyClientID connects with one of the ids clientID ..
+// clientID+cfg.ClientIDFallbacks, moving to the next while TWS refuses one as
+// already in use. It starts at start and wraps around past the last id.
+func (ib *IB) connectAnyClientID(ctx context.Context, host string, port, clientID, start int, cfg ReconnectConfig, timeout time.Duration) error {
 	fallbacks := max(cfg.ClientIDFallbacks, 0)
+	n := fallbacks + 1
+	offset := start - clientID
+	if offset < 0 || offset >= n {
+		offset = 0
+	}
+	idAt := func(i int) int { return clientID + (offset+i)%n }
 	var err error
-	for i := 0; i <= fallbacks; i++ {
+	for i := 0; i < n; i++ {
 		connectCtx, cancel := context.WithTimeout(ctx, timeout)
-		err = ib.Connect(connectCtx, host, port, clientID+i)
+		err = ib.Connect(connectCtx, host, port, idAt(i))
 		cancel()
 		if err == nil || !errors.Is(err, ErrClientIDInUse) || ctx.Err() != nil {
 			return err
 		}
-		if i < fallbacks {
-			log.Printf("ibgo: client id %d is in use, trying %d", clientID+i, clientID+i+1)
+		if i < n-1 {
+			log.Printf("ibgo: client id %d is in use, trying %d", idAt(i), idAt(i+1))
 		}
 	}
 	if fallbacks > 0 {
@@ -112,6 +122,8 @@ func (ib *IB) ConnectWithReconnect(ctx context.Context, host string, port, clien
 		connectTimeout = 10 * time.Second
 	}
 	attempt := 0
+	// The id of the last connection: a reconnect tries it first.
+	lastID := clientID
 
 	for {
 		select {
@@ -120,7 +132,7 @@ func (ib *IB) ConnectWithReconnect(ctx context.Context, host string, port, clien
 		default:
 		}
 
-		err := ib.connectAnyClientID(ctx, host, port, clientID, cfg, connectTimeout)
+		err := ib.connectAnyClientID(ctx, host, port, clientID, lastID, cfg, connectTimeout)
 
 		if err != nil {
 			ib.connErr.Store(&connErrBox{err: err})
@@ -139,6 +151,7 @@ func (ib *IB) ConnectWithReconnect(ctx context.Context, host string, port, clien
 
 		// Connected successfully
 		ib.connErr.Store(nil)
+		lastID = int(ib.ClientID())
 		attempt = 0
 		done := ib.client.Done()
 		log.Printf("ibgo: connected to %s:%d as client %d", host, port, ib.ClientID())

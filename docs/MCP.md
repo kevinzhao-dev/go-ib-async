@@ -59,7 +59,11 @@ whose client id is taken tries the next ones (`-client-id-fallbacks`,
 default 9: ids 17-26), so several sessions can read at the same time;
 `get_status` reports the id in use. With `-enable-trading` the client id is
 fixed, because orders belong to the client id that placed them: give each
-trading server its own `-client-id`.
+trading server its own `-client-id`. A read-only server that fell back
+reconnects with the id it had, so after a TWS restart it does not take the
+id of a trading server that shares its base `-client-id`; a trading server
+that starts after the read-only ones does find its id taken, so start it
+first or give it an id outside their range.
 
 ## Tools
 

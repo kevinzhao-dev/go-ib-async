@@ -38,16 +38,17 @@ var ErrClientIDInUse = errors.New("ibgo: client id already in use")
 // client id is taken.
 const codeClientIDInUse = 326
 
-// HandshakeError is an error TWS/Gateway sent before closing the connection
-// during the API handshake, i.e. the reason it refused the connection.
+// HandshakeError is an error TWS/Gateway sent during the API handshake that
+// did not complete, i.e. the likely reason the connection was refused.
 type HandshakeError struct {
 	ClientID int
 	Code     int
 	Message  string
 }
 
+// Error does not say that the client id was refused: only 326 means that.
 func (e *HandshakeError) Error() string {
-	return fmt.Sprintf("ibgo: TWS/Gateway refused client id %d: error %d: %s", e.ClientID, e.Code, e.Message)
+	return fmt.Sprintf("ibgo: TWS/Gateway error %d for client id %d: %s", e.Code, e.ClientID, e.Message)
 }
 
 // Is lets errors.Is(err, ErrClientIDInUse) detect error 326.
@@ -216,6 +217,13 @@ func (c *Client) Connect(ctx context.Context, host string, port, clientID int) e
 		return fmt.Errorf("connection closed during handshake")
 	case <-ctx.Done():
 		c.Disconnect()
+		// TWS may have refused the client id without closing the socket yet.
+		c.mu.Lock()
+		herr := c.handshakeErr
+		c.mu.Unlock()
+		if herr != nil {
+			return fmt.Errorf("%w (TWS/Gateway sent: %w)", ctx.Err(), herr)
+		}
 		return ctx.Err()
 	}
 }
@@ -371,26 +379,7 @@ func (c *Client) readLoop() {
 		ready := c.apiReady
 		c.mu.Unlock()
 		if !ready && len(fields) >= 3 {
-			msgID, _ := strconv.Atoi(fields[0])
-			c.mu.Lock()
-			if msgID == InMsgNextValidID {
-				validID, _ := strconv.ParseInt(fields[2], 10, 64)
-				c.UpdateReqID(validID)
-				c.hasReqID = true
-			} else if msgID == InMsgManagedAccounts {
-				c.accounts = splitAccounts(fields[2])
-			} else if msgID == InMsgErrMsg {
-				c.recordHandshakeError(fields)
-			}
-			becameReady := c.hasReqID && len(c.accounts) > 0
-			if becameReady {
-				c.apiReady = true
-			}
-			onReady := c.OnReady
-			c.mu.Unlock()
-			if becameReady && onReady != nil {
-				onReady()
-			}
+			c.snoopHandshake(fields)
 		}
 
 		// Batch boundary: fire OnDataArrived at start of a new batch
@@ -428,17 +417,50 @@ func (c *Client) readLoop() {
 	}
 }
 
+// snoopHandshake tracks a message received before the API is ready and
+// calls OnReady once nextValidId and managedAccounts have both arrived.
+func (c *Client) snoopHandshake(fields []string) {
+	msgID, _ := strconv.Atoi(fields[0])
+	c.mu.Lock()
+	switch msgID {
+	case InMsgNextValidID:
+		validID, _ := strconv.ParseInt(fields[2], 10, 64)
+		c.UpdateReqID(validID)
+		c.hasReqID = true
+	case InMsgManagedAccounts:
+		c.accounts = splitAccounts(fields[2])
+	case InMsgErrMsg:
+		c.recordHandshakeError(fields)
+	}
+	// Disconnect clears apiReady but not hasReqID and accounts: a message
+	// read from the buffer after it must not make the client ready again,
+	// or IsReady (IB.IsConnected) would report a closed connection.
+	becameReady := !c.apiReady && c.ConnState == Connected && c.hasReqID && len(c.accounts) > 0
+	if becameReady {
+		c.apiReady = true
+	}
+	onReady := c.OnReady
+	c.mu.Unlock()
+	if becameReady && onReady != nil {
+		onReady()
+	}
+}
+
 // recordHandshakeError keeps an error TWS sent before the API became ready,
 // so that Connect can report why TWS closed the connection (e.g. 326, client
 // id already in use). Fields: msgId, version, reqId, code, message, ...
 // Errors tied to a request and info codes (2100-2199, data farm status) are
-// not reasons for a refusal. Called with c.mu held.
+// not reasons for a refusal. A later error does not replace 326, so that the
+// client id fallback still sees it. Called with c.mu held.
 func (c *Client) recordHandshakeError(fields []string) {
 	if len(fields) < 5 || fields[2] != "-1" {
 		return
 	}
 	code, err := strconv.Atoi(fields[3])
 	if err != nil || (code >= 2100 && code < 2200) {
+		return
+	}
+	if c.handshakeErr != nil && c.handshakeErr.Code == codeClientIDInUse {
 		return
 	}
 	c.handshakeErr = &HandshakeError{ClientID: c.ClientID, Code: code, Message: fields[4]}

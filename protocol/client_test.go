@@ -326,7 +326,7 @@ func TestClientHandshakeRefusedReportsReason(t *testing.T) {
 	if !errors.As(err, &herr) || herr.Code != 326 || herr.ClientID != 17 || herr.Message != text {
 		t.Fatalf("handshake error = %+v", herr)
 	}
-	if !strings.Contains(err.Error(), "refused client id 17: error 326") {
+	if !strings.Contains(err.Error(), "error 326 for client id 17") {
 		t.Fatalf("message = %q", err.Error())
 	}
 	c.Wait()
@@ -383,4 +383,66 @@ func TestClientNotReadyDuringHandshake(t *testing.T) {
 	if !c.IsReady() {
 		t.Fatal("IsReady must be true after the handshake")
 	}
+}
+
+// A message decoded from the read buffer after Disconnect must not make the
+// client ready again: IsReady backs IB.IsConnected.
+func TestClientNotReadyAfterDisconnect(t *testing.T) {
+	port, _ := scriptedServer(t, "178", func(c net.Conn, r *bufio.Reader) {
+		readTestFrame(r)
+		writeTestFrame(c, "9\x001\x00500\x00")
+		writeTestFrame(c, "15\x001\x00DU1\x00")
+		readTestFrame(r) // until the client disconnects
+	})
+	c := NewClient()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := c.Connect(ctx, "127.0.0.1", port, 1); err != nil {
+		t.Fatal(err)
+	}
+	c.Disconnect()
+	c.Wait()
+	// What the read loop does with a currentTime it had already buffered.
+	c.snoopHandshake([]string{"49", "1", "1764255600"})
+	if c.IsReady() {
+		t.Fatal("IsReady must stay false after Disconnect")
+	}
+}
+
+// An error after 326 (and before TWS closes the socket) must not hide it,
+// or the client id fallback would not happen.
+func TestClientHandshakeKeepsClientIDInUse(t *testing.T) {
+	port, _ := scriptedServer(t, "178", func(c net.Conn, r *bufio.Reader) {
+		readTestFrame(r)
+		writeTestFrame(c, "4\x002\x00-1\x00326\x00Unable to connect as the client id is already in use.\x00\x00")
+		writeTestFrame(c, "4\x002\x00-1\x001100\x00Connectivity between IB and Trader Workstation has been lost.\x00\x00")
+	})
+	c := NewClient()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	err := c.Connect(ctx, "127.0.0.1", port, 17)
+	if !errors.Is(err, ErrClientIDInUse) {
+		t.Fatalf("err = %v, want ErrClientIDInUse", err)
+	}
+	c.Wait()
+}
+
+// TWS sent its refusal but the socket stays open until the connect times
+// out: the timeout error still carries the reason.
+func TestClientHandshakeTimeoutKeepsReason(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	port, _ := scriptedServer(t, "178", func(c net.Conn, r *bufio.Reader) {
+		readTestFrame(r)
+		writeTestFrame(c, "4\x002\x00-1\x00326\x00Unable to connect as the client id is already in use.\x00\x00")
+		<-release
+	})
+	c := NewClient()
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	err := c.Connect(ctx, "127.0.0.1", port, 17)
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, ErrClientIDInUse) {
+		t.Fatalf("err = %v, want the deadline and ErrClientIDInUse", err)
+	}
+	c.Wait()
 }

@@ -29,7 +29,7 @@ func TestNotConnectedReportsWhy(t *testing.T) {
 	h := newHarness(t, harnessOpts{offline: true, broker: func(ib *ibgo.IB) Broker { return refusedBroker{ib} }})
 	st := h.ok("get_status", map[string]any{})
 	why := fmt.Sprint(st["connection_error"])
-	if st["connected"] != false || !strings.Contains(why, "refused client id 17: error 326") || !strings.Contains(why, "-client-id (env IB_CLIENT_ID)") {
+	if st["connected"] != false || !strings.Contains(why, "error 326 for client id 17") || !strings.Contains(why, "-client-id (env IB_CLIENT_ID)") {
 		t.Fatalf("status = %v", st)
 	}
 	if _, ok := st["client_id"]; ok {

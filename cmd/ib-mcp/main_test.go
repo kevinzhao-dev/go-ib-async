@@ -338,7 +338,7 @@ func TestRunClientIDInUse(t *testing.T) {
 	call, stop = startRun(t, cfg)
 	defer stop()
 	st = waitStatus(t, call, "no connection error reported", func(st map[string]any) bool { return st["connection_error"] != nil })
-	if st["connected"] != false || !strings.Contains(fmt.Sprint(st["connection_error"]), "refused client id 17: error 326") {
+	if st["connected"] != false || !strings.Contains(fmt.Sprint(st["connection_error"]), "error 326 for client id 17") {
 		t.Fatalf("status = %v", st)
 	}
 	if r := call("get_positions", "{}"); !strings.Contains(fmt.Sprint(r["error"]), "error 326") {

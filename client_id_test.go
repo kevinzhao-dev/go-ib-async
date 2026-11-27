@@ -88,3 +88,41 @@ func TestConnectWithReconnectAllFallbacksInUse(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+// A client that fell back keeps its id when it reconnects, so it does not
+// take the configured id from the client that held it once both reconnect
+// (e.g. after a TWS restart). With its id taken it moves on and wraps around.
+func TestReconnectTriesLastClientIDFirst(t *testing.T) {
+	srv := startFake(t)
+	srv.SetClientIDsInUse(7)
+	ib := New()
+	connected := runReconnect(t, ib, srv.Port(), 7, 2)
+	wait := func(what string) {
+		t.Helper()
+		select {
+		case <-connected:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("never %s; last error %v", what, ib.LastConnectError())
+		}
+	}
+	wait("connected")
+	if ib.ClientID() != 8 {
+		t.Fatalf("client id %d, want 8", ib.ClientID())
+	}
+
+	// TWS restarts: client id 7 is free for an instant.
+	srv.SetClientIDsInUse()
+	srv.DropConnection()
+	wait("reconnected")
+	if got := srv.ClientIDAttempts(); ib.ClientID() != 8 || !slices.Equal(got, []int64{7, 8, 8}) {
+		t.Fatalf("client id %d, attempts %v: the reconnect must try 8 first", ib.ClientID(), got)
+	}
+
+	// Its id and the next are taken: it wraps around to 7.
+	srv.SetClientIDsInUse(8, 9)
+	srv.DropConnection()
+	wait("reconnected again")
+	if got := srv.ClientIDAttempts(); ib.ClientID() != 7 || !slices.Equal(got[3:], []int64{8, 9, 7}) {
+		t.Fatalf("client id %d, attempts %v: want 8, 9, 7", ib.ClientID(), got)
+	}
+}
