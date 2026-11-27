@@ -1,6 +1,8 @@
 package mcpserver
 
 import (
+	"time"
+
 	"github.com/kevinzhao-dev/go-ib-async/account"
 	"github.com/kevinzhao-dev/go-ib-async/contract"
 	"github.com/kevinzhao-dev/go-ib-async/market"
@@ -124,11 +126,8 @@ func viewQuote(t *market.Ticker) quoteView {
 		MarketDataType: marketDataTypes[t.MarketDataType],
 		Time:           timeString(t.Time),
 		Bid:            price(t.Bid),
-		BidSize:        num(t.BidSize),
 		Ask:            price(t.Ask),
-		AskSize:        num(t.AskSize),
 		Last:           price(t.Last),
-		LastSize:       num(t.LastSize),
 		Open:           price(t.Open),
 		High:           price(t.High),
 		Low:            price(t.Low),
@@ -136,6 +135,17 @@ func viewQuote(t *market.Ticker) quoteView {
 		Volume:         num(t.Volume),
 		MarkPrice:      price(t.MarkPrice),
 		Halted:         num(t.Halted) != nil && t.Halted > 0,
+	}
+	// A size without its price (TWS sends 0 with an absent bid or ask) says
+	// nothing.
+	if v.Bid != nil {
+		v.BidSize = num(t.BidSize)
+	}
+	if v.Ask != nil {
+		v.AskSize = num(t.AskSize)
+	}
+	if v.Last != nil {
+		v.LastSize = num(t.LastSize)
 	}
 	if v.MarketDataType == "" {
 		v.MarketDataType = "unknown"
@@ -147,6 +157,8 @@ func viewQuote(t *market.Ticker) quoteView {
 }
 
 type barView struct {
+	// Time is the start of the bar: a date (YYYY-MM-DD) for daily and
+	// longer bars, which TWS reports without a time of day, else RFC 3339.
 	Time     string   `json:"t"`
 	Open     float64  `json:"o"`
 	High     float64  `json:"h"`
@@ -157,14 +169,19 @@ type barView struct {
 	BarCount int      `json:"n,omitempty"`
 }
 
-func viewBar(b market.BarData) barView {
+func viewBar(b market.BarData, daily bool) barView {
 	v := barView{
-		Time:     timeString(b.Date),
-		Open:     b.Open,
-		High:     b.High,
-		Low:      b.Low,
-		Close:    b.Close,
-		BarCount: b.BarCount,
+		Time:  timeString(b.Date),
+		Open:  b.Open,
+		High:  b.High,
+		Low:   b.Low,
+		Close: b.Close,
+	}
+	if daily && !b.Date.IsZero() {
+		v.Time = b.Date.Format(time.DateOnly)
+	}
+	if b.BarCount > 0 { // -1: not reported (MIDPOINT, CASH)
+		v.BarCount = b.BarCount
 	}
 	if b.Volume >= 0 {
 		v.Volume = num(b.Volume)

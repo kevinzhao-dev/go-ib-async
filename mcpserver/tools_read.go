@@ -11,6 +11,7 @@ import (
 
 	"github.com/kevinzhao-dev/go-ib-async/account"
 	"github.com/kevinzhao-dev/go-ib-async/contract"
+	"github.com/kevinzhao-dev/go-ib-async/market"
 	"github.com/kevinzhao-dev/go-ib-async/order"
 	"github.com/kevinzhao-dev/go-ib-async/risk"
 )
@@ -114,6 +115,7 @@ func (s *Server) resolve(ctx context.Context, spec contractSpec) (contract.Contr
 		s.cacheDetails(d)
 		return d, nil
 	}
+	sortByExpiry(matches)
 	var b strings.Builder
 	fmt.Fprintf(&b, "%d contracts match %s; narrow it down (e.g. with con_id, primary_exchange, expiry, strike or right). Candidates:", len(matches), describeSpec(con))
 	for i, m := range matches {
@@ -122,10 +124,36 @@ func (s *Server) resolve(ctx context.Context, spec contractSpec) (contract.Contr
 			break
 		}
 		if c := m.Contract; c != nil {
-			fmt.Fprintf(&b, "\n- con_id %d: %s", c.ConID, describeSpec(c))
+			cp := *c
+			cp.ConID = 0 // already in front
+			fmt.Fprintf(&b, "\n- con_id %d: %s", c.ConID, describeSpec(&cp))
 		}
 	}
 	return contract.ContractDetails{}, errors.New(b.String())
+}
+
+// sortByExpiry orders contract matches by expiry, strike and right, so that
+// the front month comes first and a limit keeps the nearest expirations
+// (TWS returns futures in no particular order). Contracts without an expiry,
+// such as stocks, keep TWS's order.
+func sortByExpiry(matches []contract.ContractDetails) {
+	key := func(d contract.ContractDetails) (string, float64, string) {
+		if d.Contract == nil {
+			return "\xff", 0, ""
+		}
+		return d.Contract.LastTradeDateOrContractMonth, d.Contract.Strike, d.Contract.Right
+	}
+	sort.SliceStable(matches, func(i, j int) bool {
+		ei, si, ri := key(matches[i])
+		ej, sj, rj := key(matches[j])
+		if ei != ej {
+			return ei < ej
+		}
+		if si != sj {
+			return si < sj
+		}
+		return ri < rj
+	})
 }
 
 func (s *Server) cacheDetails(d contract.ContractDetails) {
@@ -220,13 +248,16 @@ type statusResult struct {
 	ClientID       int64           `json:"client_id,omitempty"`
 	Accounts       []accountStatus `json:"accounts"`
 	MarketDataType string          `json:"market_data_type"`
-	Trading        tradingStatus   `json:"trading"`
+	// WhatIf tells whether preview_order asks TWS for margin and commission.
+	WhatIf  bool          `json:"what_if"`
+	Trading tradingStatus `json:"trading"`
 }
 
 func (s *Server) getStatus(_ context.Context, _ noArgs) (any, error) {
 	res := statusResult{
 		Connected:      s.b.IsConnected(),
 		MarketDataType: marketDataTypes[s.cfg.MarketDataType],
+		WhatIf:         !s.cfg.DisableWhatIf,
 		Accounts:       []accountStatus{},
 	}
 	if res.Connected {
@@ -289,6 +320,7 @@ func (s *Server) searchContracts(ctx context.Context, a searchArgs) (any, error)
 	if err != nil {
 		return nil, fmt.Errorf("contract lookup failed: %w", err)
 	}
+	sortByExpiry(matches)
 	res := searchResult{Count: len(matches), Contracts: []contractDetailsView{}}
 	for i, m := range matches {
 		if i == limit {
@@ -380,8 +412,9 @@ func (s *Server) getHistoricalBars(ctx context.Context, a barsArgs) (any, error)
 		bars = bars[len(bars)-s.cfg.MaxBars:] // keep the most recent
 		res.Truncated = true
 	}
+	daily := a.BarSize == "1 day" || a.BarSize == "1 week" || a.BarSize == "1 month"
 	for _, b := range bars {
-		res.Bars = append(res.Bars, viewBar(b))
+		res.Bars = append(res.Bars, viewBar(b, daily))
 	}
 	return res, nil
 }
@@ -390,7 +423,7 @@ func (s *Server) getHistoricalBars(ctx context.Context, a barsArgs) (any, error)
 
 type chainArgs struct {
 	Underlying     contractSpec `json:"underlying" required:"true" desc:"The underlying (e.g. a STK, IND or FUT contract)."`
-	Exchange       string       `json:"exchange,omitempty" desc:"Only chains on this exchange (default SMART; use '*' for all)."`
+	Exchange       string       `json:"exchange,omitempty" desc:"Only chains on this exchange (default SMART, or the future's exchange for a FUT underlying; '*' for all)."`
 	MaxExpirations int          `json:"max_expirations,omitempty" desc:"Earliest expirations to return per chain (default 12, max 100)."`
 	StrikeMin      float64      `json:"strike_min,omitempty"`
 	StrikeMax      float64      `json:"strike_max,omitempty"`
@@ -424,14 +457,23 @@ func (s *Server) getOptionChain(ctx context.Context, a chainArgs) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("option chain request failed: %w", err)
 	}
-	exch := strings.ToUpper(a.Exchange)
-	if exch == "" {
+	// Stock and index options are listed on SMART, futures options only on
+	// the future's exchange (ES options: CME), so a FUT defaults to that.
+	exch := strings.ToUpper(strings.TrimSpace(a.Exchange))
+	defaulted := exch == ""
+	if defaulted {
 		exch = "SMART"
+		if und.SecType == "FUT" && und.Exchange != "" {
+			exch = und.Exchange
+		}
 	}
 	maxExp := clamp(a.MaxExpirations, 12, 100)
 	res := chainResult{Underlying: viewContract(und), Chains: []chainView{}}
+	// When the default exchange lists none of the chains, return them all
+	// rather than make the agent guess the exchange.
+	all := exch == "*" || (defaulted && !anyChainOn(chains, exch))
 	for _, c := range chains {
-		if exch != "*" && c.Exchange != exch {
+		if !all && c.Exchange != exch {
 			continue
 		}
 		exps := append([]string(nil), c.Expirations...)
@@ -454,11 +496,22 @@ func (s *Server) getOptionChain(ctx context.Context, a chainArgs) (any, error) {
 	if len(res.Chains) == 0 && len(chains) > 0 {
 		var exchanges []string
 		for _, c := range chains {
-			exchanges = append(exchanges, c.Exchange)
+			if !contains(exchanges, c.Exchange) {
+				exchanges = append(exchanges, c.Exchange)
+			}
 		}
 		return nil, fmt.Errorf("no option chain on exchange %s; available: %s", exch, strings.Join(exchanges, ", "))
 	}
 	return res, nil
+}
+
+func anyChainOn(chains []market.OptionChain, exch string) bool {
+	for _, c := range chains {
+		if c.Exchange == exch {
+			return true
+		}
+	}
+	return false
 }
 
 // --- get_positions ---
@@ -554,21 +607,48 @@ func (s *Server) getAccountSummary(ctx context.Context, a accountSummaryArgs) (a
 // --- list_orders / get_order ---
 
 type listOrdersArgs struct {
-	Scope string `json:"scope,omitempty" enum:"open,all" desc:"open (default): working orders only; all: every order known to this session."`
+	Scope string `json:"scope,omitempty" enum:"open,all" desc:"open (default): working orders of every API client and TWS; all: also the filled and cancelled orders this session has seen."`
 }
 
 type ordersResult struct {
 	Orders []orderView `json:"orders"`
+	Note   string      `json:"note,omitempty"`
 }
 
-func (s *Server) listOrders(_ context.Context, a listOrdersArgs) (any, error) {
+func (s *Server) listOrders(ctx context.Context, a listOrdersArgs) (any, error) {
+	me := s.b.ClientID()
+	own := func(t *order.Trade) bool {
+		o := t.OrderSnapshot()
+		return me != 0 && o.ClientID == me && o.OrderID > 0
+	}
+	res := ordersResult{Orders: []orderView{}}
+
+	// TWS tells this client about its own orders as they change, but about
+	// other clients' and manual TWS orders only when asked (and sends no
+	// updates for them afterwards). Ask every time, and leave out other
+	// clients' orders that TWS no longer reports as open: what the session
+	// knows about them is stale.
+	others := map[*order.Trade]bool{}
+	if err := s.requireConnected(); err != nil {
+		res.Note = "not connected: only this client's orders known to the session are listed"
+	} else if open, err := s.b.ReqAllOpenOrders(ctx); err != nil {
+		res.Note = fmt.Sprintf("could not fetch the open orders of other API clients and TWS (%v); only this client's orders are listed", err)
+	} else {
+		for _, t := range open {
+			if !own(t) && !t.IsDone() {
+				others[t] = true
+			}
+		}
+	}
+
 	trades := s.b.OpenTrades()
 	if a.Scope == "all" {
 		trades = s.b.Trades()
 	}
-	me := s.b.ClientID()
-	res := ordersResult{Orders: []orderView{}}
 	for _, t := range trades {
+		if !own(t) && !others[t] && !(a.Scope == "all" && t.IsDone()) {
+			continue
+		}
 		res.Orders = append(res.Orders, viewTrade(t, me))
 	}
 	sort.Slice(res.Orders, func(i, j int) bool {

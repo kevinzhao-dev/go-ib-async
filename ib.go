@@ -312,10 +312,23 @@ func (ib *IB) ReqAccountSummary(ctx context.Context, groupName, tags string) ([]
 	}
 	items := resultItems(v)
 	values := make([]account.AccountValue, 0, len(items))
+	// TWS can send the same rows more than once for one request (seen live:
+	// IB Gateway answered a single reqAccountSummary with every row, and
+	// accountSummaryEnd, twice). Keep one row per account, tag and currency,
+	// in order of first appearance, with the latest value.
+	index := make(map[[3]string]int, len(items))
 	for _, item := range items {
-		if av, ok := item.(*account.AccountValue); ok {
-			values = append(values, *av)
+		av, ok := item.(*account.AccountValue)
+		if !ok {
+			continue
 		}
+		k := [3]string{av.Account, av.Tag, av.Currency}
+		if i, dup := index[k]; dup {
+			values[i] = *av
+			continue
+		}
+		index[k] = len(values)
+		values = append(values, *av)
 	}
 	return values, nil
 }

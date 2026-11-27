@@ -202,9 +202,12 @@ func (s *Server) previewOrder(ctx context.Context, a previewArgs) (any, error) {
 	}
 	res.Warnings = append(res.Warnings, s.policyWarnings(p)...)
 
-	if p.kind == kindModify {
+	switch {
+	case p.kind == kindModify:
 		res.Warnings = append(res.Warnings, "what-if is not available for modifications")
-	} else {
+	case s.cfg.DisableWhatIf:
+		res.Warnings = append(res.Warnings, "what-if is disabled on this server: no margin or commission estimate")
+	default:
 		wi := entry
 		if st, err := s.b.WhatIfOrder(ctx, p.con, &wi); err != nil {
 			res.Warnings = append(res.Warnings, "what-if failed: "+err.Error())

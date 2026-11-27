@@ -82,6 +82,36 @@ func TestSearchContracts(t *testing.T) {
 	h.fail("search_contracts", map[string]any{"contract": map[string]any{"symbol": "AAPL", "sec_type": "XYZ"}}, `"contract.sec_type" must be one of`)
 	h.fail("search_contracts", map[string]any{"contract": map[string]any{"symbol": "AAPL"}, "bogus": 1}, "unknown field")
 	h.fail("search_contracts", `{"contract": 5}`, "invalid arguments")
+
+	// Futures come from TWS in no particular order (live: ESZ6, ESZ7, ESM7,
+	// ESH8, ...). Results and ambiguity candidates are sorted by expiry, so
+	// a limit keeps the front months; stocks keep TWS's order.
+	h.gw.Handle(9, func(req []string) [][]byte {
+		id := req[2]
+		if req[4] == "AMBIG" {
+			return [][]byte{detailsMsg(id, "AMBIG", "STK", 1002, "ARCA"), detailsMsg(id, "AMBIG", "STK", 1001, "NYSE"), fakegw.Msg(52, 1, id)}
+		}
+		return [][]byte{
+			detailsMsgExpiry(id, "ES", "FUT", 3, "CME", "20271217"),
+			detailsMsgExpiry(id, "ES", "FUT", 1, "CME", "20261218"),
+			detailsMsgExpiry(id, "ES", "FUT", 2, "CME", "20270319"),
+			fakegw.Msg(52, 1, id),
+		}
+	})
+	es := map[string]any{"symbol": "ES", "sec_type": "FUT", "exchange": "CME"}
+	res = h.ok("search_contracts", map[string]any{"contract": es, "limit": 2})
+	if cs := res["contracts"].([]any); len(cs) != 2 || get(t, cs[0], "expiry") != "20261218" || get(t, cs[1], "expiry") != "20270319" {
+		t.Fatalf("futures by expiry = %v", res)
+	}
+	msg := h.fail("get_quote", map[string]any{"contract": es}, "3 contracts match")
+	if a, b := strings.Index(msg, "con_id 1: FUT ES ES 20261218"), strings.Index(msg, "con_id 2: FUT ES ES 20270319"); a < 0 || b < a ||
+		strings.Count(msg, "con_id 1") != 1 {
+		t.Fatalf("candidates must be by expiry, con_id once each: %s", msg)
+	}
+	res = h.ok("search_contracts", map[string]any{"contract": map[string]any{"symbol": "AMBIG"}})
+	if get(t, res, "contracts", 0, "con_id") != 1002.0 {
+		t.Fatalf("stocks keep TWS's order: %v", res)
+	}
 }
 
 func TestContractDefaults(t *testing.T) {
@@ -163,6 +193,16 @@ func TestQuoteView(t *testing.T) {
 	if px, ok := referenceOf(tk); !ok || px != 10 {
 		t.Fatalf("close fallback = %g", px)
 	}
+
+	// Live, before the open: bid/ask absent but bid_size/ask_size 0.
+	tk.BidSize, tk.AskSize, tk.Last, tk.LastSize = 0, 0, 359.46, 48
+	if v := viewQuote(tk); v.BidSize != nil || v.AskSize != nil || v.LastSize == nil || *v.LastSize != 48 {
+		t.Fatalf("sizes need their price: %+v", v)
+	}
+	tk.Bid, tk.BidSize = 359, 0
+	if v := viewQuote(tk); v.BidSize == nil || *v.BidSize != 0 {
+		t.Fatalf("a quoted bid keeps its size, even 0: %+v", v)
+	}
 }
 
 func TestHistoricalBars(t *testing.T) {
@@ -187,6 +227,25 @@ func TestHistoricalBars(t *testing.T) {
 	h.fail("get_historical_bars", map[string]any{"contract": map[string]any{"symbol": "AAPL"}, "duration": "5 days"}, "duration must look like")
 	h.fail("get_historical_bars", map[string]any{"contract": map[string]any{"symbol": "AAPL"}, "bar_size": "7 mins"}, "must be one of")
 	h.fail("get_historical_bars", map[string]any{"contract": map[string]any{"symbol": "NOPE"}}, "contract lookup failed")
+
+	// Daily bars are dates (live they read 2026-11-19T00:00:00Z, intraday
+	// bars carry the exchange offset), and IB's -1 bar count (MIDPOINT, CASH)
+	// is omitted like its -1 volume.
+	h.gw.Handle(20, func(req []string) [][]byte {
+		return [][]byte{fakegw.Msg(17, req[1], "20231018", "20231020", 2,
+			"20231019", 1.05, 1.06, 1.04, 1.055, -1.0, -1.0, -1,
+			"20231020", 1.055, 1.07, 1.05, 1.06, -1.0, -1.0, -1)}
+	})
+	for _, size := range []string{"1 day", "1 week"} {
+		res = h.ok("get_historical_bars", map[string]any{"contract": map[string]any{"symbol": "EURUSD", "sec_type": "CASH"}, "bar_size": size})
+		if b := get(t, res, "bars", 0); get(t, b, "t") != "2023-10-19" || get(t, b, "n") != nil || get(t, b, "v") != nil {
+			t.Fatalf("%s bar = %v", size, b)
+		}
+	}
+	res = h.ok("get_historical_bars", map[string]any{"contract": map[string]any{"symbol": "EURUSD", "sec_type": "CASH"}, "bar_size": "1 hour"})
+	if b := get(t, res, "bars", 0); !strings.HasPrefix(get(t, b, "t").(string), "2023-10-19T00:00:00") {
+		t.Fatalf("intraday bars keep the time: %v", b)
+	}
 
 	h.gw.Handle(20, func(req []string) [][]byte {
 		return [][]byte{fakegw.Msg(4, 2, req[1], 162, "Historical Market Data Service error message:HMDS query returned no data", "")}
@@ -220,6 +279,35 @@ func TestOptionChain(t *testing.T) {
 	if req := h.gw.LastRequest(78); req[3] != "CME" || req[4] != "FUT" {
 		t.Fatalf("future underlying request = %q", req)
 	}
+
+	// Futures options are listed on the future's exchange, not SMART (live:
+	// ES returned 16 chains, all on CME).
+	esChains := func(exch string) func([]string) [][]byte {
+		return func(req []string) [][]byte {
+			id := req[1]
+			return [][]byte{
+				fakegw.Msg(75, id, exch, 495512563, "ES", "50", 1, "20261218", 2, 6000.0, 6100.0),
+				fakegw.Msg(75, id, exch, 495512563, "EW1", "50", 1, "20261204", 1, 6000.0),
+				fakegw.Msg(76, id),
+			}
+		}
+	}
+	es := map[string]any{"symbol": "ES", "sec_type": "FUT", "exchange": "CME"}
+	h.gw.Handle(78, esChains("CME"))
+	res = h.ok("get_option_chain", map[string]any{"underlying": es})
+	if cs := res["chains"].([]any); len(cs) != 2 || get(t, cs[0], "exchange") != "CME" || get(t, cs[1], "trading_class") != "EW1" {
+		t.Fatalf("future default exchange = %v", res)
+	}
+	if msg := h.fail("get_option_chain", map[string]any{"underlying": es, "exchange": "BOX"}, "available: CME"); strings.Contains(msg, "CME, CME") {
+		t.Fatalf("available exchanges must be listed once: %s", msg)
+	}
+	// A default exchange without chains returns every chain; an explicit one
+	// stays an error.
+	h.gw.Handle(78, esChains("XCME"))
+	if res := h.ok("get_option_chain", map[string]any{"underlying": es}); len(res["chains"].([]any)) != 2 {
+		t.Fatalf("fallback to all chains = %v", res)
+	}
+	h.fail("get_option_chain", map[string]any{"underlying": es, "exchange": "cme"}, "no option chain on exchange CME; available: XCME")
 	h.fail("get_option_chain", map[string]any{"underlying": map[string]any{"symbol": "NOPE"}}, "contract lookup failed")
 	h.gw.Handle(78, func(req []string) [][]byte {
 		return [][]byte{fakegw.Msg(4, 2, req[1], 200, "No security definition has been found", "")}
@@ -336,6 +424,67 @@ func TestOrdersAndExecutionsRead(t *testing.T) {
 	all := h.ok("list_orders", map[string]any{"scope": "ALL"})
 	if o := get(t, all, "orders", 0); get(t, o, "status") != "Cancelled" || get(t, o, "remaining") != 0.0 {
 		t.Fatalf("all orders = %v", all)
+	}
+}
+
+// list_orders shows manual TWS orders and other clients' orders, whatever
+// the gateway's read-only setting (live, they only appeared in read-only
+// API mode, through the SyncOrders fallback), and never stale ones.
+func TestListOrdersIncludesOtherClients(t *testing.T) {
+	limits := defaultLimits()
+	limits.MaxOpenOrders = 2
+	h := newHarness(t, harnessOpts{trading: true, limits: limits})
+	msft := fakegw.Contract{ConID: msftConID, Symbol: "MSFT", SecType: "STK", Exchange: "SMART", Currency: "USD"}
+	h.gw.AddOrder(fakegw.Order{Contract: msft, Action: "SELL", Qty: 3, OrderType: "STP", AuxPrice: 380, TIF: "GTC", Account: "DU123456"})
+	other := h.gw.AddOrder(fakegw.Order{ClientID: 3, OrderID: 12, Contract: msft, Action: "BUY", Qty: 1, OrderType: "LMT", LmtPrice: 390, TIF: "DAY", Account: "DU123456"})
+	con := &contract.Contract{ConID: aaplConID, Symbol: "AAPL", SecType: "STK", Exchange: "SMART", Currency: "USD"}
+	mine, err := h.ib.PlaceOrder(con, order.LimitOrder("BUY", 2, 150))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "submitted", func() bool { return mine.Status() == order.StatusSubmitted })
+
+	res := h.ok("list_orders", nil)
+	orders := res["orders"].([]any)
+	if len(orders) != 3 || res["note"] != nil ||
+		get(t, orders[0], "client_id") != 0.0 || get(t, orders[0], "own") != false || get(t, orders[0], "stop_price") != 380.0 ||
+		get(t, orders[1], "client_id") != 3.0 || get(t, orders[1], "order_id") != 12.0 || get(t, orders[1], "own") != false ||
+		get(t, orders[2], "order_id") != float64(mine.Order.OrderID) || get(t, orders[2], "own") != true {
+		t.Fatalf("orders = %v", res)
+	}
+
+	// TWS sends no update when another client's order ends; it just stops
+	// reporting it. The stale copy must not be listed, in either scope.
+	h.gw.SetOrderStatus(other, "Cancelled")
+	for _, scope := range []string{"open", "all"} {
+		res = h.ok("list_orders", map[string]any{"scope": scope})
+		for _, o := range res["orders"].([]any) {
+			if get(t, o, "client_id") == 3.0 {
+				t.Fatalf("%s: stale order of another client listed: %v", scope, res)
+			}
+		}
+		if n := len(res["orders"].([]any)); n != 2 {
+			t.Fatalf("%s: orders = %v", scope, res)
+		}
+	}
+
+	// The risk limits count this client's orders only: the foreign orders the
+	// session now knows of do not use up max_open_orders (2).
+	if _, err := h.ib.PlaceOrder(con, order.LimitOrder("BUY", 3, 150)); err != nil {
+		t.Fatalf("second own order: %v", err)
+	}
+	if _, err := h.ib.PlaceOrder(con, order.LimitOrder("BUY", 4, 150)); err == nil || !strings.Contains(err.Error(), "2 open orders") {
+		t.Fatalf("third own order: %v", err)
+	}
+
+	short := newHarness(t, harnessOpts{config: func(c *Config) { c.RequestTimeout = 100 * time.Millisecond }})
+	short.gw.Handle(16, func([]string) [][]byte { return nil }) // reqAllOpenOrders never ends
+	if note, _ := short.ok("list_orders", nil)["note"].(string); !strings.Contains(note, "only this client's orders") {
+		t.Fatalf("refresh failure note = %q", note)
+	}
+	off := newHarness(t, harnessOpts{offline: true})
+	if note, _ := off.ok("list_orders", nil)["note"].(string); !strings.Contains(note, "not connected") {
+		t.Fatalf("offline note = %q", note)
 	}
 }
 

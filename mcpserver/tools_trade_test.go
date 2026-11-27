@@ -416,6 +416,38 @@ func TestPreviewWithTradingDisabled(t *testing.T) {
 	if pv["preview_id"] != nil || !strings.Contains(pv["next_step"].(string), "informational") || pv["what_if"] == nil {
 		t.Fatalf("preview = %v", pv)
 	}
+	// preview_order is annotated read-only, so clients run it unasked: the
+	// one placeOrder message it sends must be a what-if that leaves no order
+	// at the broker (the fake, like TWS, decodes the whatIf flag).
+	if n := h.gw.Received(3); n != 1 {
+		t.Fatalf("%d placeOrder messages, want the one what-if", n)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if open, err := h.ib.ReqAllOpenOrders(ctx); err != nil || len(open) != 0 {
+		t.Fatalf("broker orders after a read-only preview: %v, %v", open, err)
+	}
+	if st := h.ok("get_status", nil); st["what_if"] != true {
+		t.Fatalf("status = %v", st)
+	}
+}
+
+// With DisableWhatIf a read-only server sends no order message at all.
+func TestPreviewWithWhatIfDisabled(t *testing.T) {
+	h := newHarness(t, harnessOpts{config: func(c *Config) { c.DisableWhatIf = true }})
+	pv := h.ok("preview_order", limitBuy(1, 150))
+	if pv["what_if"] != nil || pv["quote"] == nil || !strings.Contains(strings.Join(toStrings(pv["warnings"]), "\n"), "what-if is disabled") {
+		t.Fatalf("preview = %v", pv)
+	}
+	if n := h.gw.Received(3); n != 0 {
+		t.Fatalf("%d placeOrder messages sent with what-if disabled", n)
+	}
+	if st := h.ok("get_status", nil); st["what_if"] != false {
+		t.Fatalf("status = %v", st)
+	}
+	if ins := h.srv.instructions(); strings.Contains(ins, "what-if calculator") {
+		t.Fatalf("instructions = %q", ins)
+	}
 }
 
 func TestPreviewWarnsOnDelayedDataAndWhatIfFailure(t *testing.T) {

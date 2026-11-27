@@ -59,10 +59,10 @@ server starts even when the gateway is down and keeps reconnecting;
 | `search_contracts` | read | Contract lookup → `con_id`, names, min tick, exchanges, trading hours |
 | `get_quote` | read | One-off snapshot: bid/ask/last/sizes/OHLC/volume, live or delayed |
 | `get_historical_bars` | read | OHLCV bars (duration, bar size, data type, RTH) |
-| `get_option_chain` | read | Expirations and strikes per exchange and trading class |
+| `get_option_chain` | read | Expirations and strikes per exchange and trading class (default exchange SMART, or the future's own exchange for a FUT underlying) |
 | `get_positions` | read | Positions with average cost |
 | `get_account_summary` | read | NetLiquidation, cash, buying power, margin, … |
-| `list_orders` / `get_order` | read | Order status, fills, commissions and event log (incl. rejection reasons) |
+| `list_orders` / `get_order` | read | Open orders of every API client and manual TWS orders (`own` marks this client's), status, fills, commissions and event log (incl. rejection reasons) |
 | `get_executions` | read | Today's fills with commission and realized P&L |
 | `preview_order` | read | Validate an order, quote it, what-if margin/commission; returns a `preview_id` |
 | `place_order` | trade | Send exactly the previewed order (`preview_id`) |
@@ -106,7 +106,10 @@ Each layer works on its own; none relies on the model following its
 instructions.
 
 1. **Read-only by default.** Without `-enable-trading` the trade tools do
-   not exist and `preview_order` never issues a preview id.
+   not exist and `preview_order` never issues a preview id. Its margin and
+   commission estimate is a what-if order, which TWS evaluates but never
+   executes; with `-what-if=false` a read-only server sends no order
+   messages at all.
 2. **Paper accounts only** unless `-allow-live`. Paper account ids start with
    `DU`/`DF`; anything else counts as live. Checked at preview, again at
    placement, and for every cancel (orders of live accounts are skipped and
@@ -118,8 +121,12 @@ instructions.
    `-price-collar-pct 5`, `-duplicate-window 30s`. The `risk` package
    enforces them inside `PlaceOrder` and fails closed (no reference price for
    a market order means it is rejected). A bracket counts all three legs
-   against `-max-open-orders`. `mcpserver.New` and `place_order` verify that
-   the client really consults this risk manager and a journal.
+   against `-max-open-orders`. The open-order and position limits count this
+   API client's orders (`mcpserver.RiskState`): TWS sends no updates for other
+   clients' and manual orders, so the session's copies of those go stale.
+   Positions are the account's, whoever traded them. `mcpserver.New` and
+   `place_order` verify that the client really consults this risk manager
+   and a journal.
 4. **Current reference prices.** `place_order` refreshes the quote when the
    one cached by `preview_order` is older than half of its 60-second
    lifetime, and refuses a limit order when the price collar is on but no
@@ -156,14 +163,16 @@ instructions.
 
 `ib-mcp -h` lists every flag. Connection flags also read `IB_HOST`, `IB_PORT`
 and `IB_CLIENT_ID`. `-market-data-type 3` asks TWS for delayed data where the
-account has no live subscription (quotes report `market_data_type`). Logs go
-to stderr; stdout carries the protocol.
+account has no live subscription (quotes report `market_data_type`).
+`-what-if=false` turns off the what-if estimate in `preview_order`
+(`get_status` reports `what_if`). Logs go to stderr; stdout carries the
+protocol.
 
 Embedding instead of the binary:
 
 ```go
 var srv *mcpserver.Server
-rm := risk.New(limits, ib, risk.WithPriceSource(func(c *contract.Contract) (float64, bool) {
+rm := risk.New(limits, mcpserver.RiskState(ib), risk.WithPriceSource(func(c *contract.Contract) (float64, bool) {
 	return srv.ReferencePrice(c) // quotes the server has seen
 }))
 ib.SetRiskManager(rm)
@@ -199,7 +208,9 @@ implementation (`syncGate`).
   are matched case-insensitively.
 - **Results** are JSON objects, sent as text content and as
   `structuredContent`, with snake_case keys and unset IB values (NaN,
-  `UNSET_DOUBLE`, -1 prices) omitted. Failures are tool errors
+  `UNSET_DOUBLE`, -1 prices, volumes and bar counts, sizes without their
+  price) omitted. Daily and longer bars are dates (`YYYY-MM-DD`); contract
+  matches are sorted by expiry. Failures are tool errors
   (`isError: true`) that the model can read and act on; protocol errors are
   only for malformed requests.
 - **Quotes** use the new `IB.ReqTickerSnapshot`, which waits for

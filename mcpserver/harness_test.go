@@ -85,7 +85,7 @@ func newHarness(t *testing.T, o harnessOpts) *harness {
 		if limits.MaxOrderQuantity == 0 {
 			limits = defaultLimits()
 		}
-		h.rm = risk.New(limits, ib, risk.WithPriceSource(func(c *contract.Contract) (float64, bool) {
+		h.rm = risk.New(limits, RiskState(ib), risk.WithPriceSource(func(c *contract.Contract) (float64, bool) {
 			return h.srv.ReferencePrice(c)
 		}))
 		ib.SetRiskManager(h.rm)
@@ -176,11 +176,15 @@ func scriptGateway(gw *fakegw.Server) {
 }
 
 func detailsMsg(reqID, symbol, secType string, conID int64, primary string) []byte {
+	return detailsMsgExpiry(reqID, symbol, secType, conID, primary, "")
+}
+
+func detailsMsgExpiry(reqID, symbol, secType string, conID int64, primary, expiry string) []byte {
 	exch := "SMART"
 	if secType == "FUT" {
 		exch = "CME"
 	}
-	return fakegw.Msg(10, reqID, symbol, secType, "", 0.0, "", exch, "USD", symbol, "NMS", "NMS", conID, 0.01,
+	return fakegw.Msg(10, reqID, symbol, secType, expiry, 0.0, "", exch, "USD", symbol, "NMS", "NMS", conID, 0.01,
 		"", "ACTIVETIM,LMT,MKT", "SMART,"+primary, 1, 0, symbol+" INC", primary, "", "Technology", "Computers", "Computers",
 		"US/Eastern", "20231019:0930-20231019:1600", "20231019:0930-20231019:1600", "", 0,
 		0, 1, "", "", "26,26", "", "COMMON", 1.0, 1.0, 100)
