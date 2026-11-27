@@ -312,10 +312,23 @@ func (ib *IB) ReqAccountSummary(ctx context.Context, groupName, tags string) ([]
 	}
 	items := resultItems(v)
 	values := make([]account.AccountValue, 0, len(items))
+	// TWS can send the same rows more than once for one request (seen live:
+	// IB Gateway answered a single reqAccountSummary with every row, and
+	// accountSummaryEnd, twice). Keep one row per account, tag and currency,
+	// in order of first appearance, with the latest value.
+	index := make(map[[3]string]int, len(items))
 	for _, item := range items {
-		if av, ok := item.(*account.AccountValue); ok {
-			values = append(values, *av)
+		av, ok := item.(*account.AccountValue)
+		if !ok {
+			continue
 		}
+		k := [3]string{av.Account, av.Tag, av.Currency}
+		if i, dup := index[k]; dup {
+			values[i] = *av
+			continue
+		}
+		index[k] = len(values)
+		values = append(values, *av)
 	}
 	return values, nil
 }
@@ -792,11 +805,7 @@ func (ib *IB) handleOrderStatus(r *protocol.FieldReader) {
 	}
 	ib.state.Mu.RUnlock()
 
-	if trade == nil {
-		return
-	}
-
-	oldStatus, changed := trade.UpdateOrderStatus(order.OrderStatus{
+	update := order.OrderStatus{
 		OrderID:       orderID,
 		Status:        status,
 		Filled:        filled,
@@ -808,7 +817,17 @@ func (ib *IB) handleOrderStatus(r *protocol.FieldReader) {
 		ClientID:      clientID,
 		WhyHeld:       whyHeld,
 		MktCapPrice:   mktCapPrice,
-	}, ib.now())
+	}
+	if trade == nil {
+		// An order OpenOrdersSnapshot reported as detached: update the copy,
+		// without events or journal.
+		if d, _ := ib.openOrdersReq.detachedFor(key, permID); d != nil {
+			d.UpdateOrderStatus(update, ib.now())
+		}
+		return
+	}
+
+	oldStatus, changed := trade.UpdateOrderStatus(update, ib.now())
 	if !changed {
 		return // duplicate status message: no events
 	}
@@ -1134,13 +1153,29 @@ func (ib *IB) handleOpenOrder(r *protocol.FieldReader) {
 	if !exists && o.PermID != 0 {
 		trade, exists = ib.state.PermID2Trade[o.PermID], ib.state.PermID2Trade[o.PermID] != nil
 	}
+	// During OpenOrdersSnapshot an untracked order of another client gets a
+	// detached trade: TWS sends this client no updates for it, so a tracked
+	// copy would go stale (and reach events, journal and risk checks).
+	detached := false
+	if !exists && o.ClientID != ib.ClientID() {
+		if t, on := ib.openOrdersReq.detachedFor(key, o.PermID); on {
+			detached = true
+			if t != nil {
+				trade, exists = t, true
+			}
+		}
+	}
 	if !exists {
 		// New trade from TWS or another client
 		os := &order.OrderStatus{OrderID: o.OrderID, Status: st.Status, PermID: o.PermID, ClientID: o.ClientID}
 		trade = &order.Trade{Contract: c, Order: o, OrderStatus: os}
-		ib.state.Trades[key] = trade
+		if detached {
+			ib.openOrdersReq.addDetached(key, trade)
+		} else {
+			ib.state.Trades[key] = trade
+		}
 	}
-	if o.PermID != 0 {
+	if o.PermID != 0 && !detached {
 		if _, ok := ib.state.PermID2Trade[o.PermID]; !ok {
 			ib.state.PermID2Trade[o.PermID] = trade
 		}
@@ -2335,6 +2370,47 @@ type singleReq struct {
 	// roRejected is set while the in-flight request is one that TWS
 	// rejects (with reqId -1) when the API is in read-only mode.
 	roRejected atomic.Bool
+
+	// detached is non-nil while an OpenOrdersSnapshot is in flight: the
+	// orders of other clients it reported that the client does not track.
+	detachedMu sync.Mutex
+	detached   map[state.OrderKey]*order.Trade
+}
+
+func (sr *singleReq) setDetaching(on bool) {
+	sr.detachedMu.Lock()
+	defer sr.detachedMu.Unlock()
+	if on {
+		sr.detached = map[state.OrderKey]*order.Trade{}
+	} else {
+		sr.detached = nil
+	}
+}
+
+// detachedFor reports whether a snapshot is collecting detached orders, and
+// returns the one already collected for key or permID.
+func (sr *singleReq) detachedFor(key state.OrderKey, permID int64) (t *order.Trade, detaching bool) {
+	sr.detachedMu.Lock()
+	defer sr.detachedMu.Unlock()
+	if sr.detached == nil {
+		return nil, false
+	}
+	if t = sr.detached[key]; t == nil && permID != 0 {
+		for _, d := range sr.detached {
+			if d.PermID() == permID {
+				return d, true
+			}
+		}
+	}
+	return t, true
+}
+
+func (sr *singleReq) addDetached(key state.OrderKey, t *order.Trade) {
+	sr.detachedMu.Lock()
+	defer sr.detachedMu.Unlock()
+	if sr.detached != nil {
+		sr.detached[key] = t
+	}
 }
 
 func newSingleReq() *singleReq {
@@ -2358,27 +2434,70 @@ func (ib *IB) readOnlyRejectedSingles() []int64 {
 	return keys
 }
 
+// lateEndTimeout bounds how long an abandoned id-less request keeps its slot
+// waiting for its end marker.
+var lateEndTimeout = time.Minute
+
 // runSingle runs one serialised request: waits for the slot, registers a
 // synthetic key, sends, and waits for the end message.
 func (ib *IB) runSingle(ctx context.Context, sr *singleReq, roRejected bool, send func() error) (interface{}, error) {
+	return ib.runSingleDetach(ctx, sr, roRejected, false, send)
+}
+
+// runSingleDetach is runSingle; with detach, open orders of other clients
+// that the client does not track stay out of its state (OpenOrdersSnapshot).
+func (ib *IB) runSingleDetach(ctx context.Context, sr *singleReq, roRejected, detach bool, send func() error) (interface{}, error) {
 	select {
 	case sr.sem <- struct{}{}:
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-	defer func() {
+	release := func() {
 		sr.key.Store(0)
 		sr.roRejected.Store(false)
+		sr.setDetaching(false)
 		<-sr.sem
-	}()
+	}
 
 	key := ib.syntheticReqID.Add(-1)
 	ch := ib.state.StartReq(key, nil)
 	sr.roRejected.Store(roRejected)
+	sr.setDetaching(detach)
 	sr.key.Store(key)
 	if err := send(); err != nil {
 		ib.state.CancelReq(key)
+		release()
 		return nil, err
 	}
-	return ib.awaitReq(ctx, key, ch)
+	done := ib.client.Done()
+	select {
+	case result, ok := <-ch:
+		release()
+		if !ok {
+			return nil, ErrRequestCancelled
+		}
+		return result.Value, result.Err
+	case <-done:
+		ib.state.CancelReq(key)
+		release()
+		return nil, ErrDisconnected
+	case <-ctx.Done():
+		// TWS still answers what was sent, and neither its messages nor its
+		// end marker carry a request id. Until the end marker they belong to
+		// this abandoned request, so the slot stays taken: released now, the
+		// next request of this kind would collect them and end early with
+		// the wrong answer.
+		go func() {
+			t := time.NewTimer(lateEndTimeout)
+			defer t.Stop()
+			select {
+			case <-ch:
+			case <-done:
+			case <-t.C:
+			}
+			ib.state.CancelReq(key)
+			release()
+		}()
+		return nil, ctx.Err()
+	}
 }

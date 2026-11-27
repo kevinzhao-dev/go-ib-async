@@ -42,6 +42,7 @@ type config struct {
 	clientID       int
 	marketDataType int
 	requestTimeout time.Duration
+	whatIf         bool
 
 	trading           bool
 	allowLive         bool
@@ -61,6 +62,7 @@ func parseFlags(args []string, getenv func(string) string, stderr io.Writer) (*c
 	fs.IntVar(&c.clientID, "client-id", envInt(getenv, "IB_CLIENT_ID", 17), "API client id; orders placed by the agent belong to it (env IB_CLIENT_ID)")
 	fs.IntVar(&c.marketDataType, "market-data-type", 1, "1 live, 2 frozen, 3 delayed, 4 delayed-frozen (3: delayed data where there is no live subscription)")
 	fs.DurationVar(&c.requestTimeout, "request-timeout", 30*time.Second, "timeout of each tool call")
+	fs.BoolVar(&c.whatIf, "what-if", true, "let preview_order send what-if orders for margin and commission estimates (TWS evaluates them, nothing executes); -what-if=false sends no order messages without -enable-trading")
 
 	fs.BoolVar(&c.trading, "enable-trading", false, "register the order tools (place_order, cancel_order, cancel_all_orders, halt_trading)")
 	fs.BoolVar(&c.allowLive, "allow-live", false, "allow orders for live (non-paper) accounts")
@@ -167,6 +169,7 @@ func run(ctx context.Context, cfg *config, in io.Reader, out io.Writer) error {
 		Version:        version,
 		RequestTimeout: cfg.requestTimeout,
 		MarketDataType: cfg.marketDataType,
+		DisableWhatIf:  !cfg.whatIf,
 	}
 	var srv *mcpserver.Server
 	if cfg.trading {

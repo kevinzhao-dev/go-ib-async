@@ -24,8 +24,11 @@ func TestParseFlagsDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.host != "127.0.0.1" || c.port != 4002 || c.clientID != 17 || c.trading || c.marketDataType != 1 {
+	if c.host != "127.0.0.1" || c.port != 4002 || c.clientID != 17 || c.trading || c.marketDataType != 1 || !c.whatIf {
 		t.Fatalf("defaults = %+v", c)
+	}
+	if c, err := parseFlags([]string{"-what-if=false"}, noEnv, io.Discard); err != nil || c.whatIf {
+		t.Fatalf("-what-if=false: %+v, %v", c, err)
 	}
 	env := map[string]string{"IB_HOST": "gw", "IB_PORT": "7497", "IB_CLIENT_ID": "3"}
 	c, _ = parseFlags(nil, func(k string) string { return env[k] }, io.Discard)

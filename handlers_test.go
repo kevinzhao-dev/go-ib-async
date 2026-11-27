@@ -289,6 +289,35 @@ func TestReqAccountSummaryCancelsSubscription(t *testing.T) {
 	}
 }
 
+// TWS has been seen answering one request with every row twice; the
+// duplicates must not reach the caller (an agent summing values would
+// double them).
+func TestReqAccountSummaryDropsDuplicateRows(t *testing.T) {
+	srv := startFake(t)
+	srv.Handle(62, func(req []string) [][]byte {
+		id := req[2]
+		return [][]byte{
+			fakegw.Msg(63, 1, id, "DU1", "NetLiquidation", "100", "USD"),
+			fakegw.Msg(63, 1, id, "DU1", "Cushion", "0.5", ""),
+			fakegw.Msg(63, 1, id, "DU1", "NetLiquidation", "101", "USD"),
+			fakegw.Msg(63, 1, id, "DU1", "Cushion", "0.5", ""),
+			fakegw.Msg(63, 1, id, "DU1", "NetLiquidation", "7", "EUR"), // other currency: kept
+			fakegw.Msg(63, 1, id, "DU2", "NetLiquidation", "5", "USD"), // other account: kept
+			fakegw.Msg(64, 1, id),
+			fakegw.Msg(64, 1, id),
+		}
+	})
+	ib := connectFake(t, srv)
+	vals, err := ib.ReqAccountSummary(ctx5s(t), "All", "NetLiquidation,Cushion")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vals) != 4 || vals[0].Tag != "NetLiquidation" || vals[0].Value != "101" || vals[1].Tag != "Cushion" ||
+		vals[2].Currency != "EUR" || vals[3].Account != "DU2" {
+		t.Fatalf("values = %+v", vals)
+	}
+}
+
 func TestReqSecDefOptParams(t *testing.T) {
 	srv := startFake(t)
 	srv.Handle(78, func(req []string) [][]byte {

@@ -48,6 +48,9 @@ type Broker interface {
 	ReqPositions(ctx context.Context) ([]account.Position, error)
 	ReqAccountSummary(ctx context.Context, groupName, tags string) ([]account.AccountValue, error)
 	ReqExecutions(ctx context.Context, filter order.ExecutionFilter) ([]order.Fill, error)
+	// OpenOrdersSnapshot returns every client's open orders without making
+	// the client track other clients' orders (see ibgo.IB.OpenOrdersSnapshot).
+	OpenOrdersSnapshot(ctx context.Context) ([]*order.Trade, error)
 	Trades() []*order.Trade
 	OpenTrades() []*order.Trade
 	TradeFills(t *order.Trade) []order.Fill
@@ -78,6 +81,11 @@ type Config struct {
 	// MarketDataType is reported by get_status (1 live, 3 delayed, ...);
 	// the caller is responsible for requesting it (default 1).
 	MarketDataType int
+	// DisableWhatIf stops preview_order from asking TWS for the margin and
+	// commission impact. That request is a placeOrder message with whatIf
+	// set, which TWS evaluates but never executes; with DisableWhatIf a
+	// read-only server sends no order messages at all.
+	DisableWhatIf bool
 
 	Trading TradingConfig
 }
@@ -340,7 +348,7 @@ func (s *Server) registerTools() {
 		"One-off market data snapshot (bid, ask, last, sizes, open/high/low/close, volume) for one contract. market_data_type tells whether the data is live or delayed. Takes up to ~11s when some fields are unavailable.",
 		readOnly, s.getQuote)
 	addTool(s, "get_historical_bars", "Get historical bars",
-		"Historical OHLCV bars for one contract. duration is '<n> <S|D|W|M|Y>' (e.g. '5 D', '1 Y'); IB limits how many bars one request may return for small bar sizes.",
+		"Historical OHLCV bars for one contract. duration is '<n> <S|D|W|M|Y>' (e.g. '5 D', '1 Y'); IB limits how many bars one request may return for small bar sizes. Each bar's t: for intraday bars its start time (RFC 3339); for daily and longer bars the date IB labels it with (YYYY-MM-DD), the session's trade date, so a futures session that opens the evening before carries the day it closes.",
 		readOnly, s.getHistoricalBars)
 	addTool(s, "get_option_chain", "Get option chain",
 		"Option expirations and strikes for an underlying, per exchange and trading class. Use the result to build option contracts (sec_type OPT, expiry, strike, right).",
@@ -352,16 +360,16 @@ func (s *Server) registerTools() {
 		"Account values such as NetLiquidation, TotalCashValue, BuyingPower, AvailableFunds, margin requirements.",
 		readOnly, s.getAccountSummary)
 	addTool(s, "list_orders", "List orders",
-		"Orders known to this session: open orders (default) or all, including filled and cancelled ones. own=true marks orders of this API client, which are the only ones the trading tools can modify or cancel.",
+		"Open orders of every API client and manual TWS orders (other clients' orders are asked from TWS on each call), or with scope=all also the filled and cancelled orders this session has seen. own=true marks orders of this API client, which are the only ones the trading tools can modify or cancel.",
 		readOnly, s.listOrders)
 	addTool(s, "get_order", "Get order",
-		"Full state of one order: status, fills with commissions, and its event log (including rejection reasons).",
+		"Full state of one order: status, fills with commissions, and its event log (including rejection reasons). Orders of other clients are checked with TWS; stale=true means the status is the last one seen and may be out of date (note says why).",
 		readOnly, s.getOrder)
 	addTool(s, "get_executions", "Get executions",
 		"Today's executions (fills) with commission and realized P&L, optionally filtered.",
 		readOnly, s.getExecutions)
 	addTool(s, "preview_order", "Preview order",
-		"Validate an order without sending it: resolves the contract, checks it against the server policy, quotes the market, and asks IB for the margin and commission impact (what-if). Supports new orders, brackets (take_profit_price + stop_loss_price on a LMT entry) and modifications of an open order (modify_order_id). When trading is enabled it returns a single-use preview_id that place_order needs. Show the preview to the user and get explicit confirmation before placing.",
+		"Validate an order without sending it: resolves the contract, checks it against the server policy, quotes the market, and asks IB for the margin and commission impact with a what-if order, which IB evaluates but never executes (get_status shows whether what-if is enabled). Supports new orders, brackets (take_profit_price + stop_loss_price on a LMT entry) and modifications of an open order (modify_order_id). When trading is enabled it returns a single-use preview_id that place_order needs. Show the preview to the user and get explicit confirmation before placing.",
 		toolAnnotations{ReadOnlyHint: true, OpenWorldHint: true}, s.previewOrder)
 
 	if !s.cfg.Trading.Enabled {
@@ -387,7 +395,11 @@ func (s *Server) instructions() string {
 	b.WriteString("Start with get_status. Identify instruments with search_contracts and refer to them by con_id afterwards. ")
 	b.WriteString("Market data, account data and order state are read-only and safe to call. ")
 	if !s.cfg.Trading.Enabled {
-		b.WriteString("Trading is disabled on this server: preview_order works as a what-if calculator but nothing can be placed.")
+		if s.cfg.DisableWhatIf {
+			b.WriteString("Trading is disabled on this server: preview_order validates and quotes orders but nothing can be placed.")
+		} else {
+			b.WriteString("Trading is disabled on this server: preview_order works as a what-if calculator but nothing can be placed.")
+		}
 		return b.String()
 	}
 	b.WriteString("Trading rules: (1) every order is first sent to preview_order; (2) show the full preview (contract, side, quantity, price, estimated notional, margin impact, warnings) to the user; ")

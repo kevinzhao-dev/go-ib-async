@@ -229,6 +229,51 @@ func (s *Server) Order(clientID, orderID int64) (Order, bool) {
 	return Order{}, false
 }
 
+// AddOrder adds a working order placed elsewhere: by another API client, or
+// manually in TWS (ClientID and OrderID 0). Like TWS, the fake reports it
+// only to reqAllOpenOrders (and to reqOpenOrders of its own client) and
+// sends no events for it. It returns the order's perm id.
+func (s *Server) AddOrder(o Order) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nextPerm++
+	o.PermID = s.nextPerm
+	o.Transmit = true
+	if o.Status == "" {
+		o.Status = "Submitted"
+	}
+	s.orders[o.PermID] = &o
+	return o.PermID
+}
+
+// SetOrderStatus changes the status of an order added with AddOrder, without
+// telling the client (it is another client's order).
+func (s *Server) SetOrderStatus(permID int64, status string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if o := s.orders[permID]; o != nil {
+		o.Status = status
+	}
+}
+
+// NotifyOrder sends the openOrder and orderStatus of an order unprompted, as
+// TWS does for every client's orders when the connection is the Master API
+// client.
+func (s *Server) NotifyOrder(permID int64) {
+	s.mu.Lock()
+	o := s.orders[permID]
+	var msgs [][]byte
+	if o != nil {
+		cp := *o
+		msgs = [][]byte{encodeOpenOrder(&cp, false, nil), encodeOrderStatus(&cp)}
+	}
+	s.mu.Unlock()
+	s.sendAll(msgs)
+}
+
+// Send sends raw messages (built with Msg) to the connected client.
+func (s *Server) Send(msgs ...[]byte) { s.sendAll(msgs) }
+
 // SetPosition seeds a position.
 func (s *Server) SetPosition(c Contract, qty, avgCost float64) {
 	s.mu.Lock()

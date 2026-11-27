@@ -11,6 +11,7 @@ import (
 
 	"github.com/kevinzhao-dev/go-ib-async/account"
 	"github.com/kevinzhao-dev/go-ib-async/contract"
+	"github.com/kevinzhao-dev/go-ib-async/market"
 	"github.com/kevinzhao-dev/go-ib-async/order"
 	"github.com/kevinzhao-dev/go-ib-async/risk"
 )
@@ -114,6 +115,7 @@ func (s *Server) resolve(ctx context.Context, spec contractSpec) (contract.Contr
 		s.cacheDetails(d)
 		return d, nil
 	}
+	sortByExpiry(matches)
 	var b strings.Builder
 	fmt.Fprintf(&b, "%d contracts match %s; narrow it down (e.g. with con_id, primary_exchange, expiry, strike or right). Candidates:", len(matches), describeSpec(con))
 	for i, m := range matches {
@@ -122,10 +124,36 @@ func (s *Server) resolve(ctx context.Context, spec contractSpec) (contract.Contr
 			break
 		}
 		if c := m.Contract; c != nil {
-			fmt.Fprintf(&b, "\n- con_id %d: %s", c.ConID, describeSpec(c))
+			cp := *c
+			cp.ConID = 0 // already in front
+			fmt.Fprintf(&b, "\n- con_id %d: %s", c.ConID, describeSpec(&cp))
 		}
 	}
 	return contract.ContractDetails{}, errors.New(b.String())
+}
+
+// sortByExpiry orders contract matches by expiry, strike and right, so that
+// the front month comes first and a limit keeps the nearest expirations
+// (TWS returns futures in no particular order). Contracts without an expiry,
+// such as stocks, keep TWS's order.
+func sortByExpiry(matches []contract.ContractDetails) {
+	key := func(d contract.ContractDetails) (string, float64, string) {
+		if d.Contract == nil {
+			return "\xff", 0, ""
+		}
+		return d.Contract.LastTradeDateOrContractMonth, d.Contract.Strike, d.Contract.Right
+	}
+	sort.SliceStable(matches, func(i, j int) bool {
+		ei, si, ri := key(matches[i])
+		ej, sj, rj := key(matches[j])
+		if ei != ej {
+			return ei < ej
+		}
+		if si != sj {
+			return si < sj
+		}
+		return ri < rj
+	})
 }
 
 func (s *Server) cacheDetails(d contract.ContractDetails) {
@@ -220,13 +248,16 @@ type statusResult struct {
 	ClientID       int64           `json:"client_id,omitempty"`
 	Accounts       []accountStatus `json:"accounts"`
 	MarketDataType string          `json:"market_data_type"`
-	Trading        tradingStatus   `json:"trading"`
+	// WhatIf tells whether preview_order asks TWS for margin and commission.
+	WhatIf  bool          `json:"what_if"`
+	Trading tradingStatus `json:"trading"`
 }
 
 func (s *Server) getStatus(_ context.Context, _ noArgs) (any, error) {
 	res := statusResult{
 		Connected:      s.b.IsConnected(),
 		MarketDataType: marketDataTypes[s.cfg.MarketDataType],
+		WhatIf:         !s.cfg.DisableWhatIf,
 		Accounts:       []accountStatus{},
 	}
 	if res.Connected {
@@ -289,6 +320,7 @@ func (s *Server) searchContracts(ctx context.Context, a searchArgs) (any, error)
 	if err != nil {
 		return nil, fmt.Errorf("contract lookup failed: %w", err)
 	}
+	sortByExpiry(matches)
 	res := searchResult{Count: len(matches), Contracts: []contractDetailsView{}}
 	for i, m := range matches {
 		if i == limit {
@@ -380,8 +412,9 @@ func (s *Server) getHistoricalBars(ctx context.Context, a barsArgs) (any, error)
 		bars = bars[len(bars)-s.cfg.MaxBars:] // keep the most recent
 		res.Truncated = true
 	}
+	daily := a.BarSize == "1 day" || a.BarSize == "1 week" || a.BarSize == "1 month"
 	for _, b := range bars {
-		res.Bars = append(res.Bars, viewBar(b))
+		res.Bars = append(res.Bars, viewBar(b, daily))
 	}
 	return res, nil
 }
@@ -390,7 +423,7 @@ func (s *Server) getHistoricalBars(ctx context.Context, a barsArgs) (any, error)
 
 type chainArgs struct {
 	Underlying     contractSpec `json:"underlying" required:"true" desc:"The underlying (e.g. a STK, IND or FUT contract)."`
-	Exchange       string       `json:"exchange,omitempty" desc:"Only chains on this exchange (default SMART; use '*' for all)."`
+	Exchange       string       `json:"exchange,omitempty" desc:"Only chains on this exchange (default SMART, or the future's exchange for a FUT underlying; '*' for all)."`
 	MaxExpirations int          `json:"max_expirations,omitempty" desc:"Earliest expirations to return per chain (default 12, max 100)."`
 	StrikeMin      float64      `json:"strike_min,omitempty"`
 	StrikeMax      float64      `json:"strike_max,omitempty"`
@@ -424,14 +457,23 @@ func (s *Server) getOptionChain(ctx context.Context, a chainArgs) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("option chain request failed: %w", err)
 	}
-	exch := strings.ToUpper(a.Exchange)
-	if exch == "" {
+	// Stock and index options are listed on SMART, futures options only on
+	// the future's exchange (ES options: CME), so a FUT defaults to that.
+	exch := strings.ToUpper(strings.TrimSpace(a.Exchange))
+	defaulted := exch == ""
+	if defaulted {
 		exch = "SMART"
+		if und.SecType == "FUT" && und.Exchange != "" {
+			exch = und.Exchange
+		}
 	}
 	maxExp := clamp(a.MaxExpirations, 12, 100)
 	res := chainResult{Underlying: viewContract(und), Chains: []chainView{}}
+	// When the default exchange lists none of the chains, return them all
+	// rather than make the agent guess the exchange.
+	all := exch == "*" || (defaulted && !anyChainOn(chains, exch))
 	for _, c := range chains {
-		if exch != "*" && c.Exchange != exch {
+		if !all && c.Exchange != exch {
 			continue
 		}
 		exps := append([]string(nil), c.Expirations...)
@@ -454,11 +496,22 @@ func (s *Server) getOptionChain(ctx context.Context, a chainArgs) (any, error) {
 	if len(res.Chains) == 0 && len(chains) > 0 {
 		var exchanges []string
 		for _, c := range chains {
-			exchanges = append(exchanges, c.Exchange)
+			if !contains(exchanges, c.Exchange) {
+				exchanges = append(exchanges, c.Exchange)
+			}
 		}
 		return nil, fmt.Errorf("no option chain on exchange %s; available: %s", exch, strings.Join(exchanges, ", "))
 	}
 	return res, nil
+}
+
+func anyChainOn(chains []market.OptionChain, exch string) bool {
+	for _, c := range chains {
+		if c.Exchange == exch {
+			return true
+		}
+	}
+	return false
 }
 
 // --- get_positions ---
@@ -554,23 +607,42 @@ func (s *Server) getAccountSummary(ctx context.Context, a accountSummaryArgs) (a
 // --- list_orders / get_order ---
 
 type listOrdersArgs struct {
-	Scope string `json:"scope,omitempty" enum:"open,all" desc:"open (default): working orders only; all: every order known to this session."`
+	Scope string `json:"scope,omitempty" enum:"open,all" desc:"open (default): working orders of every API client and TWS; all: also the filled and cancelled orders this session has seen."`
 }
 
 type ordersResult struct {
 	Orders []orderView `json:"orders"`
+	Note   string      `json:"note,omitempty"`
 }
 
-func (s *Server) listOrders(_ context.Context, a listOrdersArgs) (any, error) {
+func (s *Server) listOrders(ctx context.Context, a listOrdersArgs) (any, error) {
+	me := s.b.ClientID()
+	res := ordersResult{Orders: []orderView{}}
+	seen := map[orderKey]bool{}
+	add := func(t *order.Trade) {
+		if k := keyOf(t); !seen[k] {
+			seen[k] = true
+			res.Orders = append(res.Orders, viewTrade(t, me))
+		}
+	}
+
 	trades := s.b.OpenTrades()
 	if a.Scope == "all" {
 		trades = s.b.Trades()
 	}
-	me := s.b.ClientID()
-	res := ordersResult{Orders: []orderView{}}
 	for _, t := range trades {
-		res.Orders = append(res.Orders, viewTrade(t, me))
+		// This client's orders are tracked live, and a final status does
+		// not change; other working orders come from the snapshot below.
+		if isOwn(t, me) || (a.Scope == "all" && t.IsDone()) {
+			add(t)
+		}
 	}
+	foreign, note := s.foreignOpenOrders(ctx, me)
+	for _, t := range foreign {
+		add(t)
+	}
+	res.Note = note
+
 	sort.Slice(res.Orders, func(i, j int) bool {
 		if res.Orders[i].ClientID != res.Orders[j].ClientID {
 			return res.Orders[i].ClientID < res.Orders[j].ClientID
@@ -583,20 +655,118 @@ func (s *Server) listOrders(_ context.Context, a listOrdersArgs) (any, error) {
 	return res, nil
 }
 
+// foreignOpenOrders returns the working orders of other API clients and of
+// TWS as TWS reports them now, or a note why they could not be fetched. TWS
+// reports them only when asked and sends no updates for them, so they are
+// read as a detached snapshot (Broker.OpenOrdersSnapshot): they never enter
+// the client's tracked orders, journal or risk checks.
+func (s *Server) foreignOpenOrders(ctx context.Context, me int64) ([]*order.Trade, string) {
+	if err := s.requireConnected(); err != nil {
+		return nil, "not connected: other API clients' and TWS orders are not listed"
+	}
+	snap, err := s.b.OpenOrdersSnapshot(ctx)
+	if err != nil {
+		return nil, fmt.Sprintf("could not fetch the open orders of other API clients and TWS (%v); only this client's orders are listed", err)
+	}
+	var out []*order.Trade
+	for _, t := range snap {
+		if !isOwn(t, me) && !t.IsDone() {
+			out = append(out, t)
+		}
+	}
+	return out, ""
+}
+
+// isOwn reports whether t is an order of API client me, which TWS keeps the
+// client updated about. Client id 0 owns nothing (manual TWS orders).
+func isOwn(t *order.Trade, me int64) bool {
+	o := t.OrderSnapshot()
+	return me != 0 && o.ClientID == me && o.OrderID > 0
+}
+
+// orderKey identifies an order as TWS does: client and order id for API
+// orders, perm id for manual TWS orders.
+type orderKey struct{ clientID, orderID, permID int64 }
+
+func keyOf(t *order.Trade) orderKey {
+	o := t.OrderSnapshot()
+	if o.OrderID > 0 {
+		return orderKey{clientID: o.ClientID, orderID: o.OrderID}
+	}
+	perm := o.PermID
+	if perm == 0 {
+		perm = t.PermID()
+	}
+	return orderKey{permID: perm}
+}
+
 type getOrderArgs struct {
 	OrderID  int64 `json:"order_id,omitempty" desc:"Order id (of this API client unless client_id is given)."`
 	ClientID int64 `json:"client_id,omitempty" desc:"API client id that placed the order (default: this client)."`
 	PermID   int64 `json:"perm_id,omitempty" desc:"Permanent order id; identifies orders of any client."`
 }
 
-func (s *Server) getOrder(_ context.Context, a getOrderArgs) (any, error) {
-	t, err := s.findTrade(a.OrderID, a.ClientID, a.PermID)
-	if err != nil {
-		return nil, err
+func (s *Server) getOrder(ctx context.Context, a getOrderArgs) (any, error) {
+	if a.OrderID <= 0 && a.PermID <= 0 {
+		return nil, errors.New("give order_id or perm_id")
 	}
-	return withDetail(viewTrade(t, s.b.ClientID()), t, s.b.TradeFills(t)), nil
+	me := s.b.ClientID()
+	clientID := a.ClientID
+	if clientID == 0 {
+		clientID = me
+	}
+	match := func(t *order.Trade) bool {
+		o := t.OrderSnapshot()
+		if a.PermID > 0 {
+			return o.PermID == a.PermID || t.PermID() == a.PermID
+		}
+		return o.OrderID == a.OrderID && o.ClientID == clientID
+	}
+	detail := func(t *order.Trade) orderView {
+		return withDetail(viewTrade(t, me), t, s.b.TradeFills(t))
+	}
+
+	var local *order.Trade
+	for _, t := range s.b.Trades() {
+		if match(t) {
+			local = t
+			break
+		}
+	}
+	if local != nil && (isOwn(local, me) || local.IsDone()) {
+		return detail(local), nil
+	}
+	// Another client's working order, or one this session has not seen:
+	// what the session knows of those can be stale, so ask TWS.
+	foreign, note := s.foreignOpenOrders(ctx, me)
+	for _, t := range foreign {
+		if match(t) {
+			return detail(t), nil
+		}
+	}
+	if local == nil {
+		what := fmt.Sprintf("no order %d of client %d", a.OrderID, clientID)
+		if a.PermID > 0 {
+			what = fmt.Sprintf("no order with perm_id %d", a.PermID)
+		}
+		if note != "" {
+			return nil, fmt.Errorf("%s in this session, and %s", what, note)
+		}
+		return nil, fmt.Errorf("%s in this session or open at TWS (see list_orders; fills are in get_executions)", what)
+	}
+	v := detail(local)
+	v.Stale = true
+	if note != "" {
+		v.Note = "this is the last status the session saw; the current one could not be checked: " + note
+	} else {
+		v.Note = "TWS no longer reports this order as open, so it was filled or cancelled after the session last saw it (TWS sends no updates for other clients' orders); the status is the last one seen, fills are in get_executions"
+	}
+	return v, nil
 }
 
+// findTrade finds an order of this session by order id (of clientID,
+// default this client) or perm id. The trading tools use it for this
+// client's orders, which the session tracks live.
 func (s *Server) findTrade(orderID, clientID, permID int64) (*order.Trade, error) {
 	if orderID <= 0 && permID <= 0 {
 		return nil, errors.New("give order_id or perm_id")
