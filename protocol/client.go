@@ -576,7 +576,8 @@ func (c *Client) ReqHistoricalNews(reqID int64, conID int64, providerCodes, star
 }
 
 func (c *Client) ReqHeadTimestamp(reqID int64, con *contract.Contract, whatToShow string, useRTH bool, formatDate int) error {
-	return c.Send(MsgReqHeadTimestamp, reqID, con, con.IncludeExpired, whatToShow, useRTH, formatDate)
+	// Field order per EClient/ib_async: useRTH comes before whatToShow.
+	return c.Send(MsgReqHeadTimestamp, reqID, con, con.IncludeExpired, useRTH, whatToShow, formatDate)
 }
 
 func (c *Client) CancelHeadTimestamp(reqID int64) error {
@@ -603,7 +604,8 @@ func (c *Client) ReqScannerSubscription(reqID int64, sub ScannerSubscription, sc
 		sub.CouponRateAbove, sub.CouponRateBelow,
 		sub.ExcludeConvertible, sub.AverageOptionVolumeAbove,
 		sub.ScannerSettingPairs, sub.StockTypeFilter,
-		scannerSubOptions, scannerSubFilterOptions,
+		// Filter options are sent before subscription options (EClient order).
+		scannerSubFilterOptions, scannerSubOptions,
 	)
 }
 

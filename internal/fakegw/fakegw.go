@@ -112,6 +112,9 @@ type Server struct {
 	execs     []*execution
 	positions map[string]*position // account|conId
 	received  map[int]int
+	lastReq   map[int][]string
+	handlers  map[int]func(req []string) [][]byte
+	version   int
 	reject    func(o *Order) string
 	connCh    chan struct{}
 	closed    bool
@@ -120,6 +123,13 @@ type Server struct {
 
 // Start launches the fake on 127.0.0.1 with a random port.
 func Start() (*Server, error) {
+	return StartVersion(ServerVersion)
+}
+
+// StartVersion is like Start but negotiates the given server version. The
+// built-in order simulation assumes 178; other versions are meant for tests
+// that only capture requests (LastRequest) or script responses (Handle).
+func StartVersion(version int) (*Server, error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, err
@@ -133,6 +143,9 @@ func Start() (*Server, error) {
 		orders:     map[int64]*Order{},
 		positions:  map[string]*position{},
 		received:   map[int]int{},
+		lastReq:    map[int][]string{},
+		handlers:   map[int]func([]string) [][]byte{},
+		version:    version,
 		connCh:     make(chan struct{}, 16),
 	}
 	s.wg.Add(1)
@@ -178,6 +191,26 @@ func (s *Server) SetReject(f func(o *Order) string) {
 	s.reject = f
 	s.mu.Unlock()
 }
+
+// Handle installs a scripted responder for request message msgID, replacing
+// the built-in behaviour. respond gets the request fields (msgId first) and
+// returns the messages to send back, built with Msg.
+func (s *Server) Handle(msgID int, respond func(req []string) [][]byte) {
+	s.mu.Lock()
+	s.handlers[msgID] = respond
+	s.mu.Unlock()
+}
+
+// LastRequest returns the fields of the last received message with msgID.
+func (s *Server) LastRequest(msgID int) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.lastReq[msgID]...)
+}
+
+// Msg encodes values as one TWS message (ints, strings, floats, bools;
+// math.MaxFloat64 is sent as TWS's UNSET_DOUBLE).
+func Msg(vals ...interface{}) []byte { return msg(vals...) }
 
 // Received returns how many messages with msgID the fake has received.
 func (s *Server) Received(msgID int) int {
@@ -261,7 +294,10 @@ func (s *Server) handleConn(c net.Conn) {
 	if _, err := readFrame(br); err != nil {
 		return
 	}
-	if err := writeFrame(c, &s.writeMu, fields(strconv.Itoa(ServerVersion), time.Now().Format("20060102 15:04:05 MST"))); err != nil {
+	s.mu.Lock()
+	version := s.version
+	s.mu.Unlock()
+	if err := writeFrame(c, &s.writeMu, fields(strconv.Itoa(version), time.Now().Format("20060102 15:04:05 MST"))); err != nil {
 		return
 	}
 	// startApi: 71, version, clientId, optCapab
@@ -316,7 +352,15 @@ func (s *Server) dispatch(c net.Conn, f []string) {
 	id, _ := strconv.Atoi(f[0])
 	s.mu.Lock()
 	s.received[id]++
+	s.lastReq[id] = append([]string(nil), f...)
+	custom := s.handlers[id]
 	s.mu.Unlock()
+	if custom != nil {
+		for _, m := range custom(f) {
+			s.send(c, m)
+		}
+		return
+	}
 
 	switch id {
 	case 3: // placeOrder

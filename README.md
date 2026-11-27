@@ -176,17 +176,38 @@ raced.
 
 ```bash
 make                  # build + vet + test (no Gateway needed)
+make ci               # everything CI runs: build, lint, shuffled race tests, coverage gate
+make lint             # go vet (incl. integration tag), gofmt, go mod tidy -diff
 make test-race        # tests with race detector
+make test-shuffle     # race detector + random test order
+make cover-check      # coverage.out/.txt/.html, fails below COVERAGE_MIN (default 90%)
+make fuzz-all         # every fuzz target, FUZZTIME each (default 10s)
 make test-live        # integration tests (needs Gateway running)
 make smoke            # live smoke test (needs Gateway)
 make bench            # benchmarks
-make fuzz             # fuzz decoder for 10 seconds
-make test-cover       # coverage report
 ```
 
-Tests are split by build tag:
-- **Unit + E2E tests** (`make test`): mock servers and the fake gateway, run in CI, no Gateway needed
-- **Integration tests** (`make test-live`): require a live IB Gateway, tagged `//go:build integration`, skipped in CI
+### Tests
+
+| Kind | Where | What it checks |
+|------|-------|----------------|
+| Wire format (outbound) | `protocol/requests_test.go`, `order_wire_test.go` | Every request and `placeOrder` field-by-field against ib_async's `client.py` layout, incl. server-version branches |
+| Wire format (inbound) | `handlers_test.go`, `order_wire_test.go` | Every handled message decoded from the ib_async `decoder.py` layout (ticks, contract details, bars, account, portfolio, openOrder with all optional blocks, conditions) |
+| Client / connection | `protocol/client_test.go`, `review_fixes_test.go` | Handshake, version checks, disconnect/reconnect, framing limits, panic recovery |
+| Order lifecycle | `order/`, `internal/state/`, `review_fixes_test.go` | Trade status semantics, duplicates, rejects, warnings, concurrency (`-race`) |
+| Risk / journal | `risk/`, `journal/` | Every limit, kill switch, daily loss; write-ahead, crash recovery, replay, reconcile |
+| End to end | `e2e_test.go`, `api_misc_test.go` | Real client against `internal/fakegw` (fake TWS): fills, modify/cancel, brackets, whatIf, reconnect sync, restart recovery |
+| Fuzz | `protocol/fuzz_test.go` | Decoder/encoder robustness |
+| Live (opt-in) | `integration*_test.go` (`//go:build integration`) | Real Gateway; `IB_E2E_TRADING=1` places paper orders |
+
+### CI
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on pushes and PRs to `main`:
+
+- **test (1.24 / 1.25)**: build, `go vet` (also with `-tags=integration`), `go test -race -shuffle=on ./...`. Required for merging into `main`.
+- **lint**: gofmt and `go mod tidy -diff`.
+- **coverage**: `scripts/coverage.sh` with a 90% minimum; uploads `coverage.html` as an artifact and posts a per-package table to the job summary.
+- **fuzz**: every fuzz target for 10s.
 
 ## Known Limitations
 
