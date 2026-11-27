@@ -294,7 +294,7 @@ func viewTrade(t *order.Trade, myClientID int64) orderView {
 }
 
 // withDetail adds the fills and the event log of t to v. fills must be
-// copies taken under the client's lock (Broker.TradeFills): the reader sets
+// copies (Broker.TradeFills), taken under the trade's lock: the reader sets
 // a fill's commission report while it runs.
 func withDetail(v orderView, t *order.Trade, fills []order.Fill) orderView {
 	for _, f := range fills {

@@ -1176,6 +1176,10 @@ func (ib *IB) handleOpenOrder(r *protocol.FieldReader) {
 			ib.state.PermID2Trade[o.PermID] = trade
 		}
 	}
+	if exists && o.OrderID < 0 {
+		// Under both locks: tradeForWrite reads the ID under state.Mu.
+		trade.BindOrderID(o.OrderID)
+	}
 	ib.state.Mu.Unlock()
 	if exists {
 		trade.UpdateFromOpenOrder(o)
@@ -1481,7 +1485,7 @@ func (ib *IB) PlaceOrder(con *contract.Contract, ord *order.Order) (*order.Trade
 	}
 	ib.placeMu.Lock()
 	defer ib.placeMu.Unlock()
-	return ib.placeOrderLocked(con, ord, true)
+	return ib.placeOrderLocked(con, ord, false)
 }
 
 // tradeForWrite checks the identity before sending a message that addresses
@@ -1539,8 +1543,11 @@ func (ib *IB) assignOrderID(ord *order.Order) {
 	}
 }
 
-// placeOrderLocked implements PlaceOrder; placeMu must be held.
-func (ib *IB) placeOrderLocked(con *contract.Contract, ord *order.Order, runRisk bool) (*order.Trade, error) {
+// placeOrderLocked implements PlaceOrder; placeMu must be held. A bracket
+// leg skips the risk check (PlaceBracketOrder checked the whole bracket) and
+// must still be a new order: an openOrder for its ID that arrived after that
+// check would otherwise make the leg an unchecked modification.
+func (ib *IB) placeOrderLocked(con *contract.Contract, ord *order.Order, bracketLeg bool) (*order.Trade, error) {
 	if !ib.client.IsConnected() {
 		return nil, ErrNotConnected
 	}
@@ -1550,6 +1557,9 @@ func (ib *IB) placeOrderLocked(con *contract.Contract, ord *order.Order, runRisk
 		return nil, err
 	}
 	isModify := existing != nil
+	if isModify && bracketLeg {
+		return nil, fmt.Errorf("order ID %d now belongs to an existing order", ord.OrderID)
+	}
 	if isModify && existing.IsDone() {
 		return existing, ErrOrderDone
 	}
@@ -1558,7 +1568,7 @@ func (ib *IB) placeOrderLocked(con *contract.Contract, ord *order.Order, runRisk
 		ord.ClientID = clientID
 	}
 
-	if runRisk {
+	if !bracketLeg {
 		if rc := ib.riskChecker(); rc != nil {
 			if err := rc.CheckOrder(con, ord, isModify); err != nil {
 				return nil, err

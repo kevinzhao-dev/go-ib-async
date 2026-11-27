@@ -321,6 +321,17 @@ func (t *Trade) UpdateFromOpenOrder(o *Order) {
 	}
 }
 
+// BindOrderID adopts the negative API order ID that TWS binds a manual order
+// to, when the trade was created before the binding (orderId 0). Without it
+// the order could only be addressed by an ID that no longer matches.
+func (t *Trade) BindOrderID(orderID int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.Order.OrderID == 0 && orderID < 0 {
+		t.Order.OrderID = orderID
+	}
+}
+
 // SetPermID records the permanent id assigned by TWS.
 func (t *Trade) SetPermID(permID int64) {
 	t.mu.Lock()

@@ -412,7 +412,7 @@ func (ib *IB) PlaceBracketOrder(con *contract.Contract, b *order.BracketOrder) (
 
 	trades := make([]*order.Trade, 0, len(legs))
 	for i, leg := range legs {
-		t, err := ib.placeOrderLocked(con, leg, false)
+		t, err := ib.placeOrderLocked(con, leg, true)
 		if err != nil {
 			for _, sent := range trades {
 				_, _ = ib.CancelOrder(sent.Order)

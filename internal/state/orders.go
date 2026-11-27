@@ -101,7 +101,11 @@ func (m *Manager) FinishPositions() []account.Position {
 	var closed []account.Position
 	for k := range m.unconfirmedPositions {
 		rows := m.Positions[k.account]
-		p := *rows[k.conID]
+		row, ok := rows[k.conID]
+		if !ok {
+			continue
+		}
+		p := *row
 		p.Position, p.AvgCost = 0, 0
 		closed = append(closed, p)
 		delete(rows, k.conID)

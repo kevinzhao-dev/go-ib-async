@@ -246,6 +246,17 @@ func (s *Server) AddOrder(o Order) int64 {
 	return o.PermID
 }
 
+// BindOrder gives an order added with AddOrder the API order ID that TWS
+// binds a manual order to (negative) when client 0 takes it over, without
+// telling the client (see NotifyOrder).
+func (s *Server) BindOrder(permID, orderID int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if o := s.orders[permID]; o != nil {
+		o.OrderID = orderID
+	}
+}
+
 // SetOrderStatus changes the status of an order added with AddOrder, without
 // telling the client (it is another client's order).
 func (s *Server) SetOrderStatus(permID int64, status string) {

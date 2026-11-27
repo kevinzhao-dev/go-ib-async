@@ -646,3 +646,123 @@ func TestCancelledSnapshotIgnoresLateTicksOnSharedTicker(t *testing.T) {
 		t.Fatalf("cancel of surviving stream = %v, want ID %s", req, streamID)
 	}
 }
+
+// Client 0 first sees a manual TWS order unbound (orderId 0), then TWS binds
+// it to a negative orderId. Client 0 can modify it through the trade's order
+// and through a copy, and the modification reaches the bound order.
+func TestClientZeroModifiesBoundManualOrder(t *testing.T) {
+	for _, via := range []string{"trade order", "copy"} {
+		t.Run(via, func(t *testing.T) {
+			srv := startFake(t)
+			ib := New()
+			if err := ib.Connect(ctx5s(t), "127.0.0.1", srv.Port(), 0); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(ib.Disconnect)
+			con := aaplE2E()
+			perm := srv.AddOrder(fakegw.Order{
+				Contract: fakegw.Contract{ConID: con.ConID, Symbol: "AAPL", SecType: "STK", Exchange: "SMART", Currency: "USD"},
+				Action:   "BUY", Qty: 1, OrderType: "LMT", LmtPrice: 90, TIF: "DAY", Account: srv.Account,
+			})
+			srv.NotifyOrder(perm)
+			roundTrip(t, ib)
+			srv.BindOrder(perm, -3)
+			srv.NotifyOrder(perm)
+			roundTrip(t, ib)
+
+			var trade *order.Trade
+			for _, tr := range ib.Trades() {
+				if tr.PermID() == perm {
+					trade = tr
+				}
+			}
+			if trade == nil {
+				t.Fatal("manual order not tracked")
+			}
+			if id := trade.OrderSnapshot().OrderID; id != -3 {
+				t.Fatalf("bound manual order has orderId %d, want -3", id)
+			}
+			ord := trade.Order
+			if via == "copy" {
+				cp := trade.OrderSnapshot()
+				ord = &cp
+			}
+			ord.LmtPrice = 91
+			got, err := ib.PlaceOrder(con, ord)
+			if err != nil || got != trade {
+				t.Fatalf("modify: trade %p (want %p), err %v", got, trade, err)
+			}
+			roundTrip(t, ib)
+			if o, ok := srv.Order(0, -3); !ok || o.LmtPrice != 91 || o.PermID != perm {
+				t.Fatalf("bound order not modified: %+v", o)
+			}
+			if n := len(ib.Trades()); n != 1 {
+				t.Fatalf("%d local trades, want the bound order only", n)
+			}
+		})
+	}
+}
+
+// injectOnSubmit is an OrderJournal that runs inject when the n-th order is
+// recorded, before it is sent.
+type injectOnSubmit struct {
+	failOnNthJournal
+	at     int
+	inject func()
+}
+
+func (j *injectOnSubmit) RecordSubmit(*contract.Contract, *order.Order, bool) error {
+	j.mu.Lock()
+	j.n++
+	n := j.n
+	j.mu.Unlock()
+	if n == j.at {
+		j.inject()
+	}
+	return nil
+}
+
+// An openOrder for a leg's ID can arrive after PlaceBracketOrder checked
+// the legs and before it sends that leg. The leg must not then go out as a
+// modification of that order (with no risk check): the bracket fails and the
+// legs already sent are cancelled.
+func TestBracketLegIDTakenBeforeItIsSent(t *testing.T) {
+	srv := startFake(t)
+	ib := connectFake(t, srv)
+	con := aaplE2E()
+	b, err := order.NewBracket("SELL", 5, 100, 95, 105)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.Parent.OrderID, b.TakeProfit.OrderID, b.StopLoss.OrderID = 4000, 4001, 4002
+	var perm int64
+	ib.SetJournal(&injectOnSubmit{at: 1, inject: func() {
+		// Another connection with this client id placed order 4001.
+		perm = srv.AddOrder(fakegw.Order{
+			ClientID: e2eClientID, OrderID: 4001,
+			Contract: fakegw.Contract{ConID: con.ConID, Symbol: "AAPL", SecType: "STK", Exchange: "SMART", Currency: "USD"},
+			Action:   "BUY", Qty: 1, OrderType: "LMT", LmtPrice: 90, TIF: "DAY", Account: srv.Account,
+		})
+		srv.NotifyOrder(perm)
+		waitFor(t, "the openOrder for 4001", func() bool {
+			for _, tr := range ib.Trades() {
+				if tr.PermID() == perm {
+					return true
+				}
+			}
+			return false
+		})
+	}})
+	trades, err := ib.PlaceBracketOrder(con, b)
+	if err == nil || !strings.Contains(err.Error(), "take-profit leg") {
+		t.Fatalf("err = %v, want the take-profit leg to fail", err)
+	}
+	roundTrip(t, ib)
+	if o, ok := srv.Order(e2eClientID, 4001); !ok || o.PermID != perm || o.Action != "BUY" || o.Qty != 1 || o.LmtPrice != 90 || o.ParentID != 0 {
+		t.Fatalf("order 4001 changed: %+v", o)
+	}
+	if len(trades) != 1 || trades[0].Order.OrderID != 4000 {
+		t.Fatalf("trades = %v, want the parent only", trades)
+	}
+	waitFor(t, "the parent cancelled", func() bool { return srv.Received(protocol.MsgCancelOrder) == 1 })
+}
