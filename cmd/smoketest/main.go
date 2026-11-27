@@ -21,6 +21,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"log"
 	"math"
 	"os"
 	"strconv"
@@ -47,17 +49,50 @@ var (
 
 var pass, fail, warn int
 
+// redactor masks every managed account id; it is set once the accounts
+// are known and applied to all output (ours and the library's log).
+var redactor atomic.Pointer[strings.Replacer]
+
+func redact(s string) string {
+	if r := redactor.Load(); r != nil {
+		return r.Replace(s)
+	}
+	return s
+}
+
+// out prints redacted output.
+func out(f string, a ...any) { fmt.Print(redact(fmt.Sprintf(f, a...))) }
+
+type redactWriter struct{ w io.Writer }
+
+func (r redactWriter) Write(p []byte) (int, error) {
+	if _, err := io.WriteString(r.w, redact(string(p))); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func setAccounts(accts []string) {
+	pairs := make([]string, 0, 2*len(accts))
+	for _, a := range accts {
+		if a != "" {
+			pairs = append(pairs, a, mask(a))
+		}
+	}
+	redactor.Store(strings.NewReplacer(pairs...))
+}
+
 func ok(name, f string, a ...any) {
 	pass++
-	fmt.Printf("  PASS %-36s %s\n", name, fmt.Sprintf(f, a...))
+	out("  PASS %-36s %s\n", name, fmt.Sprintf(f, a...))
 }
 func bad(name, f string, a ...any) {
 	fail++
-	fmt.Printf("  FAIL %-36s %s\n", name, fmt.Sprintf(f, a...))
+	out("  FAIL %-36s %s\n", name, fmt.Sprintf(f, a...))
 }
 func wrn(name, f string, a ...any) {
 	warn++
-	fmt.Printf("  WARN %-36s %s\n", name, fmt.Sprintf(f, a...))
+	out("  WARN %-36s %s\n", name, fmt.Sprintf(f, a...))
 }
 func check(name string, cond bool, f string, a ...any) {
 	if cond {
@@ -66,8 +101,8 @@ func check(name string, cond bool, f string, a ...any) {
 		bad(name, f, a...)
 	}
 }
-func info(f string, a ...any) { fmt.Printf("       %s\n", fmt.Sprintf(f, a...)) }
-func section(s string)        { fmt.Printf("\n== %s ==\n", s) }
+func info(f string, a ...any) { out("       %s\n", fmt.Sprintf(f, a...)) }
+func section(s string)        { out("\n== %s ==\n", s) }
 func tctx(d time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), d)
 }
@@ -82,9 +117,10 @@ func mask(acct string) string {
 
 func main() {
 	flag.Parse()
+	log.SetOutput(redactWriter{os.Stderr})
 	ib := ibgo.New()
 	ib.ErrorEvent.Subscribe(func(e *ibgo.IBError) {
-		fmt.Printf("       [ib %d] reqId=%d warn=%v: %.150s\n", e.Code, e.ReqID, e.IsWarning, e.Message)
+		out("       [ib %d] reqId=%d warn=%v: %.150s\n", e.Code, e.ReqID, e.IsWarning, e.Message)
 	})
 
 	connected := make(chan struct{}, 4)
@@ -112,11 +148,8 @@ func main() {
 		os.Exit(1)
 	}
 	accts := ib.ManagedAccounts()
-	masked := make([]string, len(accts))
-	for i, a := range accts {
-		masked[i] = mask(a)
-	}
-	ok("ConnectWithReconnect", "serverVersion=%d accounts=%v", ib.ServerVersion(), masked)
+	setAccounts(accts)
+	ok("ConnectWithReconnect", "serverVersion=%d accounts=%v", ib.ServerVersion(), accts)
 	ctx, cancel := tctx(10 * time.Second)
 	st, err := ib.ReqCurrentTime(ctx)
 	cancel()
