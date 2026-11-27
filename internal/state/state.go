@@ -223,10 +223,15 @@ func (m *Manager) MarkTickerPending(t *market.Ticker) {
 }
 
 // ClearPendingTickers clears pending tickers and their per-batch tick lists.
+//
+// The pending set is swapped out under Mu but the tickers are cleared after
+// releasing it, so Mu is never held while waiting for a ticker lock.
 func (m *Manager) ClearPendingTickers() {
 	m.Mu.Lock()
-	m.MarketState.ClearPendingTickers()
+	pending := m.PendingTickers
+	m.PendingTickers = make(map[*market.Ticker]bool)
 	m.Mu.Unlock()
+	clearTickLists(pending)
 }
 
 // ResetSession clears per-connection state (market data subscriptions,

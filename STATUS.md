@@ -144,7 +144,7 @@ measured across packages by `scripts/coverage.sh`): **94.2%**. CI fails below 90
 | journal | 95.2% |
 | ibgo (root) | 91.7% |
 | internal/fakegw (test infrastructure) | 73.2% own tests; exercised further by the E2E tests |
-| cmd/ibguard | blocking of every order message type is tested |
+| cmd/ibguard | blocking of every order message type, fail-closed handling of unknown or binary message ids and the API version cap are tested |
 
 Found while adding tests (fixed): `reqHeadTimestamp` sent `whatToShow`/`useRTH`
 swapped, `reqScannerSubscription` sent its two option lists swapped, and the

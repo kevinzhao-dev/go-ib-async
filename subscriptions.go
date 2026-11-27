@@ -36,6 +36,9 @@ type subscription struct {
 	cancel func(reqID int64) error
 	// onRestart is called with the new request id after a reconnect.
 	onRestart func(reqID int64)
+	// epoch is the connection (IB.connEpoch) the subscription was last
+	// sent on, 0 if that send failed. Guarded by IB.subsMu.
+	epoch int64
 }
 
 // tickerForContract returns the ticker already used for the contract (one
@@ -87,7 +90,7 @@ func (ib *IB) releaseReq(reqID int64) {
 	delete(ib.state.Tickers, key)
 }
 
-func (ib *IB) registerSub(reqID int64, s *subscription) {
+func (ib *IB) registerSub(reqID int64, s *subscription, epoch int64) {
 	if s.ticker != nil {
 		ib.registerTickerReq(reqID, s.con, s.ticker)
 	}
@@ -97,6 +100,7 @@ func (ib *IB) registerSub(reqID int64, s *subscription) {
 		ib.state.Mu.Unlock()
 	}
 	ib.subsMu.Lock()
+	s.epoch = epoch
 	ib.subs[reqID] = s
 	ib.subsMu.Unlock()
 }
@@ -113,7 +117,7 @@ func (ib *IB) unregisterSub(reqID int64) *subscription {
 // startSub registers a subscription under a new request id and sends it.
 func (ib *IB) startSub(s *subscription) (int64, error) {
 	reqID := ib.client.GetReqID()
-	ib.registerSub(reqID, s)
+	ib.registerSub(reqID, s, ib.connEpoch.Load())
 	if s.onRestart != nil {
 		s.onRestart(reqID)
 	}
@@ -124,22 +128,47 @@ func (ib *IB) startSub(s *subscription) (int64, error) {
 	return reqID, nil
 }
 
-// endSub cancels the first subscription matching pred (lowest request id).
+// endSub cancels the first subscription matching pred: the lowest request
+// id, preferring subscriptions live on the current connection. It is
+// serialised with restoreSubscriptions, so a cancelled subscription is
+// never re-sent.
 func (ib *IB) endSub(pred func(*subscription) bool) bool {
+	ib.subOpMu.Lock()
+	defer ib.subOpMu.Unlock()
+
+	cur := ib.connEpoch.Load()
 	ib.subsMu.Lock()
-	var ids []int64
-	for id, s := range ib.subs {
-		if pred(s) {
-			ids = append(ids, id)
+	var reqID int64
+	var s *subscription
+	for id, cand := range ib.subs {
+		if !pred(cand) {
+			continue
+		}
+		if s == nil {
+			reqID, s = id, cand
+			continue
+		}
+		candLive, bestLive := cand.epoch == cur, s.epoch == cur
+		if candLive != bestLive {
+			if candLive {
+				reqID, s = id, cand
+			}
+		} else if id < reqID {
+			reqID, s = id, cand
 		}
 	}
-	ib.subsMu.Unlock()
-	if len(ids) == 0 {
+	if s == nil {
+		ib.subsMu.Unlock()
 		return false
 	}
-	reqID := slices.Min(ids)
-	s := ib.unregisterSub(reqID)
-	if s != nil && s.cancel != nil {
+	delete(ib.subs, reqID)
+	live := s.epoch != 0 && s.epoch == cur
+	ib.subsMu.Unlock()
+
+	ib.releaseReq(reqID)
+	// A subscription not (re)sent on the current connection is unknown to
+	// TWS: there is nothing to cancel.
+	if live && s.cancel != nil {
 		_ = s.cancel(reqID)
 	}
 	return true
@@ -183,9 +212,13 @@ func (ib *IB) releaseFailedSnapshot(reqID int64) {
 	}
 }
 
-// restoreSubscriptions re-sends every live subscription with new request
-// ids after a reconnect. Market data type and account updates are restored
-// first so the re-requested data arrives in the expected form.
+// restoreSubscriptions re-sends, with new request ids, every subscription
+// that was sent on an earlier connection (or whose re-send failed).
+// Subscriptions already made on the current connection, e.g. from a
+// ConnectedEvent handler, are left alone. A subscription whose re-send
+// fails stays registered and is retried after the next reconnect. Market
+// data type and account updates are restored first so the re-requested
+// data arrives in the expected form.
 func (ib *IB) restoreSubscriptions() {
 	if t := ib.mdType.Load(); t != 0 {
 		if err := ib.client.ReqMarketDataType(int(t)); err != nil {
@@ -201,23 +234,67 @@ func (ib *IB) restoreSubscriptions() {
 		}
 	}
 
+	cur := ib.connEpoch.Load()
 	ib.subsMu.Lock()
-	old := ib.subs
-	ib.subs = map[int64]*subscription{}
-	ib.subsMu.Unlock()
-
-	ids := make([]int64, 0, len(old))
-	for id := range old {
-		ids = append(ids, id)
-	}
-	slices.Sort(ids)
-	for _, id := range ids {
-		ib.releaseReq(id)
-		if _, err := ib.startSub(old[id]); err != nil {
-			log.Printf("ibgo: restore subscription (reqId %d): %v", id, err)
+	var ids []int64
+	for id, s := range ib.subs {
+		if s.epoch != cur {
+			ids = append(ids, id)
 		}
 	}
-	if len(ids) > 0 {
-		log.Printf("ibgo: restored %d subscriptions", len(ids))
+	ib.subsMu.Unlock()
+	slices.Sort(ids)
+
+	restored, failed := 0, 0
+	var firstErr error
+	for _, id := range ids {
+		ok, err := ib.restoreSub(id, cur)
+		switch {
+		case err != nil:
+			failed++
+			if firstErr == nil {
+				firstErr = err
+			}
+		case ok:
+			restored++
+		}
 	}
+	if restored > 0 {
+		log.Printf("ibgo: restored %d subscriptions", restored)
+	}
+	if failed > 0 {
+		log.Printf("ibgo: %d subscriptions not restored, retrying after the next reconnect: %v", failed, firstErr)
+	}
+}
+
+// restoreSub re-sends one subscription of an earlier connection under a new
+// request id. It reports false when the subscription was cancelled
+// meanwhile; on a send error the subscription stays registered, marked as
+// not sent, for the next reconnect.
+func (ib *IB) restoreSub(oldID, epoch int64) (bool, error) {
+	ib.subOpMu.Lock()
+	defer ib.subOpMu.Unlock()
+
+	ib.subsMu.Lock()
+	s := ib.subs[oldID]
+	if s == nil || s.epoch == epoch {
+		ib.subsMu.Unlock()
+		return false, nil
+	}
+	delete(ib.subs, oldID)
+	ib.subsMu.Unlock()
+	ib.releaseReq(oldID)
+
+	reqID := ib.client.GetReqID()
+	ib.registerSub(reqID, s, epoch)
+	if s.onRestart != nil {
+		s.onRestart(reqID)
+	}
+	if err := s.send(reqID); err != nil {
+		ib.subsMu.Lock()
+		s.epoch = 0
+		ib.subsMu.Unlock()
+		return false, err
+	}
+	return true, nil
 }

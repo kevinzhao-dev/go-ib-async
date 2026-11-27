@@ -142,7 +142,11 @@ go ib.ConnectWithReconnect(ctx, "127.0.0.1", 4002, 1, cfg, func() {
 An automatic reconnect keeps orders, fills and positions, so `*order.Trade`
 objects held by the application stay valid, and re-requests every streaming
 subscription (market data, tick-by-tick, depth, bars, PnL, account updates)
-and the market data type, so `Ticker` and bar list objects keep updating. `SyncOrders` then refreshes open
+and the market data type, so `Ticker` and bar list objects keep updating.
+Do not re-request them in `onConnect`: that would create a second
+subscription. Subscriptions made on the new connection (e.g. from a
+`ConnectedEvent` handler) are not sent twice, and one whose re-send fails is
+retried after the next reconnect. `SyncOrders` then refreshes open
 orders, fetches executions (missed fills are added to their trades),
 finalises orders that completed while disconnected and refreshes positions.
 After a process restart use `SyncOrders(ctx, SyncOptions{IncludeCompleted: true})`
@@ -179,7 +183,10 @@ See [STATUS.md](STATUS.md) for full details.
 ### Testing against a live account safely
 
 `cmd/ibguard` is a proxy that blocks every order message (place, cancel,
-global cancel, exercise, ...) at the socket level, and `cmd/smoketest` runs
+global cancel, exercise, ...) at the socket level. It fails closed (any
+message id it does not recognise ends the session) and caps the negotiated
+API version at 178, above which messages can no longer be inspected as text.
+`cmd/smoketest` runs
 ~45 read-only checks with sanity checks on the decoded values:
 
 ```bash

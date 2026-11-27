@@ -51,6 +51,12 @@ type IB struct {
 	// Streaming subscriptions by request id (see subscriptions.go).
 	subsMu sync.Mutex
 	subs   map[int64]*subscription
+	// subOpMu serialises cancelling a subscription with re-sending it
+	// after a reconnect.
+	subOpMu sync.Mutex
+	// connEpoch counts successful connections; a subscription is live on
+	// the connection whose epoch it was sent on.
+	connEpoch atomic.Int64
 	// mdType is the last market data type requested (0 = never).
 	mdType atomic.Int64
 
@@ -161,6 +167,9 @@ func (ib *IB) Connect(ctx context.Context, host string, port, clientID int) erro
 	if err != nil {
 		return err
 	}
+	// Before ConnectedEvent: subscriptions made from its handlers belong to
+	// this connection and are not re-sent by restoreSubscriptions.
+	ib.connEpoch.Add(1)
 	ib.ConnectedEvent.Emit(struct{}{})
 	return nil
 }

@@ -70,3 +70,97 @@ func TestBlocksOrderMessages(t *testing.T) {
 		})
 	}
 }
+
+func TestCheckOutbound(t *testing.T) {
+	for _, tc := range []struct {
+		frame string
+		pass  bool
+	}{
+		{"49\x001\x00", true},
+		{"1\x0011\x00", true},
+		{"104\x0024\x00", true},
+		{"3\x0042\x00", false},
+		{"03\x0042\x00", false},     // TWS parses the id as a number
+		{"+3\x0042\x00", false},     // not a plain decimal id
+		{" 3\x0042\x00", false},     // not a plain decimal id
+		{"\x00\x00\x00\x03", false}, // binary message id (server version 201+)
+		{"203\x00", false},          // protobuf placeOrder
+		{"105\x00", false},          // newer than maxServerVersion
+		{"0\x00", false},
+		{"49", false}, // no field terminator
+	} {
+		if got := checkOutbound([]byte(tc.frame)) == ""; got != tc.pass {
+			t.Errorf("checkOutbound(%q) pass = %v, want %v", tc.frame, got, tc.pass)
+		}
+	}
+}
+
+func TestCapHandshake(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"v157..178", "v157..178"},
+		{"v100..187", "v100..178"},
+		{"v100..210 +PACEAPI", "v100..178 +PACEAPI"},
+		{"v170", "v170"},
+		{"v190..210", ""}, // minimum above the cap
+		{"v201", ""},
+		{"API", ""},
+		{"v..178", ""},
+	} {
+		got, err := capHandshake([]byte(tc.in))
+		if tc.want == "" {
+			if err == nil {
+				t.Errorf("capHandshake(%q) = %q, want error", tc.in, got)
+			}
+			continue
+		}
+		if err != nil || string(got) != tc.want {
+			t.Errorf("capHandshake(%q) = %q, %v; want %q", tc.in, got, err, tc.want)
+		}
+	}
+}
+
+// TestSessionFailsClosed: a client offering a new API version is capped, and
+// a frame with a binary message id kills the session without forwarding.
+func TestSessionFailsClosed(t *testing.T) {
+	up, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer up.Close()
+	*upstream = up.Addr().String()
+	got := make(chan []byte, 1)
+	go func() {
+		c, err := up.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		b, _ := io.ReadAll(c)
+		got <- b
+	}()
+
+	client, guardSide := net.Pipe()
+	go handle(1, guardSide)
+	hs := append([]byte("API\x00"), frame("v100..210")...)
+	if _, err := client.Write(hs); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = client.Write(frame("49\x001\x00"))
+	_, _ = client.Write(frame("\x00\x00\x00\x03SECRET"))
+	client.Close()
+
+	select {
+	case b := <-got:
+		if bytes.Contains(b, []byte("SECRET")) {
+			t.Fatal("binary-id message was forwarded")
+		}
+		if !bytes.HasPrefix(b, append([]byte("API\x00"), frame("v100..178")...)) {
+			t.Fatalf("handshake not capped: %q", b)
+		}
+		if !bytes.Contains(b, []byte("49\x001\x00")) {
+			t.Fatalf("allowed traffic not forwarded: %q", b)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("upstream session did not end")
+	}
+}

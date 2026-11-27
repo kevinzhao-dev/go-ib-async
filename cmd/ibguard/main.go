@@ -5,6 +5,11 @@
 // reqAutoOpenOrders. Everything else (market data, account, historical data,
 // contract details, ...) passes through.
 //
+// It fails closed: a message whose id is not a plain decimal id between 1
+// and maxMsgID also kills the session. The API version offered by the
+// client is capped at maxServerVersion, because newer servers send binary
+// message ids and protobuf messages the guard cannot inspect.
+//
 // Use it to develop or test read-only features against a live account:
 //
 //	go run ./cmd/ibguard -upstream 127.0.0.1:4001 -listen 127.0.0.1:4011
@@ -20,6 +25,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -28,6 +34,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -41,13 +48,83 @@ var (
 )
 
 // Outbound message ids that must never reach a live gateway.
-var blocked = map[string]string{
-	"3":  "PLACE_ORDER",
-	"4":  "CANCEL_ORDER",
-	"15": "REQ_AUTO_OPEN_ORDERS",
-	"19": "REPLACE_FA",
-	"21": "EXERCISE_OPTIONS",
-	"58": "REQ_GLOBAL_CANCEL",
+var blocked = map[int]string{
+	3:  "PLACE_ORDER",
+	4:  "CANCEL_ORDER",
+	15: "REQ_AUTO_OPEN_ORDERS",
+	19: "REPLACE_FA",
+	21: "EXERCISE_OPTIONS",
+	58: "REQ_GLOBAL_CANCEL",
+}
+
+const (
+	// maxServerVersion is the highest API version negotiated through the
+	// guard. Up to it every message starts with its id as decimal text.
+	maxServerVersion = 178
+	// maxMsgID is the highest outbound message id up to maxServerVersion
+	// (REQ_USER_INFO); higher ids are unknown and rejected.
+	maxMsgID = 104
+)
+
+// checkOutbound returns why a client message must not be forwarded, or ""
+// when it may pass. The id is parsed as TWS parses it (a decimal number),
+// so encodings like "03" cannot sneak past the block list.
+func checkOutbound(p []byte) string {
+	i := bytes.IndexByte(p, 0)
+	if i <= 0 {
+		return "message without a text id"
+	}
+	s := string(p[:i])
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return fmt.Sprintf("non-numeric message id %q", s)
+		}
+	}
+	id, err := strconv.Atoi(s)
+	if err != nil {
+		return fmt.Sprintf("bad message id %q", s)
+	}
+	if name, bad := blocked[id]; bad {
+		return fmt.Sprintf("%s (%d)", name, id)
+	}
+	if id < 1 || id > maxMsgID {
+		return fmt.Sprintf("unknown message id %d", id)
+	}
+	return ""
+}
+
+// capHandshake rewrites the client's version range "vMIN..MAX[ options]"
+// so MAX does not exceed maxServerVersion. It fails when the range cannot
+// be parsed or starts above maxServerVersion.
+func capHandshake(p []byte) ([]byte, error) {
+	spec, opts, hasOpts := strings.Cut(string(p), " ")
+	rest, ok := strings.CutPrefix(spec, "v")
+	if !ok {
+		return nil, fmt.Errorf("unexpected version string %q", p)
+	}
+	lo, hi, isRange := strings.Cut(rest, "..")
+	if !isRange {
+		hi = lo
+	}
+	minV, err1 := strconv.Atoi(lo)
+	maxV, err2 := strconv.Atoi(hi)
+	if err1 != nil || err2 != nil || minV < 1 || minV > maxV {
+		return nil, fmt.Errorf("unexpected version string %q", p)
+	}
+	if minV > maxServerVersion {
+		return nil, fmt.Errorf("client requires API version %d+, guard supports up to %d", minV, maxServerVersion)
+	}
+	out := spec
+	if maxV > maxServerVersion {
+		if !isRange {
+			return nil, fmt.Errorf("client requires API version %d, guard supports up to %d", maxV, maxServerVersion)
+		}
+		out = fmt.Sprintf("v%d..%d", minV, maxServerVersion)
+	}
+	if hasOpts {
+		out += " " + opts
+	}
+	return []byte(out), nil
 }
 
 var (
@@ -147,10 +224,19 @@ func handle(id int, client net.Conn) {
 		return
 	}
 	record(id, "->", append([]byte("HANDSHAKE "), ver...))
+	capped, err := capHandshake(ver)
+	if err != nil {
+		log.Printf("c%d: %v, closing", id, err)
+		kill()
+		return
+	}
+	if !bytes.Equal(capped, ver) {
+		log.Printf("c%d: API version range %q capped to %q", id, ver, capped)
+	}
 	if _, err := server.Write(magic[:]); err != nil {
 		return
 	}
-	if err := writeFrame(server, ver); err != nil {
+	if err := writeFrame(server, capped); err != nil {
 		return
 	}
 	for {
@@ -160,13 +246,9 @@ func handle(id int, client net.Conn) {
 			log.Printf("c%d: session closed", id)
 			return
 		}
-		msgID := string(p)
-		if i := strings.IndexByte(msgID, 0); i >= 0 {
-			msgID = msgID[:i]
-		}
-		if name, bad := blocked[msgID]; bad {
+		if why := checkOutbound(p); why != "" {
 			record(id, "XX", p)
-			log.Printf("c%d: BLOCKED outbound %s (%s) - session killed, nothing forwarded", id, name, msgID)
+			log.Printf("c%d: BLOCKED outbound %s - session killed, nothing forwarded", id, why)
 			kill()
 			return
 		}

@@ -134,6 +134,29 @@ func TestPendingTickersClearTickLists(t *testing.T) {
 	}
 }
 
+// A user holding a ticker's read lock while calling into the client (which
+// takes Mu) must not deadlock with ClearPendingTickers on the reader.
+func TestClearPendingTickersLockOrder(t *testing.T) {
+	m := NewManager()
+	tk := market.NewTicker(nil)
+	m.MarkTickerPending(tk)
+
+	tk.RLock()
+	cleared := make(chan struct{})
+	go func() { m.ClearPendingTickers(); close(cleared) }()
+	time.Sleep(50 * time.Millisecond) // the clearer is now waiting for the ticker lock
+
+	got := make(chan struct{})
+	go func() { _ = m.GetPendingTickers(); close(got) }()
+	select {
+	case <-got:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Mu is held while waiting for a ticker lock")
+	}
+	tk.RUnlock()
+	<-cleared
+}
+
 // Request starters and the reader goroutine touch the same maps; run with -race.
 func TestManagerConcurrentUse(t *testing.T) {
 	m := NewManager()
