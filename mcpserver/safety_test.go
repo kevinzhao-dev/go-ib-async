@@ -3,6 +3,8 @@ package mcpserver
 // Regression tests for the safety review of the trading tools.
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"math"
 	"strings"
@@ -105,6 +107,33 @@ func TestPlaceRejectsAgingQuoteAfterFailedRefresh(t *testing.T) {
 	h.fail("place_order", map[string]any{"preview_id": id}, "so the price collar cannot check the limit price. Nothing was sent")
 	if h.gw.Received(3) != sent {
 		t.Fatal("order sent without a current reference price")
+	}
+}
+
+// A place_order request that ends (client cancellation or timeout) while the
+// quote refresh stalls gets no response, so it must not send the order. A
+// stop order has no limit price for the collar, so the failed refresh alone
+// does not stop it.
+func TestPlaceNotSentAfterRequestEnds(t *testing.T) {
+	h := newHarness(t, harnessOpts{trading: true, limits: collarLimits(),
+		config: func(c *Config) { c.QuoteMaxAge = 40 * time.Millisecond }})
+	id := h.previewID(map[string]any{"contract": aapl(), "action": "SELL", "quantity": 1, "order_type": "STP", "stop_price": 140})
+	h.gw.Handle(1, func([]string) [][]byte { return nil }) // quotes stall
+	time.Sleep(60 * time.Millisecond)                      // the cached quote is stale
+	quotes, sent := h.gw.Received(1), h.gw.Received(3)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	res := h.srv.callTool(ctx, h.srv.toolByName["place_order"], json.RawMessage(`{"preview_id":"`+id+`"}`))
+	if !res.IsError || !strings.Contains(res.Content[0].Text, "the request ended before it was sent") {
+		t.Fatalf("place_order = %s", res.Content[0].Text)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if h.gw.Received(1) != quotes+1 {
+		t.Fatal("place_order must have tried to refresh the quote")
+	}
+	if h.gw.Received(3) != sent {
+		t.Fatal("order sent after the request ended")
 	}
 }
 

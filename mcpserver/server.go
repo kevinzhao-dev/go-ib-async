@@ -348,7 +348,7 @@ func (s *Server) registerTools() {
 		"Look up instruments matching a contract description and return their IB contract ids (con_id) and details. Use the con_id in later calls to refer to one instrument unambiguously. For options, call get_option_chain first and then search with expiry, strike and right; a bare option symbol matches thousands of contracts.",
 		readOnly, s.searchContracts)
 	addTool(s, "get_quote", "Get quote",
-		"One-off market data snapshot (bid, ask, last, sizes, open/high/low/close, volume) for one contract. market_data_type tells whether the data is live or delayed. Takes up to ~11s when some fields are unavailable.",
+		"One-off market data snapshot (bid, ask, last, sizes, open/high/low/close, volume) for one contract. market_data_type tells whether the data is live or delayed. Takes up to ~12s when some fields are unavailable (e.g. a closed market).",
 		readOnly, s.getQuote)
 	addTool(s, "get_historical_bars", "Get historical bars",
 		"Historical OHLCV bars for one contract. duration is '<n> <S|D|W|M|Y>' (e.g. '5 D', '1 Y'); IB limits how many bars one request may return for small bar sizes. Each bar's t: for intraday bars its start time (RFC 3339); for daily and longer bars the date IB labels it with (YYYY-MM-DD), the session's trade date, so a futures session that opens the evening before carries the day it closes.",

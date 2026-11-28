@@ -156,7 +156,9 @@ instructions.
    `-allow-market-orders`.
 7. **Two-step orders.** Previews are single-use, expire (default 2 minutes)
    and are bound to the exact contract, side, quantity, prices, account and
-   time in force.
+   time in force. A `place_order` request that the client cancelled, or that
+   timed out, before the order was sent sends nothing: the client would
+   never see that response.
 8. **Write-ahead journal.** Every submit is fsync'd to the JSONL journal
    before it is sent; a journal failure blocks the order.
 9. **Scope.** Agents can modify or cancel only orders of the server's API

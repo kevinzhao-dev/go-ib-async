@@ -139,6 +139,20 @@ func TestFieldReaderReadString(t *testing.T) {
 	}
 }
 
+func TestFieldReaderPeekString(t *testing.T) {
+	r := NewFieldReader([]string{"a", ""})
+	if r.PeekString() != "a" || r.PeekString() != "a" || r.ReadString() != "a" {
+		t.Fatal("PeekString must not consume the field")
+	}
+	if r.PeekString() != "" || r.Pos != 1 {
+		t.Fatal("PeekString of an empty field")
+	}
+	r.Skip(1)
+	if r.PeekString() != "" || r.Pos != 2 {
+		t.Fatal("PeekString past the end should return empty")
+	}
+}
+
 func TestFieldReaderReadInt(t *testing.T) {
 	r := NewFieldReader([]string{"42", "", "-1"})
 	if r.ReadInt() != 42 {
