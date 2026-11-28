@@ -31,9 +31,18 @@ const (
 	// and place_order. TWS ends a snapshot after its own 11-second timeout
 	// when some fields never arrive (any closed market); against a live
 	// Gateway that took up to 12.05s, so 12s lost the quote about half the
-	// time. Together with place_order's acknowledgement wait (max 15s) this
-	// stays within the default 30s RequestTimeout.
-	quoteTimeout = 15 * time.Second
+	// time. place_order spends it before submitting and waiting up to
+	// ackWaitMax, all within the default 30s RequestTimeout with about 1s
+	// left for the submission (TestQuoteTimeoutBudget). A slower submission
+	// shortens the wait; the result then says the order is not yet
+	// acknowledged.
+	quoteTimeout = 14 * time.Second
+
+	// ackWaitDefault and ackWaitMax are the default and the cap of
+	// wait_seconds: how long place_order, cancel_order and cancel_all_orders
+	// wait for the broker. The tool descriptions repeat them.
+	ackWaitDefault = 3
+	ackWaitMax     = 15
 )
 
 // bracketRoles names the legs of a bracket plan, in order.
@@ -650,7 +659,7 @@ func (s *Server) placeOrder(ctx context.Context, a placeArgs) (any, error) {
 		o := p.orders[i]
 		legs[i] = &o
 	}
-	trades, err := s.submit(p, legs)
+	trades, err := s.submit(ctx, p, legs)
 	if err != nil {
 		var ns errNotSent
 		if errors.As(err, &ns) {
@@ -669,7 +678,7 @@ func (s *Server) placeOrder(ctx context.Context, a placeArgs) (any, error) {
 		return nil, errors.New(msg)
 	}
 
-	acked := s.waitAck(ctx, trades, p.kind == kindModify, waitDuration(a.WaitSeconds, 3, 15))
+	acked := s.waitAck(ctx, trades, p.kind == kindModify, waitDuration(a.WaitSeconds, ackWaitDefault, ackWaitMax))
 	me := s.b.ClientID()
 	res := placeResult{Summary: p.summary, Orders: []orderView{}}
 	for _, t := range trades {
@@ -693,9 +702,11 @@ type errNotSent struct{ error }
 
 // submit sends the plan's orders. It holds placeMu shared, so halt_trading
 // (which takes it exclusively after halting) sees every order that passed the
-// risk check before the halt. The hooks and readiness are checked again here,
-// right before sending.
-func (s *Server) submit(p *plan, legs []*order.Order) ([]*order.Trade, error) {
+// risk check before the halt. The hooks, readiness and the request are
+// checked again here, right before sending: a request the client cancelled
+// (or that timed out) during the quote refresh or while waiting for placeMu
+// gets no response, so it must not send an order either.
+func (s *Server) submit(ctx context.Context, p *plan, legs []*order.Order) ([]*order.Trade, error) {
 	s.placeMu.RLock()
 	defer s.placeMu.RUnlock()
 	if err := s.checkHooks(); err != nil {
@@ -703,6 +714,9 @@ func (s *Server) submit(p *plan, legs []*order.Order) ([]*order.Trade, error) {
 	}
 	if err := s.tradingReady(); err != nil {
 		return nil, errNotSent{fmt.Errorf("%w (the preview was used up)", err)}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, errNotSent{fmt.Errorf("order not sent: the request ended before it was sent (%w); the preview was used up", err)}
 	}
 	if p.kind == kindBracket {
 		return s.b.PlaceBracketOrder(p.con, &order.BracketOrder{Parent: legs[0], TakeProfit: legs[1], StopLoss: legs[2]})
@@ -837,7 +851,7 @@ func (s *Server) cancelOrder(ctx context.Context, a cancelArgs) (any, error) {
 	if acct := t.OrderSnapshot().Account; !s.cancelAllowed(acct) {
 		return nil, fmt.Errorf("order %d is for account %s, which is not a paper account, and live trading is disabled on this server; it cannot be cancelled here", a.OrderID, acct)
 	}
-	return s.cancelTrades(ctx, []*order.Trade{t}, waitDuration(a.WaitSeconds, 3, 15))
+	return s.cancelTrades(ctx, []*order.Trade{t}, waitDuration(a.WaitSeconds, ackWaitDefault, ackWaitMax))
 }
 
 // cancelAllowed applies the paper-only policy to cancellations too.
@@ -857,7 +871,7 @@ func (s *Server) cancelAllOrders(ctx context.Context, a cancelAllArgs) (any, err
 	if err != nil {
 		return nil, err
 	}
-	return s.cancelTrades(ctx, own, waitDuration(a.WaitSeconds, 3, 15))
+	return s.cancelTrades(ctx, own, waitDuration(a.WaitSeconds, ackWaitDefault, ackWaitMax))
 }
 
 // ownOpenTrades returns the open orders of this client. Children of a
