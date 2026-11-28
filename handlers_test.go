@@ -395,14 +395,9 @@ func TestReqRealTimeBarsAndCancel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "real-time bar", func() bool {
-		ib.state.Mu.RLock()
-		defer ib.state.Mu.RUnlock()
-		return len(rtbl.Bars) == 1
-	})
-	ib.state.Mu.RLock()
-	b := rtbl.Bars[0]
-	ib.state.Mu.RUnlock()
+	// The reader appends under the list's own lock: read through Snapshot.
+	waitFor(t, "real-time bar", func() bool { return len(rtbl.Snapshot()) == 1 })
+	b := rtbl.Snapshot()[0]
 	if !b.Time.Equal(time.Unix(1697722200, 0)) || b.Open != 174 || b.High != 175 || b.Low != 173.5 || b.Close != 174.5 || b.WAP != 174.2 || b.Count != 12 {
 		t.Fatalf("bar = %+v", b)
 	}
