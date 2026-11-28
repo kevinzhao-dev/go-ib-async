@@ -28,8 +28,12 @@ const (
 	maxPreviews = 50
 
 	// quoteTimeout bounds the market data snapshot taken by preview_order
-	// and place_order (TWS completes a snapshot after at most ~11s).
-	quoteTimeout = 12 * time.Second
+	// and place_order. TWS ends a snapshot after its own 11-second timeout
+	// when some fields never arrive (any closed market); against a live
+	// Gateway that took up to 12.05s, so 12s lost the quote about half the
+	// time. Together with place_order's acknowledgement wait (max 15s) this
+	// stays within the default 30s RequestTimeout.
+	quoteTimeout = 15 * time.Second
 )
 
 // bracketRoles names the legs of a bracket plan, in order.

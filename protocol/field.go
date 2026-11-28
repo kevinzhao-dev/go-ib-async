@@ -31,6 +31,14 @@ func (r *FieldReader) ReadString() string {
 	return v
 }
 
+// PeekString returns the next field without consuming it ("" past the end).
+func (r *FieldReader) PeekString() string {
+	if r.Pos >= len(r.Fields) {
+		return ""
+	}
+	return r.Fields[r.Pos]
+}
+
 // ReadInt reads the next field as an int64. Returns 0 for empty strings.
 func (r *FieldReader) ReadInt() int64 {
 	s := r.ReadString()

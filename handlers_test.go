@@ -94,6 +94,48 @@ func TestTickMessagesUpdateTicker(t *testing.T) {
 	}
 }
 
+// TWS sends an empty price for a field it has no value for (captured from a
+// live Gateway: "1|6|2|9||0|0", the close of an SPX snapshot). Like ib_async
+// the message is dropped: it neither reads as a price of 0 nor overwrites a
+// real price.
+func TestTickPriceEmptyPriceIgnored(t *testing.T) {
+	ib := newTestIB()
+	tk := market.NewTicker(aaplE2E())
+	ib.state.ReqID2Ticker[5] = tk
+	var updates atomic.Int32
+	tk.UpdateEvent.Subscribe(func(*market.Ticker) { updates.Add(1) })
+
+	ib.client.OnDataArrived()
+	dispatch(ib, "1", "6", "5", "9", "7182.78", "0", "0") // close
+	dispatch(ib, "1", "6", "5", "4", "7183.5", "1", "0")  // last
+	if n := len(tk.Ticks); n != 2 {
+		t.Fatalf("setup: %d ticks in the batch, want 2", n)
+	}
+	ib.client.OnDataProcessed()
+	if tk.Close != 7182.78 || tk.Last != 7183.5 || updates.Load() != 1 {
+		t.Fatalf("setup: close %g last %g updates %d", tk.Close, tk.Last, updates.Load())
+	}
+
+	ib.client.OnDataArrived()
+	dispatch(ib, "1", "6", "5", "9", "", "0", "0") // close without a value
+	dispatch(ib, "1", "6", "5", "4", "", "", "0")  // last and size without a value
+	dispatch(ib, "1", "6", "5", "1", "", "", "0")  // bid without a value (index stream)
+	dispatch(ib, "1", "6", "5", "2")               // truncated: no price field at all
+	if n, p := len(tk.Ticks), len(ib.state.GetPendingTickers()); n != 0 || p != 0 {
+		t.Fatalf("dropped messages must not add ticks (%d) or mark the ticker pending (%d)", n, p)
+	}
+	ib.client.OnDataProcessed()
+	if tk.Close != 7182.78 || tk.Last != 7183.5 || tk.LastSize != 1 {
+		t.Fatalf("empty price overwrote: close %g last %g lastSize %g", tk.Close, tk.Last, tk.LastSize)
+	}
+	if !math.IsNaN(tk.Bid) || !math.IsNaN(tk.BidSize) || !math.IsNaN(tk.Ask) || !math.IsNaN(tk.PrevLast) {
+		t.Fatalf("empty price must leave fields unset: bid %g size %g ask %g prevLast %g", tk.Bid, tk.BidSize, tk.Ask, tk.PrevLast)
+	}
+	if updates.Load() != 1 {
+		t.Fatalf("dropped messages fired %d more updates", updates.Load()-1)
+	}
+}
+
 // Every tick map entry must name a real Ticker field that the setter handles.
 func TestTickMapsMapToTickerFields(t *testing.T) {
 	check := func(name string, m map[int]string, set func(*market.Ticker, string), want func(reflect.Value) bool) {

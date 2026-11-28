@@ -46,6 +46,13 @@ func (ib *IB) handleTickPrice(r *protocol.FieldReader) {
 	r.Skip(1) // version
 	reqID := r.ReadInt()
 	tickType := int(r.ReadInt())
+	// TWS sends an empty price for a field it has no value for, e.g. the
+	// close in an index snapshot or an index's bid and ask. ib_async drops
+	// such a message (decoder.priceSizeTick: "if price:"); read as 0 it
+	// reported a price of 0 and overwrote real prices.
+	if r.PeekString() == "" {
+		return
+	}
 	price := r.ReadFloat()
 	size := unsetToNaN(r.ReadFloat())
 	_ = r.ReadString() // attrib mask (canAutoExecute, pastLimit, preOpen)

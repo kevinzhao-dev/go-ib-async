@@ -541,3 +541,17 @@ func (failingJournal) RecordStatus(*order.Trade) error                  { return
 func (failingJournal) RecordFill(*order.Trade, *order.Fill) error       { return nil }
 func (failingJournal) RecordCommission(*order.Trade, *order.Fill) error { return nil }
 func (failingJournal) RecordError(*order.Trade, int, string) error      { return nil }
+
+// A closed-market snapshot ends after TWS's own 11s timeout and took up to
+// 12.05s against a live Gateway, so the quote budget needs headroom above
+// that. place_order spends it before its acknowledgement wait (max 15s), and
+// both must fit in the default request timeout.
+func TestQuoteTimeoutBudget(t *testing.T) {
+	if quoteTimeout < 14*time.Second {
+		t.Fatalf("quoteTimeout %v: closed-market snapshots take up to ~12s", quoteTimeout)
+	}
+	h := newHarness(t, harnessOpts{offline: true})
+	if maxWait := waitDuration(99, 3, 15); quoteTimeout+maxWait > h.srv.cfg.RequestTimeout {
+		t.Fatalf("quote %v + ack wait %v exceed the request timeout %v", quoteTimeout, maxWait, h.srv.cfg.RequestTimeout)
+	}
+}

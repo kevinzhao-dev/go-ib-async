@@ -98,6 +98,13 @@ arriving after cancellation while its contract still has a streaming ticker.
 See [trading scenarios](trading_scenarios_test.go), [risk cases](risk/risk_edge_test.go),
 and [journal replay cases](journal/journal_edge_test.go).
 
+## Fixed in release testing (November 28, 2026)
+
+Found with the smoke test, `cmd/mdcheck` and the MCP tools against a live Gateway (read-only API mode, markets closed):
+
+1. TWS sends an empty price in tickPrice for a field it has no value for (the close of an SPX snapshot, an index's bid and ask). It was decoded as 0, so `get_quote` reported an SPX close of 0 and an empty tick could overwrite a real price. These messages are now dropped, as in ib_async (`priceSizeTick`). The MCP reference price was not affected, because it only accepts prices above 0.
+2. `preview_order` and `place_order` gave a quote 12s, but on a closed market TWS completes a snapshot only after its own 11s timeout, which took up to 12.05s. About half of the previews came back without a quote. With the price collar on, `place_order` could then refuse a limit order for lack of a reference price. The quote budget is now 15s, and it still fits in the 30s request timeout together with the acknowledgement wait.
+
 ## Fixed after the second review (November 2026)
 
 1. `cmd/ibguard` passed reqOpenOrders, which binds manual TWS orders for client id 0 (TWS may cancel and resubmit them). It is now blocked for client 0 and before startApi, and only allowlisted message ids pass. `SyncOrders` uses reqAllOpenOrders for client 0.

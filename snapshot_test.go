@@ -3,6 +3,7 @@ package ibgo
 import (
 	"context"
 	"errors"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -43,6 +44,34 @@ func TestReqTickerSnapshot(t *testing.T) {
 	}
 	if req := srv.LastRequest(1); len(req) < 3 {
 		t.Fatalf("reqMktData = %q", req)
+	}
+}
+
+// The SPX index snapshot as a live Gateway sent it on a closed market: the
+// close with an empty price, bid and ask as -1. The close must stay unset,
+// not read as 0.
+func TestReqTickerSnapshotEmptyClose(t *testing.T) {
+	srv := startFake(t)
+	srv.Handle(1, func(req []string) [][]byte {
+		id := req[2]
+		return [][]byte{
+			fakegw.Msg(58, 1, id, 1),
+			fakegw.Msg(81, id, "0.01", "", 0), // tickReqParams
+			fakegw.Msg(1, 6, id, 9, "", 0, 0),
+			fakegw.Msg(1, 6, id, 1, "-1.00", 0, 0),
+			fakegw.Msg(1, 6, id, 2, "-1.00", 0, 0),
+			fakegw.Msg(57, 1, id),
+		}
+	})
+	ib := connectFake(t, srv)
+
+	spx := &contract.Contract{ConID: 416904, Symbol: "SPX", SecType: "IND", Exchange: "CBOE", Currency: "USD"}
+	tk, err := ib.ReqTickerSnapshot(ctx5s(t), spx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !math.IsNaN(tk.Close) || tk.Bid != -1 || tk.Ask != -1 {
+		t.Fatalf("close %g bid %g ask %g, want NaN/-1/-1", tk.Close, tk.Bid, tk.Ask)
 	}
 }
 
